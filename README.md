@@ -42,9 +42,15 @@ cargo build --release -p winbeautify
 ### 测试
 
 ```bash
-cargo test --workspace     # 92 个单元测试
+cargo test --workspace                  # 纯逻辑测试，不需要桌面
+cargo test -p beautify-settings -- --ignored   # 真的开一个设置窗口，开→关→再开
 cargo clippy --workspace --all-targets
 ```
+
+默认跑的是不依赖桌面的那些：布局、命中测试、像素运算、配置读写。真正需要窗口的测试
+标记了 `#[ignore]`，上面第二条是其中一个——它验证设置窗口能开、能关、还能再开一次。
+这条不是形式：`DestroyWindow` 会在处理消息的过程中同步投递 `WM_NCDESTROY`，重入消息
+过程曾让关闭设置窗口直接 abort 整个进程，这个测试就是那次缺陷的回归守卫。
 
 ---
 
