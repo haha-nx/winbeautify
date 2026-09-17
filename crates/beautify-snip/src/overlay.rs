@@ -193,6 +193,10 @@ struct Frame {
     dc: HDC,
     bitmap: HBITMAP,
     previous: HGDIOBJ,
+    /// Base of the pixel buffer, kept so a test can read back what a blit
+    /// actually wrote.
+    #[cfg(test)]
+    bits: *mut u8,
 }
 
 impl Frame {
@@ -231,6 +235,8 @@ impl Frame {
             dc,
             bitmap,
             previous,
+            #[cfg(test)]
+            bits: bits as *mut u8,
         })
     }
 }
@@ -1312,6 +1318,55 @@ fn message_font() -> HGDIOBJ {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region blit has to land on the rows that were asked for.
+    ///
+    /// This is the check for the worst bug this window has had: the overlay's
+    /// dimmed background and its bright selection are both *sub-rectangles* of
+    /// one captured DIB, and if the source rectangle of such a blit is
+    /// interpreted against the wrong end of the bitmap, the picture the user
+    /// drags over has nothing to do with the picture underneath it — while the
+    /// file that comes out (a plain crop of the buffer) is perfectly correct.
+    #[test]
+    #[ignore = "needs a desktop session (a screen DC)"]
+    fn a_region_blit_lands_on_the_rows_it_was_asked_for() {
+        const W: i32 = 8;
+        const H: i32 = 16;
+        // Every row carries its own index in the blue channel.
+        let mut shot = Shot {
+            width: W,
+            height: H,
+            bgra: vec![0; (W * H * 4) as usize],
+        };
+        for y in 0..H {
+            for x in 0..W {
+                let at = ((y * W + x) * 4) as usize;
+                shot.bgra[at] = y as u8;
+                shot.bgra[at + 3] = 0xFF;
+            }
+        }
+
+        let window_dc = unsafe { GetDC(None) };
+        let frame = Frame::new(window_dc, W, H).expect("a frame");
+        let area = Area {
+            left: 0,
+            top: 4,
+            right: W,
+            bottom: 12,
+        };
+        blit_dib(frame.dc, &shot, area);
+        unsafe { ReleaseDC(None, window_dc) };
+
+        let blue = |y: i32| unsafe { *frame.bits.add((y * W * 4) as usize) };
+        for y in area.top..area.bottom {
+            assert_eq!(
+                blue(y),
+                y as u8,
+                "row {y} of the frame holds row {} of the shot: the source                  rectangle is being read from the wrong end",
+                blue(y)
+            );
+        }
+    }
 
     #[test]
     fn a_drag_normalises_whichever_way_it_went() {
