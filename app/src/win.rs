@@ -5,9 +5,9 @@
 //!
 //! * `widget` — the launcher + adaptive audio component, floating over the
 //!   taskbar. Created at startup, lives for the whole session.
-//! * `flyout` — the task list / clipboard panel, anchored to the widget bar.
-//!   Created on first use, then hidden and reused: recreating a webview costs
-//!   a few hundred milliseconds, which is very noticeable on a click.
+//! Only the widget bar's *webview fallback* is a window here: the flyout panel
+//! and the settings centre are drawn natively, by [`beautify_flyout`] and
+//! [`beautify_settings`] respectively, and each owns its own window.
 //!
 //! The settings window is *not* here: it is drawn natively by
 //! [`beautify_settings`], which owns its own window, and is reached through
@@ -16,7 +16,6 @@
 use beautify_core::config::{Config, WidgetAnchor, WidgetRenderer};
 use beautify_core::geometry::Rect;
 use beautify_taskbar::shell;
-use std::time::Duration;
 use tauri::{
     AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
@@ -25,12 +24,9 @@ use tauri::{
 use crate::state::AppState;
 
 pub const WIDGET: &str = "widget";
-pub const FLYOUT: &str = "flyout";
 
 /// Vertical inset of the widget bar inside the taskbar rect, in physical px.
 const WIDGET_VERTICAL_INSET: i32 = 3;
-/// Window during which a focus loss right after showing the flyout is ignored.
-const FOCUS_GRACE_MS: u64 = 900;
 /// Gap between the widget bar and the flyout.
 const FLYOUT_GAP: i32 = 6;
 /// Height used when the bar is anchored to the work area rather than the taskbar.
@@ -310,185 +306,18 @@ pub fn bar_rect(app: &AppHandle, config: &Config) -> Rect {
     )
 }
 
-/// Hide the flyout whenever it loses focus — that is the "click outside closes
-/// it" contract, and doing it from the window event means it also works when
-/// the click landed on the taskbar, the desktop or another app.
+/// Show the panel on `tab`.
 ///
-/// Registered exactly once per window: `show_flyout` runs on every open, and
-/// stacking a handler per call would hide the window on the first focus blip.
-///
-/// The grace period matters. `set_focus` on a process that does not own the
-/// foreground is refused by Windows, and the resulting activate/deactivate
-/// churn arrives as a `Focused(false)` right after we showed the window — which
-/// would otherwise slam it shut again before it ever painted.
-fn foreground_is_ours() -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-    let foreground = unsafe { GetForegroundWindow() };
-    if foreground.is_invalid() {
-        return false;
-    }
-    let mut process = 0u32;
-    unsafe {
-        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(foreground, Some(&mut process));
-    }
-    process == std::process::id()
-}
-
-fn attach_auto_dismiss(window: &WebviewWindow) {
-    let handle = window.clone();
-    let shown_at = std::sync::Arc::new(parking_lot::Mutex::new(std::time::Instant::now()));
-    window.on_window_event(move |event| {
-        if matches!(event, tauri::WindowEvent::Focused(false)) {
-            let elapsed = shown_at.lock().elapsed();
-            if elapsed < Duration::from_millis(FOCUS_GRACE_MS) {
-                tracing::debug!("ignoring a focus loss {elapsed:?} after showing the flyout");
-                return;
-            }
-            // Focus moving to one of our own windows (the settings centre, say)
-            // is not the user clicking away.
-            if foreground_is_ours() {
-                tracing::debug!("flyout kept: focus moved to another WinBeautify window");
-                return;
-            }
-            tracing::debug!("flyout dismissed: focus moved elsewhere");
-            let _ = handle.hide();
-            let app = handle.app_handle().clone();
-            publish_flyout_visibility(&app, false);
-        }
-    });
-}
-
-/// Create the flyout if needed and show it on `tab`.
+/// The panel is a native window of this process now; its placement is still
+/// resolved here, because that is the one place that knows the taskbar geometry
+/// and the configured anchor.
 pub fn show_flyout(app: &AppHandle, tab: beautify_core::model::FlyoutTab) -> tauri::Result<()> {
-    let state = app.state::<std::sync::Arc<AppState>>();
-    let config = state.config.get();
-    *state.flyout_tab.write() = tab;
-
-    let window = match app.get_webview_window(FLYOUT) {
-        Some(existing) => existing,
-        None => {
-            let builder = WebviewWindowBuilder::new(
-                app,
-                FLYOUT,
-                WebviewUrl::App("flyout.html".into()),
-            )
-            .title("WinBeautify")
-            .inner_size(config.widget.flyout_width as f64, config.widget.flyout_height as f64)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .resizable(false)
-            .maximizable(false)
-            .minimizable(false)
-            .visible(false);
-
-            // Same panel treatment as the widget bar, plus a drop shadow so it
-            // reads as a layer above the taskbar.
-            let created = apply_panel_style(builder, config.widget.corner_radius as f64)
-                .shadow(true)
-                .build()?;
-            attach_auto_dismiss(&created);
-            created
-        }
-    };
-
-    // Re-read the config: it may have changed since the window was built.
-    let _ = window.set_size(PhysicalSize::new(
-        config.widget.flyout_width as u32,
-        config.widget.flyout_height as u32,
-    ));
-    let (x, y) = flyout_position(
-        &config,
-        bar_rect(app, &config),
-        (config.widget.flyout_width, config.widget.flyout_height),
-    );
-    let _ = window.set_position(PhysicalPosition::new(x, y));
-    window.show()?;
-    publish_flyout_visibility(app, true);
-    let _ = window.set_focus();
-
-    // Claim the foreground from the *main* thread — the one that owns the
-    // window — after the show has been processed.
-    let handle = app.clone();
-    let _ = app.run_on_main_thread(move || claim_foreground(&handle));
-    tracing::debug!(?tab, x, y, "flyout shown");
+    crate::flyout::show(app, tab);
     Ok(())
 }
 
-/// Take the foreground for the flyout window.
-///
-/// # Why this is not just `set_focus`
-///
-/// The launcher is a `WS_EX_NOACTIVATE` window. Clicking it does *not* hand our
-/// process the foreground the way an ordinary click would, so Windows refuses
-/// the flyout's activation request, focus snaps back to whatever the user was
-/// in, and our own focus-loss handler dismisses the flyout before it is ever
-/// seen.
-///
-/// The documented remedy is to share the input queue with the current
-/// foreground thread for the duration of the call: while attached, the
-/// "only the foreground process may set the foreground window" rule is not
-/// applied. This is the standard technique for a non-activating overlay that
-/// has to open a focusable popup.
-fn claim_foreground(app: &AppHandle) {
-    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
-    };
-
-    let Some(window) = app.get_webview_window(FLYOUT) else {
-        return;
-    };
-    if !window.is_visible().unwrap_or(false) {
-        return;
-    }
-    let Ok(handle) = window.hwnd() else {
-        return;
-    };
-    let hwnd = windows::Win32::Foundation::HWND(handle.0);
-
-    unsafe {
-        let foreground = GetForegroundWindow();
-        let foreground_thread = if foreground.is_invalid() {
-            0
-        } else {
-            GetWindowThreadProcessId(foreground, None)
-        };
-        let this_thread = GetCurrentThreadId();
-        let attached = foreground_thread != 0
-            && foreground_thread != this_thread
-            && AttachThreadInput(this_thread, foreground_thread, true).as_bool();
-
-        let _ = SetForegroundWindow(hwnd);
-        let _ = BringWindowToTop(hwnd);
-
-        if attached {
-            let _ = AttachThreadInput(this_thread, foreground_thread, false);
-        }
-    }
-}
-
 pub fn hide_flyout(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(FLYOUT) {
-        let _ = window.hide();
-    }
-    publish_flyout_visibility(app, false);
-}
-
-/// Record that the flyout is up or down, and tell the native bar.
-///
-/// The atomic is what the launcher's click handler reads, and the widget flag is
-/// what makes the launcher draw itself lit. They have to move together: setting
-/// only the atomic left the button highlighted after the panel had gone, because
-/// the renderer was still being told the flyout was open.
-///
-/// Every path that shows or hides the flyout — the X button, the launcher
-/// itself, clicking away and losing focus — funnels through here.
-fn publish_flyout_visibility(app: &AppHandle, visible: bool) {
-    let state = app.state::<std::sync::Arc<AppState>>();
-    state
-        .flyout_visible
-        .store(visible, std::sync::atomic::Ordering::Release);
-    state.widget.set_flyout_open(visible);
+    crate::flyout::hide(app);
 }
 
 pub fn current_widget_width(app: &AppHandle) -> i32 {

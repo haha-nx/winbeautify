@@ -125,6 +125,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "beautify-flyout"
+version = "0.1.0"
+dependencies = [
+ "beautify-core",
+ "beautify-widget",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "beautify-media"
 version = "0.1.0"
 dependencies = [
@@ -4335,6 +4345,7 @@ version = "0.1.0"
 dependencies = [
  "beautify-clipboard",
  "beautify-core",
+ "beautify-flyout",
  "beautify-media",
  "beautify-settings",
  "beautify-snip",

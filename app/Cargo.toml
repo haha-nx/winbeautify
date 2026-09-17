@@ -22,6 +22,7 @@ beautify-todo.workspace = true
 beautify-widget.workspace = true
 # The settings centre and the snipper are native windows of this process now,
 # not webviews; both are driven through the `Host` traits they define.
+beautify-flyout.workspace = true
 beautify-settings.workspace = true
 beautify-snip.workspace = true
 

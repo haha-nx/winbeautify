@@ -1,11 +1,12 @@
 import { defineConfig } from "vite";
 
-// Two separate windows, two separate HTML entries. Keeping them as real pages
-// (rather than one SPA with routing) is what lets the widget bar stay a ~400x44
+// One HTML entry, for the WebView2 fallback of the widget bar. Keeping it a real
+// page (rather than an SPA with routing) is what lets the bar stay a ~400x44
 // transparent window with no router, no framework and almost no JS.
 //
-// The settings centre used to be a third entry. It is a native Direct2D window
-// now, drawn by `beautify-settings`, so there is no page to build for it.
+// The settings centre and the flyout panel used to be entries here. Both are
+// native Direct2D windows now — drawn by `beautify-settings` and
+// `beautify-flyout` — so there is no page to build for either.
 //
 // Vite is run from this directory, so `root` is the default and the entry
 // paths are relative to it.
@@ -21,7 +22,6 @@ export default defineConfig({
     rollupOptions: {
       input: {
         widget: "widget.html",
-        flyout: "flyout.html",
       },
     },
   },

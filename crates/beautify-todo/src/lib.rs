@@ -130,6 +130,12 @@ pub enum TaskFilter {
     /// Open tasks only, due today or undated.
     #[default]
     Today,
+    /// Today's plate with the finished items still in it.
+    ///
+    /// What the flyout shows: ticking a task off must not make it vanish under
+    /// the pointer, or a mis-click has nothing to undo it, and the list is where
+    /// the day's work is reviewed rather than only where it is queued.
+    TodayAll,
     /// Open tasks only, everything.
     Open,
     /// Everything, newest first.
@@ -242,6 +248,17 @@ impl TaskStore {
                     "SELECT {COLUMNS} FROM tasks
                      WHERE done = 0 AND (due_at IS NULL OR due_at < ?1)
                      ORDER BY position ASC, created_at ASC"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let end_of_today = end_of_today_millis();
+                let mapped = stmt.query_map(params![end_of_today], row_to_task)?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            TaskFilter::TodayAll => {
+                let sql = format!(
+                    "SELECT {COLUMNS} FROM tasks
+                     WHERE due_at IS NULL OR due_at < ?1
+                     ORDER BY done ASC, position ASC, created_at ASC"
                 );
                 let mut stmt = conn.prepare(&sql)?;
                 let end_of_today = end_of_today_millis();

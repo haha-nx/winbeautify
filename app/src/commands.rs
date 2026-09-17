@@ -381,12 +381,13 @@ impl From<FlyoutTabArg> for FlyoutTab {
 
 #[tauri::command]
 pub fn show_flyout(app: AppHandle, tab: FlyoutTabArg) -> R<()> {
-    win::show_flyout(&app, tab.into()).map_err(|e| err("showing the flyout", e))
+    crate::flyout::show(&app, tab.into());
+    Ok(())
 }
 
 #[tauri::command]
 pub fn hide_flyout(app: AppHandle) {
-    win::hide_flyout(&app);
+    crate::flyout::hide(&app);
 }
 
 #[tauri::command]

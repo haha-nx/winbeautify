@@ -19,6 +19,7 @@
 // module named `windows` would shadow it; `win` is the window manager.
 mod autostart;
 mod commands;
+mod flyout;
 mod hotkeys;
 mod settings;
 mod snip;
@@ -108,6 +109,13 @@ fn main() {
             bridge_events(&handle);
             state.start_modules();
             push_widget_state(&handle);
+
+            // A pin put on screen or taken away from its own ✕ changes which
+            // clipboard rows are lit, and the panel may be open while it happens.
+            beautify_snip::on_pins_changed({
+                let handle = handle.clone();
+                move || flyout::refresh(&handle)
+            });
 
             if let Err(e) = tray::install(&handle) {
                 tracing::error!("tray icon unavailable: {e}");
@@ -254,6 +262,7 @@ fn bridge_events(app: &AppHandle) {
                 win::reposition_widget(&handle, width);
             }
             Event::ClipboardChanged => {
+                flyout::refresh(&handle);
                 let _ = handle.emit("clipboard-changed", ());
             }
             Event::TodoChanged => {
@@ -262,6 +271,7 @@ fn bridge_events(app: &AppHandle) {
                         handle.state::<Arc<AppState>>().widget.set_open_tasks(count);
                     }
                 }
+                flyout::refresh(&handle);
                 let _ = handle.emit("todo-changed", ());
             }
             Event::ThemeChanged | Event::ConfigChanged => {
@@ -333,9 +343,7 @@ pub fn shutdown(app: &AppHandle) {
         return;
     }
     tracing::info!("shutting down");
-    if let Some(window) = app.get_webview_window(win::FLYOUT) {
-        let _ = window.hide();
-    }
+    crate::flyout::hide(app);
     state.stop_modules();
     app.exit(0);
 }

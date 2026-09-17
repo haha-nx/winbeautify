@@ -2,40 +2,49 @@
 
 use crate::paths;
 
-/// Every crate in the workspace, so the default filter can name them.
+/// Third-party crates that are chatty even at `debug`.
 ///
-/// A directive matches a target as a module path, so `beautify` does **not**
-/// cover `beautify_media` — the crates have to be listed. (This used to be a
-/// single `beautify_{level}` directive, which built the target name
-/// `beautify_info` and matched nothing: every module crate was silent unless
-/// `RUST_LOG` was set, including the warnings meant for the user.)
-const CRATES: [&str; 6] = [
-    "beautify_core",
-    "beautify_taskbar",
-    "beautify_media",
-    "beautify_clipboard",
-    "beautify_todo",
-    "beautify_widget",
+/// The filter is *the configured level for everything*, with these quietened.
+/// The previous shape — a level per workspace crate, listed by name — was a trap
+/// that has now caught three crates in a row: a directive matches a target as a
+/// module path, so a crate that is not named is silent, and `beautify_snip`,
+/// `beautify_settings` and `beautify_flyout` each lost their warnings and errors
+/// (including the one that would have explained why a window never appeared).
+/// Listing what to *silence* means a new crate is covered the day it is added.
+const QUIET: [&str; 8] = [
+    "winit",
+    "tao",
+    "wry",
+    "tauri",
+    "muda",
+    "tray_icon",
+    "hyper",
+    "mio",
 ];
 
 /// Install the global subscriber.
+///
 ///
 /// Console output is always on (the app is normally launched from Explorer, so
 /// this is harmless); the rotating file sink is opt-in because writing a log
 /// every few seconds would burn through SSD writes for no benefit on a healthy
 /// install.
+/// The default filter directives for `level`.
+pub fn directives(level: &str) -> String {
+    let mut directives = level.to_string();
+    for krate in QUIET {
+        directives.push_str(&format!(",{krate}=warn"));
+    }
+    directives
+}
+
 pub fn init(level: &str, to_file: bool) {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
 
     // `RUST_LOG` wins so a user can debug without editing config.toml.
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        let mut directives = format!("winbeautify={level}");
-        for krate in CRATES {
-            directives.push_str(&format!(",{krate}={level}"));
-        }
-        EnvFilter::new(directives)
-    });
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(directives(level)));
 
     let registry = tracing_subscriber::registry().with(filter);
 
@@ -58,4 +67,34 @@ pub fn init(level: &str, to_file: bool) {
     let _ = registry
         .with(tracing_subscriber::fmt::layer().with_ansi(false))
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_filter_covers_every_crate_by_default() {
+        let text = directives("debug");
+        // No workspace crate is named, so none can be forgotten: a crate added
+        // tomorrow inherits the configured level.
+        assert!(
+            !text.contains("beautify_"),
+            "our own crates must not need an entry: {text}"
+        );
+        assert!(text.starts_with("debug,"), "the level leads: {text}");
+        // …and the noisy ones are quietened.
+        for krate in ["winit", "tauri", "wry"] {
+            assert!(
+                text.contains(&format!("{krate}=warn")),
+                "{krate} should be quietened: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_configured_level_is_the_one_used() {
+        assert!(directives("info").starts_with("info,"));
+        assert!(directives("warn").starts_with("warn,"));
+    }
 }

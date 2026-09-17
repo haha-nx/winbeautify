@@ -8,6 +8,7 @@ members = [
     "crates/beautify-todo",
     "crates/beautify-snip",
     "crates/beautify-settings",
+    "crates/beautify-flyout",
     "crates/beautify-widget",
     "app",
 ]
@@ -28,6 +29,7 @@ beautify-clipboard = { path = "crates/beautify-clipboard" }
 beautify-todo = { path = "crates/beautify-todo" }
 beautify-widget = { path = "crates/beautify-widget" }
 beautify-settings = { path = "crates/beautify-settings" }
+beautify-flyout = { path = "crates/beautify-flyout" }
 beautify-snip = { path = "crates/beautify-snip" }
 
 windows = "0.62"

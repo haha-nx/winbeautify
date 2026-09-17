@@ -227,11 +227,13 @@ fn dispatch(app: &AppHandle, action: HotkeyAction) {
         HotkeyAction::OpenTodo => beautify_core::model::FlyoutTab::Todo,
         HotkeyAction::Snip | HotkeyAction::PinClipboard => unreachable!("handled above"),
     };
-    // Toggle: pressing the hotkey while the flyout is up should put it away.
+    // Toggle: pressing the hotkey while the panel is up should put it away. The
+    // flag is the authoritative answer, because asking a window whether it is
+    // visible round-trips to the main thread.
     let visible = app
-        .get_webview_window(win::FLYOUT)
-        .and_then(|w| w.is_visible().ok())
-        .unwrap_or(false);
+        .state::<std::sync::Arc<crate::state::AppState>>()
+        .flyout_visible
+        .load(std::sync::atomic::Ordering::Acquire);
     if visible {
         win::hide_flyout(app);
     } else if let Err(e) = win::show_flyout(app, tab) {

@@ -1,0 +1,31 @@
+[package]
+name = "beautify-flyout"
+description = "Native task list and clipboard panel for WinBeautify."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+beautify-core.workspace = true
+# The panel draws with the same Direct2D primitives and text engine as the
+# widget bar and the settings window; a second text cache would be a second set
+# of font fallbacks to keep in step.
+beautify-widget.workspace = true
+tracing.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+]

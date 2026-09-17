@@ -47,6 +47,9 @@ pub struct AppState {
     pub taskbar_state: RwLock<TaskbarState>,
     /// Global hotkeys, rebuilt whenever the configured bindings change.
     pub hotkeys: Mutex<Option<HotkeyRegistry>>,
+    /// The native flyout panel — task list and clipboard history — created on
+    /// first use and then hidden and reused.
+    pub flyout_panel: Mutex<Option<beautify_flyout::Panel>>,
     /// The native settings window, created on first use.
     ///
     /// Its `Host` implementation needs an `AppHandle`, which does not exist
@@ -101,6 +104,7 @@ impl AppState {
             taskbar_state: RwLock::new(TaskbarState::default()),
             flyout_visible: AtomicBool::new(false),
             hotkeys: Mutex::new(None),
+            flyout_panel: Mutex::new(None),
             settings_window: Mutex::new(None),
             last_action: RwLock::new(String::new()),
             shutting_down: AtomicBool::new(false),
@@ -137,6 +141,9 @@ impl AppState {
         beautify_snip::close_all_pins();
         if let Some(window) = self.settings_window.lock().take() {
             window.close();
+        }
+        if let Some(panel) = self.flyout_panel.lock().take() {
+            panel.hide();
         }
         self.registry.stop_all();
     }
