@@ -109,8 +109,17 @@ impl LayeredSurface {
     /// Replace the pixel buffer and push it to the screen.
     ///
     /// `source` is premultiplied BGRA, top-down, `stride` bytes per row — which
-    /// is exactly what a `32bppPBGRA` WIC bitmap locks as.
-    pub fn present(&mut self, source: &[u8], source_stride: usize, x: i32, y: i32) {
+    /// is exactly what a `32bppPBGRA` WIC bitmap locks as. The result is handed
+    /// back rather than dropped: `UpdateLayeredWindow` failing is the difference
+    /// between a bar that is drawn and one that is not on the screen at all, and
+    /// nothing else in the process can tell.
+    pub fn present(
+        &mut self,
+        source: &[u8],
+        source_stride: usize,
+        x: i32,
+        y: i32,
+    ) -> windows::core::Result<()> {
         let rows = self.height as usize;
         let copy_row = self.stride.min(source_stride);
         for row in 0..rows {
@@ -127,18 +136,18 @@ impl LayeredSurface {
                 );
             }
         }
-        self.flush(x, y);
+        self.flush(x, y)
     }
 
     /// Clear the surface to fully transparent and push it.
-    pub fn clear(&mut self, x: i32, y: i32) {
+    pub fn clear(&mut self, x: i32, y: i32) -> windows::core::Result<()> {
         unsafe {
             std::ptr::write_bytes(self.bits, 0, self.stride * self.height as usize);
         }
-        self.flush(x, y);
+        self.flush(x, y)
     }
 
-    fn flush(&self, x: i32, y: i32) {
+    fn flush(&self, x: i32, y: i32) -> windows::core::Result<()> {
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             BlendFlags: 0,
@@ -146,7 +155,7 @@ impl LayeredSurface {
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
         unsafe {
-            let _ = UpdateLayeredWindow(
+            UpdateLayeredWindow(
                 self.hwnd,
                 Some(self.screen_dc),
                 Some(&POINT { x, y }),
@@ -160,7 +169,7 @@ impl LayeredSurface {
                 COLORREF(0),
                 Some(&blend),
                 ULW_ALPHA,
-            );
+            )
         }
     }
 }

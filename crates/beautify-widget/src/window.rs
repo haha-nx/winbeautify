@@ -25,9 +25,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    KillTimer, PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow,
-    TranslateMessage, GWLP_HWNDPARENT, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOMOVE,
+    GetWindow, GetWindowLongW, KillTimer, PostQuitMessage, RegisterClassExW, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, GWL_EXSTYLE, GWLP_HWNDPARENT,
+    GW_HWNDPREV, HWND_TOP, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
     SWP_NOSIZE, SW_SHOWNOACTIVATE, WM_APP, WM_CLOSE, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
     WM_MOUSEMOVE, WM_TIMER,
     WNDCLASSEXW, WINDOW_EX_STYLE, WS_POPUP, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
@@ -182,6 +182,55 @@ fn window_origin(anchor_x: i32, width: i32, inset: f32, align: Align) -> i32 {
     }
 }
 
+fn is_topmost(hwnd: HWND) -> bool {
+    let style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
+    (style & WS_EX_TOPMOST.0 as i32) != 0
+}
+
+/// What a frame actually contains: how many pixels have any alpha, the
+/// strongest alpha, and the box the ink is in.
+///
+/// The one reading that separates "the bar is drawn" from "the bar is a
+/// transparent window nobody can see".
+#[derive(Debug, Clone, Copy)]
+struct Ink {
+    inked: usize,
+    peak: u8,
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+}
+
+fn frame_ink(pixels: &[u8], stride: usize) -> Ink {
+    let stride = stride.max(4);
+    let mut ink = Ink {
+        inked: 0,
+        peak: 0,
+        left: usize::MAX,
+        top: usize::MAX,
+        right: 0,
+        bottom: 0,
+    };
+    for (row, line) in pixels.chunks(stride).enumerate() {
+        for (column, pixel) in line.chunks_exact(4).enumerate() {
+            if pixel[3] != 0 {
+                ink.inked += 1;
+                ink.left = ink.left.min(column);
+                ink.top = ink.top.min(row);
+                ink.right = ink.right.max(column);
+                ink.bottom = ink.bottom.max(row);
+            }
+            ink.peak = ink.peak.max(pixel[3]);
+        }
+    }
+    if ink.inked == 0 {
+        ink.left = 0;
+        ink.top = 0;
+    }
+    ink
+}
+
 /// Everything the pump thread owns.
 struct Pump {
     hwnd: HWND,
@@ -201,6 +250,8 @@ struct Pump {
     lyric_width: f32,
     /// Per-tick easing of the width transition, derived from `animation_ms`.
     easing: f32,
+    /// Set once the bar has said it has nothing to draw on, so it says it once.
+    blank_reported: bool,
 }
 
 impl Pump {
@@ -285,14 +336,26 @@ impl Pump {
     }
 
     fn draw(&mut self) {
-        let Some(geometry) = self.geometry else {
+        // Neither can be faked: without geometry there is no place to draw, and
+        // without a surface there is nothing to draw on.
+        let (Some(geometry), Some(surface)) = (self.geometry, self.surface.as_mut()) else {
+            self.report_blank();
             return;
         };
-        let Some(surface) = self.surface.as_mut() else {
-            return;
-        };
+        self.blank_reported = false;
         let state = self.shared.snapshot();
 
+        // How much of the frame is actually opaque. A layer of transparent
+        // pixels is a bar that is not on the screen, and nothing else in the
+        // process can tell that apart from a bar that is perfectly fine.
+        let mut ink = Ink {
+            inked: 0,
+            peak: 0,
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
         let result = self.painter.render(
             &state,
             (geometry.width, geometry.height),
@@ -300,11 +363,104 @@ impl Pump {
             self.bar_width,
             geometry.align,
             state.hover,
-            |pixels, stride| surface.present(pixels, stride, geometry.x, geometry.y),
+            |pixels, stride| {
+                ink = frame_ink(pixels, stride);
+                surface.present(pixels, stride, geometry.x, geometry.y)
+            },
+        );
+        tracing::debug!(
+            bar_width = self.bar_width,
+            target_width = self.target_width,
+            frame = ?(geometry.width, geometry.height),
+            audio = state.content().audio,
+            opacity = state.config.widget.opacity,
+            ?ink,
+            "widget frame"
         );
         if let Err(e) = result {
             tracing::warn!("widget frame failed: {e}");
         }
+    }
+
+    /// Put the bar back where it belongs: directly above the taskbar.
+    ///
+    /// # Why this is needed
+    ///
+    /// The shell re-raises `Shell_TrayWnd` whenever the taskbar's appearance
+    /// changes, and one of those moments is a full-screen window appearing —
+    /// including our own capture overlay, because the taskbar module reacts to
+    /// that. Owning the taskbar is supposed to keep us in front of it, and on
+    /// this build it does not: the bar ends up *behind* the taskbar, still
+    /// drawing, still presenting, still `IsWindowVisible`, and completely
+    /// invisible. That is the bug that could not be found by looking at the
+    /// pixels: every frame succeeds and the screen does not change.
+    ///
+    /// # Why it is placed *above the taskbar* rather than on top of everything
+    ///
+    /// `HWND_TOPMOST` would put the bar at the top of the topmost band — over a
+    /// full-screen capture overlay, over a pinned image, over anything else the
+    /// user has deliberately put in front. What the bar is entitled to is the
+    /// place immediately in front of its owner, so that is what it takes.
+    fn assert_above_taskbar(&mut self) {
+        let Some(taskbar) = shell::primary_taskbar() else {
+            return;
+        };
+        // "Am I where I belong" is exactly "am I the window directly in front of
+        // the taskbar" — the one relationship an owned window is supposed to
+        // keep. Asked rather than walked: a walk up the z-order has to decide
+        // what "above" means and where to stop, and getting that wrong makes a
+        // repair that fires when nothing is broken.
+        let above = unsafe { GetWindow(taskbar, GW_HWNDPREV) }.unwrap_or_default();
+        if above == self.hwnd {
+            return;
+        }
+        unsafe {
+            // Re-stating the ownership too: it is the relationship that is
+            // supposed to make this unnecessary in the first place.
+            SetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT, taskbar.0 as isize);
+            let after = if !above.is_invalid() && is_topmost(above) {
+                above
+            } else {
+                // Nothing topmost in front of the taskbar, so there is nothing
+                // for the bar to stay behind either.
+                HWND_TOP
+            };
+            let result = SetWindowPos(
+                self.hwnd,
+                Some(after),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            );
+            tracing::debug!(
+                taskbar = %shell::class_name(taskbar),
+                above = %shell::class_name(above),
+                after = ?result,
+                "the widget bar was behind the taskbar; put it back in front of it"
+            );
+        }
+    }
+
+    /// Say once that the bar has nowhere to draw.
+    ///
+    /// From the outside this is indistinguishable from "the bar is fine but
+    /// invisible": no window error, no paint error, no pixels. One line per
+    /// outage, and the flag keeps a bar that stays broken from filling the log
+    /// at the safety timer's rate.
+    fn report_blank(&mut self) {
+        if self.blank_reported {
+            return;
+        }
+        self.blank_reported = true;
+        tracing::warn!(
+            has_geometry = self.geometry.is_some(),
+            has_surface = self.surface.is_some(),
+            bar_width = self.bar_width,
+            target_width = self.target_width,
+            "the widget bar has nothing to draw on"
+        );
     }
 
     /// Step the width animation; returns true while it is still running.
@@ -428,6 +584,7 @@ pub fn run(shared: Arc<Shared>) -> Result<(), Box<dyn std::error::Error + Send +
         line_cache: None,
         lyric_width: 0.0,
         easing: ANIMATE_FALLBACK_EASING,
+        blank_reported: false,
     };
     PUMP.with(|slot| *slot.borrow_mut() = Some(pump));
 
@@ -532,6 +689,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // `UpdateLayeredWindow` every tick is the price of a bar that
                     // repairs itself.
                     with_pump(|pump| pump.sync_geometry());
+                    with_pump(|pump| pump.assert_above_taskbar());
                     with_pump(|pump| pump.draw());
                 }
                 _ => {}
@@ -541,6 +699,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_DIRTY => {
             with_pump(|pump| {
                 pump.sync_geometry();
+                pump.assert_above_taskbar();
                 pump.kick_animation();
                 if !pump.animating {
                     pump.draw();

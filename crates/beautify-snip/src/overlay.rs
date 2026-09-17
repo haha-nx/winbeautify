@@ -52,12 +52,13 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW,
-    PostQuitMessage,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW, LoadCursorW,
+    PostMessageW, PostQuitMessage,
     RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
-    CS_DBLCLKS, GWLP_USERDATA, HC_ACTION, HWND_TOPMOST, IDC_CROSS, KBDLLHOOKSTRUCT, MSG,
-    NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_SHOWWINDOW, SW_SHOW,
+    CS_DBLCLKS, GWLP_USERDATA, GW_HWNDPREV, HC_ACTION, HWND_TOPMOST, IDC_CROSS, KBDLLHOOKSTRUCT,
+    MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SW_SHOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WM_CLOSE, WM_DESTROY, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
     WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -470,7 +471,17 @@ fn select(options: Options) -> Result<Captured, Failure> {
     let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }.ok();
 
     let mut message = MSG::default();
+    let mut was_covered = false;
     loop {
+        // Before blocking for the next message, not after: whatever is in front
+        // of the mask has to be put back whether or not the mouse has moved.
+        // Reported on the way in only: a mouse move is one message each, and one
+        // line per repaired message would bury the log during a drag.
+        let covered = assert_topmost(hwnd);
+        if covered && !was_covered {
+            tracing::debug!("something was in front of the capture mask; put it back on top");
+        }
+        was_covered = covered;
         let ret = unsafe { GetMessageW(&mut message, None, 0, 0) };
         if ret.0 <= 0 {
             break;
@@ -521,6 +532,37 @@ fn select(options: Options) -> Result<Captured, Failure> {
     })
 }
 
+/// Put the mask back on top of everything.
+///
+/// A capture overlay is modal: the whole point is that the screen it shows *is*
+/// what will be taken, dimmed, with the selection punched out of it. Any window
+/// in front of it — and on this machine the shell reorders topmost windows on
+/// its own, which is what makes the widget bar disappear behind the taskbar —
+/// is a patch of undimmed, unselected screen that the user reads as part of the
+/// picture. What they then drag a box around is not what they are looking at.
+///
+/// So the invariant is asserted rather than assumed, and only while a session
+/// is running: outside one, the overlay is not on screen at all.
+fn assert_topmost(hwnd: HWND) -> bool {
+    // Nothing in front means nothing to repair. `GW_HWNDPREV` walks the whole
+    // desktop, and everything in front of a topmost window is topmost too.
+    if unsafe { GetWindow(hwnd, GW_HWNDPREV) }.is_err() {
+        return false;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+    true
+}
+
 /// Swallow exactly one key — Escape — while a session is up.
 ///
 /// The overlay usually cannot take the foreground, so this is the only way
@@ -555,6 +597,14 @@ fn repaint(session: &mut Session, area: Area) {
     }
     compose(session, area);
     let rect = area.to_rect();
+    tracing::debug!(
+        left = area.left,
+        top = area.top,
+        right = area.right,
+        bottom = area.bottom,
+        selection = ?session.selection,
+        "overlay repaint"
+    );
     unsafe {
         let _ = InvalidateRect(Some(session.hwnd), Some(&rect), false);
     }
@@ -1021,9 +1071,16 @@ fn border_bands(selection: Area, thickness: i32) -> [Area; 4] {
 /// Copy the part of `shot` that `area` covers into the frame at the same place.
 fn blit_dib(dc: HDC, shot: &Shot, area: Area) {
     if area.width() <= 0 || area.height() <= 0 {
+        tracing::debug!(?area, "a blit was asked for an empty area");
         return;
     }
     if area.left < 0 || area.top < 0 || area.right > shot.width || area.bottom > shot.height {
+        tracing::warn!(
+            ?area,
+            width = shot.width,
+            height = shot.height,
+            "a blit was refused: the area is outside the capture"
+        );
         return;
     }
     let bmi = BITMAPINFO {
@@ -1154,6 +1211,14 @@ unsafe extern "system" fn window_proc(
                         .union(next.inflated(8, width, height)),
                     None => next.inflated(8, width, height),
                 };
+                tracing::debug!(
+                    ?previous,
+                    ?next,
+                    dirty = ?dirty,
+                    stale = ?stale,
+                    fresh = ?fresh,
+                    "drag"
+                );
                 repaint(session, dirty.union(stale).union(fresh));
             });
             LRESULT(0)

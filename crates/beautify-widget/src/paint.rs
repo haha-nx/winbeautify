@@ -165,7 +165,7 @@ impl Painter {
         bar_width: f32,
         align: Align,
         hover: Option<Hit>,
-        out: impl FnOnce(&[u8], usize),
+        out: impl FnOnce(&[u8], usize) -> Result<()>,
     ) -> Result<()> {
         self.ensure_frame(size)?;
         let metrics = Metrics::new(dpi);
@@ -246,8 +246,10 @@ impl Painter {
         let mut length = 0u32;
         unsafe { lock.GetDataPointer(&mut length, &mut pointer)? };
         let pixels = unsafe { std::slice::from_raw_parts(pointer, length as usize) };
-        out(pixels, stride);
-        Ok(())
+        // The presenting step is part of the frame: drawing into a buffer
+        // nothing looks at is not a rendered frame, and the caller has to hear
+        // about the difference.
+        out(pixels, stride)
     }
 
     fn ensure_frame(&mut self, size: (u32, u32)) -> Result<()> {
