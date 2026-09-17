@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL;
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::Graphics::Dwm::{
@@ -31,6 +32,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
+};
+use windows::Win32::UI::Input::Ime::{
+    ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow,
+    CANDIDATEFORM, COMPOSITIONFORM, CFS_CANDIDATEPOS, CFS_POINT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_ESCAPE, VK_RETURN,
@@ -46,9 +51,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SETCURSOR, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::layout::{self, Hit, Metrics, RowTarget, Scene};
+use crate::layout::{self, FooterAction, Hit, Metrics, RowTarget, Scene, Segment};
 use crate::paint::{Icon, Interaction, Painter, Palette};
-use crate::{ClipRow, Host, Tab, TodoRow};
+use crate::{ClipFilter, ClipRow, Host, Tab, TodoPage, TodoRow};
 
 /// Posted to make the panel redraw.
 pub const WM_APP_REFRESH: u32 = WM_APP + 91;
@@ -167,6 +172,10 @@ struct Panel {
     metrics: Metrics,
     palette: Palette,
     tab: Tab,
+    /// Which clipboard kinds are showing.
+    filter: ClipFilter,
+    /// Which half of the task list is showing.
+    page: TodoPage,
     /// The search text on the clipboard tab, or the task being typed on the task
     /// tab. One field, two jobs, matching the layout.
     field_text: String,
@@ -197,6 +206,8 @@ impl Panel {
             // window shows for the few milliseconds before that.
             palette: Palette::resolve(beautify_core::geometry::Color::rgb(0x6C, 0x8C, 0xFF), false),
             tab,
+            filter: ClipFilter::default(),
+            page: TodoPage::default(),
             field_text: String::new(),
             field_focused: false,
             editing_todo: None,
@@ -233,7 +244,7 @@ impl Panel {
             Tab::Todo => String::new(),
         };
         self.clips = match self.tab {
-            Tab::Clipboard => self.host.clipboard_rows(&query, ROW_LIMIT),
+            Tab::Clipboard => self.host.clipboard_rows(&query, self.filter, ROW_LIMIT),
             Tab::Todo => Vec::new(),
         };
         self.todos = match self.tab {
@@ -249,6 +260,8 @@ impl Panel {
                 self.tab,
                 &self.clips,
                 &self.todos,
+                self.filter,
+                self.page,
                 self.stats,
                 &|text, width, px, max_lines| self.text_height(text, width, px, max_lines),
             ),
@@ -279,7 +292,7 @@ impl Panel {
         let (width, height) = self.client_size();
         let (placeholder, empty) = match scene.tab {
             Tab::Clipboard => ("搜索剪贴板…", "还没有记录"),
-            Tab::Todo => ("添加任务，回车确认", "今天没有任务"),
+            Tab::Todo => ("添加任务，回车确认", self.page.empty()),
         };
         let Some(painter) = self.painter.as_mut() else {
             return;
@@ -324,7 +337,22 @@ impl Panel {
         if scene.field.contains(x, y) {
             return Hit::Field;
         }
-        if scene.footer_button.is_some_and(|rect| rect.contains(x, y)) {
+        if scene
+            .segments
+            .iter()
+            .any(|(_, rect)| rect.contains(x, y))
+        {
+            let (segment, _) = scene
+                .segments
+                .iter()
+                .find(|(_, rect)| rect.contains(x, y))
+                .expect("checked above");
+            return Hit::Segment(*segment);
+        }
+        if scene
+            .footer_button
+            .is_some_and(|(_, rect)| rect.contains(x, y))
+        {
             return Hit::FooterButton;
         }
         if scene.scroll_max > 0.0 && scene.scrollbar.contains(x, y) {
@@ -349,10 +377,6 @@ impl Panel {
                         };
                     }
                 }
-                // A section title is a label: clicking it does nothing.
-                if matches!(target, RowTarget::Heading(_)) {
-                    return Hit::Nothing;
-                }
                 Hit::Row(target)
             }
             None => Hit::Nothing,
@@ -368,6 +392,7 @@ impl Panel {
                 self.field_focused = true;
                 self.interaction.editing = true;
                 self.interaction.editing_text = self.field_text.clone();
+                self.place_ime();
                 self.repaint();
             }
             Hit::Scrollbar(fraction) => {
@@ -376,9 +401,24 @@ impl Panel {
                 }
                 self.refresh();
             }
+            Hit::Segment(segment) => self.select_segment(segment),
             Hit::FooterButton => {
-                let removed = self.host.clear_unpinned_clips();
-                tracing::debug!(removed, "cleared unpinned clipboard entries");
+                let action = self
+                    .scene
+                    .as_ref()
+                    .and_then(|scene| scene.footer_button)
+                    .map(|(action, _)| action);
+                match action {
+                    Some(FooterAction::ClearUnpinnedClips) => {
+                        let removed = self.host.clear_unpinned_clips();
+                        tracing::debug!(removed, "cleared unpinned clipboard entries");
+                    }
+                    Some(FooterAction::ClearCompletedTodos) => {
+                        let removed = self.host.clear_completed_todos();
+                        tracing::debug!(removed, "cleared completed tasks");
+                    }
+                    None => {}
+                }
                 self.refresh();
             }
             Hit::Checkbox(index) => {
@@ -447,10 +487,28 @@ impl Panel {
                 self.interaction.editing_row = Some(target);
                 self.interaction.editing_text = task.title.clone();
                 self.editing_todo = Some((task.id, task.title));
+                self.place_ime();
                 self.repaint();
             }
-            RowTarget::Heading(_) => {}
         }
+    }
+
+    /// Show another slice of the list.
+    fn select_segment(&mut self, segment: Segment) {
+        match segment {
+            Segment::Clip(filter) if self.filter != filter => {
+                self.filter = filter;
+                // The list is a different list now, so it starts at the top.
+                self.scroll = 0.0;
+            }
+            Segment::Todo(page) if self.page != page => {
+                self.page = page;
+                self.scroll = 0.0;
+            }
+            _ => return,
+        }
+        self.commit_edit();
+        self.refresh();
     }
 
     fn switch_tab(&mut self, tab: Tab) {
@@ -511,6 +569,7 @@ impl Panel {
             self.interaction.hover_tab,
             self.interaction.hover_close,
             self.interaction.hover_footer,
+            self.interaction.hover_segment,
             self.interaction.hover_checkbox,
         );
         let hit = if inside {
@@ -537,6 +596,10 @@ impl Panel {
         };
         self.interaction.hover_close = hit == Hit::Close;
         self.interaction.hover_footer = hit == Hit::FooterButton;
+        self.interaction.hover_segment = match hit {
+            Hit::Segment(segment) => Some(segment),
+            _ => None,
+        };
 
         previous
             != (
@@ -545,6 +608,7 @@ impl Panel {
                 self.interaction.hover_tab,
                 self.interaction.hover_close,
                 self.interaction.hover_footer,
+                self.interaction.hover_segment,
                 self.interaction.hover_checkbox,
             )
     }
@@ -621,8 +685,72 @@ impl Panel {
         }
     }
 
+    /// The rectangle the text being typed goes in: the field, or the title of
+    /// the task being renamed.
+    fn editing_rect(&self) -> Option<beautify_widget::layout::Rect> {
+        let scene = self.scene.as_ref()?;
+        if let Some(target) = self.interaction.editing_row {
+            return scene.row(target).map(|row| row.title);
+        }
+        Some(scene.field.inset_by(self.metrics.px(9.0), 0.0))
+    }
+
+    /// Put the IME's composition string and candidate list at the caret.
+    ///
+    /// Both fields are *drawn*, so there is no edit control and nothing tells
+    /// the IME where the text is going: the candidate list ends up wherever the
+    /// IME last remembered, which is not under what you are typing. The caret is
+    /// the same measurement the painter makes — the text so far, at the size it
+    /// is drawn — so the two cannot disagree.
+    fn place_ime(&self) {
+        let Some(rect) = self.editing_rect() else {
+            return;
+        };
+        let Some(painter) = self.painter.as_ref() else {
+            return;
+        };
+        let Ok(format) = painter
+            .text
+            .format(self.metrics.title_size(), DWRITE_FONT_WEIGHT_NORMAL)
+        else {
+            return;
+        };
+        let typed = painter
+            .text
+            .measure(&self.interaction.editing_text, &format, rect.width())
+            .min(rect.width());
+        let at = POINT {
+            x: (rect.left + typed) as i32,
+            y: rect.bottom as i32,
+        };
+        unsafe {
+            let himc = ImmGetContext(self.hwnd);
+            if himc.is_invalid() {
+                return;
+            }
+            let composition = COMPOSITIONFORM {
+                dwStyle: CFS_POINT,
+                ptCurrentPos: at,
+                rcArea: RECT::default(),
+            };
+            let _ = ImmSetCompositionWindow(himc, &composition);
+            // The candidate list is a separate window with its own idea of where
+            // it belongs; both have to be told, and the second one is the one
+            // the user actually sees.
+            let candidate = CANDIDATEFORM {
+                dwIndex: 0,
+                dwStyle: CFS_CANDIDATEPOS,
+                ptCurrentPos: at,
+                rcArea: RECT::default(),
+            };
+            let _ = ImmSetCandidateWindow(himc, &candidate);
+            let _ = ImmReleaseContext(self.hwnd, himc);
+        }
+    }
+
     fn backspace(&mut self) {
         self.interaction.editing_text.pop();
+        self.place_ime();
         if let Some((_, text)) = self.editing_todo.as_mut() {
             *text = self.interaction.editing_text.clone();
             self.repaint();
@@ -643,6 +771,7 @@ impl Panel {
             return;
         }
         self.interaction.editing_text.push(ch);
+        self.place_ime();
         if let Some((_, text)) = self.editing_todo.as_mut() {
             *text = self.interaction.editing_text.clone();
             self.repaint();
@@ -737,6 +866,7 @@ impl Panel {
                     || self.interaction.hover_tab.is_some()
                     || self.interaction.hover_close
                     || self.interaction.hover_footer
+                    || self.interaction.hover_segment.is_some()
                     || self.interaction.hover_checkbox.is_some()
                 {
                     IDC_HAND

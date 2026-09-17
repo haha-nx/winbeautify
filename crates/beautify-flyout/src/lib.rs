@@ -26,7 +26,7 @@ pub mod window;
 
 use std::sync::Arc;
 
-pub use layout::{Heading, Hit, Metrics, Row, RowTarget, Rows, Scene, DEFAULT_SIZE};
+pub use layout::{Hit, Metrics, Row, RowTarget, Rows, Scene, Segment, DEFAULT_SIZE};
 pub use paint::{Interaction, Palette};
 pub use window::{scaled_size, FlyoutWindow};
 
@@ -61,6 +61,76 @@ pub enum ClipKind {
 impl ClipKind {
     pub const fn is_image(self) -> bool {
         matches!(self, ClipKind::Image)
+    }
+}
+
+/// Which clipboard entries the panel shows.
+///
+/// The webview panel had these as a row of chips and they were worth keeping:
+/// "the screenshot I took a minute ago" and "that text" are different searches,
+/// and scrolling a mixed list to find one of them is the thing the filter
+/// exists to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipFilter {
+    #[default]
+    All,
+    Text,
+    Image,
+    Files,
+    Link,
+}
+
+impl ClipFilter {
+    pub const ALL: [ClipFilter; 5] = [
+        ClipFilter::All,
+        ClipFilter::Text,
+        ClipFilter::Image,
+        ClipFilter::Files,
+        ClipFilter::Link,
+    ];
+
+    /// Two characters each, so the chips are all the same width and the row
+    /// does not have to be measured to be laid out.
+    pub const fn label(self) -> &'static str {
+        match self {
+            ClipFilter::All => "全部",
+            ClipFilter::Text => "文本",
+            ClipFilter::Image => "图片",
+            ClipFilter::Files => "文件",
+            ClipFilter::Link => "链接",
+        }
+    }
+}
+
+/// Which half of the task list the panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TodoPage {
+    #[default]
+    Open,
+    Done,
+}
+
+impl TodoPage {
+    pub const ALL: [TodoPage; 2] = [TodoPage::Open, TodoPage::Done];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            TodoPage::Open => "未完成",
+            TodoPage::Done => "已完成",
+        }
+    }
+
+    /// Does this page hold the tasks that have been ticked off?
+    pub const fn is_done(self) -> bool {
+        matches!(self, TodoPage::Done)
+    }
+
+    /// What the list says when it is empty.
+    pub const fn empty(self) -> &'static str {
+        match self {
+            TodoPage::Open => "今天没有待办，享受一下吧",
+            TodoPage::Done => "还没有已完成的任务",
+        }
     }
 }
 
@@ -109,7 +179,7 @@ pub struct TodoRow {
 /// and sends back the clicks. That keeps this crate free of any dependency on the
 /// binary that hosts it, and means the lists cannot drift from the database.
 pub trait Host: Send + Sync {
-    fn clipboard_rows(&self, query: &str, limit: u32) -> Vec<ClipRow>;
+    fn clipboard_rows(&self, query: &str, filter: ClipFilter, limit: u32) -> Vec<ClipRow>;
     fn clipboard_stats(&self) -> (i64, i64);
 
     fn copy_clip(&self, id: i64);

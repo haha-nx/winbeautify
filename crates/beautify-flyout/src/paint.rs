@@ -22,7 +22,7 @@ use beautify_widget::canvas::{Canvas, TextEngine};
 use beautify_widget::layout::Rect;
 use beautify_widget::theme::Rgba;
 
-use crate::layout::{Heading, Metrics, Row, RowTarget, Scene, LINE_SPACING};
+use crate::layout::{FooterAction, Metrics, Row, RowTarget, Scene, Segment, LINE_SPACING};
 use crate::{ClipKind, ClipRow, Tab, TodoRow};
 
 const LABEL_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_NORMAL;
@@ -58,6 +58,8 @@ pub struct Interaction {
     pub hover_tab: Option<Tab>,
     pub hover_close: bool,
     pub hover_footer: bool,
+    /// The segmented button under the pointer.
+    pub hover_segment: Option<Segment>,
     /// True while the pointer is over the check box of a task row.
     pub hover_checkbox: Option<usize>,
     /// The field has focus and is being typed into.
@@ -270,6 +272,7 @@ impl Painter {
 
         self.draw_header(canvas, scene, metrics, palette, interaction)?;
         self.draw_field(canvas, scene, metrics, palette, interaction, placeholder);
+        self.draw_segments(canvas, scene, metrics, palette, interaction)?;
 
         canvas.clipped(scene.list, || {
             for row in &scene.rows {
@@ -398,30 +401,47 @@ impl Painter {
         }
     }
 
-    /// A section title: a quiet label over the rows it introduces.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_heading(
+    /// The row of segmented buttons under the field.
+    ///
+    /// Drawn like the tabs, because that is what they are: a small set of
+    /// mutually exclusive choices, with the current one lit in the accent rather
+    /// than filled like a button — five filled chips would outweigh the list
+    /// they are filtering.
+    fn draw_segments(
         &self,
         canvas: &Canvas<'_>,
         scene: &Scene,
-        row: &Row,
-        heading: Heading,
-        todos: &[TodoRow],
         metrics: &Metrics,
         palette: &Palette,
-    ) {
-        self.divider(canvas, scene, row, metrics, palette);
-        let Ok(format) = self.text.format(metrics.meta_size(), TITLE_WEIGHT) else {
-            return;
-        };
-        // Counted from the tasks rather than from the visible rows: the number
-        // is the section's size, not how much of it fits on screen.
-        let count = todos
-            .iter()
-            .filter(|task| task.done == (heading == Heading::Done))
-            .count();
-        let label = format!("{} · {count}", heading.label());
-        self.text_in(canvas, row.title, &label, &format, palette.text_faint);
+        interaction: &Interaction,
+    ) -> Result<()> {
+        let format = self.text.format_aligned(
+            metrics.meta_size(),
+            LABEL_WEIGHT,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+        )?;
+        for (segment, rect) in &scene.segments {
+            let selected = match segment {
+                Segment::Clip(filter) => scene.tab == Tab::Clipboard && scene.filter == *filter,
+                Segment::Todo(page) => scene.tab == Tab::Todo && scene.page == *page,
+            };
+            if selected {
+                canvas.fill_rounded(*rect, metrics.px(12.0), palette.accent.with_alpha(0.22));
+            } else if interaction.hover_segment == Some(*segment) {
+                canvas.fill_rounded(*rect, metrics.px(12.0), palette.hover);
+            }
+            let colour = if selected {
+                palette.accent
+            } else {
+                palette.text_dim
+            };
+            let label = match segment {
+                Segment::Clip(filter) => filter.label(),
+                Segment::Todo(page) => page.label(),
+            };
+            self.text_in(canvas, *rect, label, &format, colour);
+        }
+        Ok(())
     }
 
     /// The hairline between two rows, inset so the list reads as a list rather
@@ -460,10 +480,6 @@ impl Painter {
         palette: &Palette,
         interaction: &Interaction,
     ) {
-        if let RowTarget::Heading(heading) = row.target {
-            self.draw_heading(canvas, scene, row, heading, todos, metrics, palette);
-            return;
-        }
         if interaction.hover_row == Some(row.target) {
             canvas.fill_rect(row.rect, palette.hover);
         }
@@ -484,7 +500,6 @@ impl Painter {
                     self.draw_thumbnail(canvas, row, entry, metrics, palette);
                 }
             }
-            RowTarget::Heading(_) => {}
         }
 
         if let Err(e) = self.draw_row_text(canvas, clips, todos, row, metrics, palette, interaction)
@@ -594,7 +609,6 @@ impl Painter {
     ) -> Result<()> {
         let editing = interaction.editing_row == Some(row.target);
         match row.target {
-            RowTarget::Heading(_) => Ok(()),
             RowTarget::Todo(index) => {
                 let task = todos.get(index);
                 let done = task.is_some_and(|task| task.done);
@@ -729,6 +743,8 @@ impl Painter {
         };
         let text = match scene.tab {
             Tab::Clipboard => format!("{} 条 · 收藏 {}", stats.0, stats.1),
+            // The task tab's state is in its two pages; the footer holds the
+            // button that clears the finished ones.
             Tab::Todo => String::new(),
         };
         self.text_in(
@@ -744,7 +760,7 @@ impl Painter {
             palette.text_faint,
         );
 
-        if let Some(button) = scene.footer_button {
+        if let Some((action, button)) = scene.footer_button {
             let lit = interaction.hover_footer;
             canvas.fill_rounded(
                 button,
@@ -757,7 +773,11 @@ impl Painter {
                 LABEL_WEIGHT,
                 DWRITE_TEXT_ALIGNMENT_CENTER,
             ) {
-                self.text_in(canvas, button, "清空未收藏", &centred, palette.danger);
+                let label = match action {
+                    FooterAction::ClearUnpinnedClips => "清空未收藏",
+                    FooterAction::ClearCompletedTodos => "清空已完成",
+                };
+                self.text_in(canvas, button, label, &centred, palette.danger);
             }
         }
     }

@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use beautify_flyout::{ClipKind, ClipRow, Host, Panel, Tab, TodoRow};
+use beautify_flyout::{ClipFilter, ClipKind, ClipRow, Host, Panel, Tab, TodoRow};
 use beautify_todo::{TaskFilter, TaskPatch};
 use parking_lot::Mutex;
 use tauri::{AppHandle, Manager};
@@ -111,12 +111,22 @@ fn shot_from_file(path: &str) -> Option<beautify_snip::Shot> {
 }
 
 impl Host for FlyoutHost {
-    fn clipboard_rows(&self, query: &str, limit: u32) -> Vec<ClipRow> {
+    fn clipboard_rows(&self, query: &str, filter: ClipFilter, limit: u32) -> Vec<ClipRow> {
+        use beautify_clipboard::store::ClipFilter as Store;
         let state = self.state();
         let Some(store) = state.clipboard.store() else {
             return Vec::new();
         };
-        let entries = match store.list(query, Default::default(), limit, 0) {
+        // The panel's kinds are the store's kinds; the two are separate types
+        // only because the panel must not depend on the store.
+        let filter = match filter {
+            ClipFilter::All => Store::All,
+            ClipFilter::Text => Store::Text,
+            ClipFilter::Image => Store::Image,
+            ClipFilter::Files => Store::Files,
+            ClipFilter::Link => Store::Link,
+        };
+        let entries = match store.list(query, filter, limit, 0) {
             Ok(entries) => entries,
             Err(e) => {
                 tracing::warn!("could not read clipboard history: {e}");

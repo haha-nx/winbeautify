@@ -427,15 +427,29 @@ fn draw_scene(scene: &Scene<'_>) -> Result<()> {
 
 fn draw_pill(target: &ID2D1RenderTarget, brush: &ID2D1SolidColorBrush, scene: &Scene<'_>) {
     let theme = scene.theme;
-    if theme.pill.a <= 0.0 {
-        // Switched off entirely — drawing a zero-alpha fill would be a no-op
-        // anyway, and the stroke must not survive it.
-        return;
-    }
+    // A pill with no opacity is still a pill as far as the mouse is concerned.
+    //
+    // A layered window is hit-tested per pixel by alpha, so a pill filled with
+    // nothing at all lets the pointer fall straight through to the taskbar: at
+    // opacity 0 only the launcher's ink and the transport glyphs could be
+    // hovered, and the buttons around that ink — the actual targets — could not.
+    // One part in 255 is the smallest alpha that is not "transparent": invisible
+    // to the eye, present to the hit test, so the bar has the same hit area at
+    // opacity 0 that it has at any other setting.
+    let invisible = theme.pill.a <= 0.0;
+    let fill = if invisible {
+        theme.pill.with_alpha(1.0 / 255.0)
+    } else {
+        theme.pill
+    };
 
     let shape = canvas::rounded(scene.layout.pill, scene.corner_radius);
-    canvas::set_brush(brush, theme.pill);
+    canvas::set_brush(brush, fill);
     unsafe { target.FillRoundedRectangle(&shape, brush) };
+    if invisible {
+        // The hairline would be a no-op anyway: its alpha tracks the pill's.
+        return;
+    }
 
     // A hairline stroke keeps the pill legible against a wallpaper of the same
     // tone as its fill. Its alpha already tracks the pill's, so a translucent

@@ -29,5 +29,8 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
+    # The fields are drawn rather than being edit controls, so the candidate
+    # list has to be pointed at the caret by hand.
+    "Win32_UI_Input_Ime",
     "Win32_UI_WindowsAndMessaging",
 ]

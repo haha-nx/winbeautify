@@ -25,11 +25,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetWindow, GetWindowLongW, KillTimer, PostQuitMessage, RegisterClassExW, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, GWL_EXSTYLE, GWLP_HWNDPARENT,
-    GW_HWNDPREV, HWND_TOP, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SW_SHOWNOACTIVATE, WM_APP, WM_CLOSE, WM_LBUTTONDOWN, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_TIMER,
+    GetWindow, GetWindowLongW, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, GWL_EXSTYLE,
+    GWLP_HWNDPARENT, GW_HWNDPREV, HTCLIENT, HWND_TOP, HWND_TOPMOST, IDC_ARROW, IDC_HAND, MSG,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SW_SHOWNOACTIVATE, WM_APP,
+    WM_CLOSE, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_SETCURSOR, WM_TIMER,
     WNDCLASSEXW, WINDOW_EX_STYLE, WS_POPUP, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST,
 };
@@ -182,6 +182,29 @@ fn window_origin(anchor_x: i32, width: i32, inset: f32, align: Align) -> i32 {
     }
 }
 
+/// Is the taskbar ahead of `hwnd` in the z-order?
+///
+/// Walked up from our own window: the walk ends the moment the taskbar turns up
+/// (it is in front of us) or when nothing is left in front (it is behind us).
+/// Everything in front of a topmost window is topmost too, so the walk is a
+/// handful of steps long.
+fn taskbar_is_in_front(hwnd: HWND, taskbar: HWND) -> bool {
+    let mut current = hwnd;
+    for _ in 0..64 {
+        let Ok(previous) = (unsafe { GetWindow(current, GW_HWNDPREV) }) else {
+            return false;
+        };
+        if previous.is_invalid() {
+            return false;
+        }
+        if previous == taskbar {
+            return true;
+        }
+        current = previous;
+    }
+    false
+}
+
 fn is_topmost(hwnd: HWND) -> bool {
     let style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };
     (style & WS_EX_TOPMOST.0 as i32) != 0
@@ -293,12 +316,18 @@ impl Pump {
         }
 
         // Recomputed every time: a config change can widen the bar without the
-        // window itself moving.
+        // window itself moving — except while the pointer is on the bar. The
+        // width follows the lyric, and the lyric advances every few seconds, so
+        // without this the transport controls slide out from under a pointer
+        // that is on its way to one of them. The bar re-adapts on the way out
+        // (see WM_MOUSELEAVE).
         let metrics = Metrics::new(geometry.dpi);
         let content = state.content();
         let limits = state.limits();
-        let lyric = self.measure_lyric(&state, &metrics);
-        self.target_width = layout::bar_width(&content, &limits, &metrics, lyric);
+        if state.hover.is_none() {
+            let lyric = self.measure_lyric(&state, &metrics);
+            self.target_width = layout::bar_width(&content, &limits, &metrics, lyric);
+        }
         self.easing = easing_for(state.config.widget.animation_ms);
         if self.bar_width <= 0.0 {
             // First frame: appear at the right width rather than growing from 0.
@@ -405,15 +434,15 @@ impl Pump {
         let Some(taskbar) = shell::primary_taskbar() else {
             return;
         };
-        // "Am I where I belong" is exactly "am I the window directly in front of
-        // the taskbar" — the one relationship an owned window is supposed to
-        // keep. Asked rather than walked: a walk up the z-order has to decide
-        // what "above" means and where to stop, and getting that wrong makes a
-        // repair that fires when nothing is broken.
-        let above = unsafe { GetWindow(taskbar, GW_HWNDPREV) }.unwrap_or_default();
-        if above == self.hwnd {
+        // The question is whether the taskbar got in front of us — not whether
+        // we are glued to it. Another topmost window between the two is none of
+        // our business: this machine has one (a chat app's floating window sits
+        // in front of the taskbar), and asking "am I directly in front of the
+        // taskbar" made the repair fire twenty times a second and fight it.
+        if !taskbar_is_in_front(self.hwnd, taskbar) {
             return;
         }
+        let above = unsafe { GetWindow(taskbar, GW_HWNDPREV) }.unwrap_or_default();
         unsafe {
             // Re-stating the ownership too: it is the relationship that is
             // supposed to make this unnecessary in the first place.
@@ -532,6 +561,11 @@ pub fn run(shared: Arc<Shared>) -> Result<(), Box<dyn std::error::Error + Send +
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(wndproc),
         hInstance: instance.into(),
+        // A window that never names a cursor does not get one: the pointer keeps
+        // whatever it was showing when it arrived, which on this machine is the
+        // busy ring the shell leaves behind while the desktop is busy. Hovering
+        // the bar is enough to be stuck with it.
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
         lpszClassName: WINDOW_CLASS,
         ..Default::default()
     };
@@ -738,7 +772,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_MOUSELEAVE => {
             with_pump(|pump| pump.tracking_leave = false);
             if with_pump(|pump| pump.set_hover(None)).unwrap_or(false) {
-                with_pump(|pump| pump.draw());
+                // The pointer is off the bar, so the width is free to follow the
+                // lyric again — this is the "and then it adapts" half of "the
+                // bar does not move while you are reaching for a control".
+                with_pump(|pump| {
+                    pump.sync_geometry();
+                    pump.kick_animation();
+                    if !pump.animating {
+                        pump.draw();
+                    }
+                });
             }
             LRESULT(0)
         }
@@ -748,6 +791,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // activated, and the click that triggered it is discarded. Answering
             // MA_NOACTIVATE keeps the click and still refuses the focus.
             LRESULT(MA_NOACTIVATE as isize)
+        }
+        WM_SETCURSOR => {
+            // Only the client area is ours; the frame belongs to Windows.
+            if (lparam.0 & 0xFFFF) as u32 != HTCLIENT {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
+            // A hand over the things that can be clicked, the arrow elsewhere —
+            // the same rule the panel uses.
+            let id = if with_pump(|pump| {
+                let state = pump.shared.snapshot();
+                matches!(
+                    state.hover,
+                    Some(Hit::Launcher) | Some(Hit::Transport(_))
+                )
+            })
+            .unwrap_or(false)
+            {
+                IDC_HAND
+            } else {
+                IDC_ARROW
+            };
+            unsafe {
+                if let Ok(cursor) = LoadCursorW(None, id) {
+                    SetCursor(Some(cursor));
+                }
+            }
+            LRESULT(1)
         }
         WM_LBUTTONDOWN => {
             // A layered window passes clicks through wherever the pill is

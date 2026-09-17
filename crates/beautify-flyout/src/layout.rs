@@ -18,7 +18,7 @@
 //! may take ([`CLIP_TITLE_LINES`] and friends).
 
 use crate::paint::Icon;
-use crate::{ClipRow, Tab, TodoRow};
+use crate::{ClipFilter, ClipRow, Tab, TodoPage, TodoRow};
 
 use beautify_widget::layout::Rect;
 
@@ -35,6 +35,8 @@ pub const CLIP_TITLE_LINES: usize = 2;
 pub const CLIP_OCR_LINES: usize = 2;
 /// A task title is the row, so it gets one line more than a preview.
 pub const TODO_TITLE_LINES: usize = 3;
+/// Gap between the segmented buttons under the field.
+const CHIP_GAP: f32 = 4.0;
 
 /// The default size of the panel, in logical pixels.
 pub const DEFAULT_SIZE: (f32, f32) = (380.0, 480.0);
@@ -146,9 +148,21 @@ impl Metrics {
         self.px(3.0)
     }
 
-    /// A section title in the task list ("未完成" / "已完成").
-    pub fn heading_height(&self) -> f32 {
-        self.px(26.0)
+    /// The row of segmented buttons under the field: the clipboard's kinds, or
+    /// the task list's two pages.
+    pub fn chip_height(&self) -> f32 {
+        self.px(24.0)
+    }
+
+    /// One chip of the clipboard's kind row. The labels are two characters
+    /// each, so one width fits all of them.
+    pub fn chip_width(&self) -> f32 {
+        self.px(46.0)
+    }
+
+    /// One of the task list's two page buttons, which carry one character more.
+    pub fn page_width(&self) -> f32 {
+        self.px(62.0)
     }
 
     /// One of a clipboard row's action buttons.
@@ -229,22 +243,6 @@ pub struct Button {
     pub active: bool,
 }
 
-/// Which section of the task list a heading introduces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Heading {
-    Open,
-    Done,
-}
-
-impl Heading {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Heading::Open => "未完成",
-            Heading::Done => "已完成",
-        }
-    }
-}
-
 /// What a row stands for.
 ///
 /// The identity of a row is what it points at rather than where it happens to
@@ -252,8 +250,6 @@ impl Heading {
 /// the entry it came from either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowTarget {
-    /// A section title, which is not clickable.
-    Heading(Heading),
     /// Index into the clipboard list the frame was built from.
     Clip(usize),
     /// Index into the task list the frame was built from.
@@ -288,6 +284,10 @@ pub struct Row {
 #[derive(Debug, Clone)]
 pub struct Scene {
     pub tab: Tab,
+    /// Which clipboard kinds the list is showing.
+    pub filter: ClipFilter,
+    /// Which half of the task list the list is showing.
+    pub page: TodoPage,
     pub window: Rect,
     pub header: Rect,
     pub tabs: Vec<(Tab, Rect)>,
@@ -296,6 +296,8 @@ pub struct Scene {
     pub field: Rect,
     /// The scrolling list.
     pub list: Rect,
+    /// The segmented buttons under the field.
+    pub segments: Vec<(Segment, Rect)>,
     /// The rows that are on screen, in order. Rows scrolled out of view are not
     /// built: an off-screen row is one nobody can see, click or hover, and
     /// wrapping its text would be work done for nothing.
@@ -306,7 +308,18 @@ pub struct Scene {
     pub scroll_max: f32,
     pub scrollbar: Rect,
     pub footer: Rect,
-    pub footer_button: Option<Rect>,
+    /// The footer's action button, when this tab has one.
+    pub footer_button: Option<(FooterAction, Rect)>,
+}
+
+/// What the footer's button does. One button per tab, so it is drawn from the
+/// action rather than from the tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterAction {
+    /// Delete every clipboard entry that is not a favourite.
+    ClearUnpinnedClips,
+    /// Delete the tasks on the "done" page.
+    ClearCompletedTodos,
 }
 
 impl Scene {
@@ -332,6 +345,15 @@ impl Scene {
     }
 }
 
+/// One button of the row that sits under the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segment {
+    /// A clipboard kind.
+    Clip(ClipFilter),
+    /// A page of the task list.
+    Todo(TodoPage),
+}
+
 /// What a click landed on, worked out before anything acts on it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Hit {
@@ -344,6 +366,8 @@ pub enum Hit {
     Tab(Tab),
     Close,
     Field,
+    /// One of the segmented buttons under the field.
+    Segment(Segment),
     FooterButton,
     Scrollbar(f32),
     /// Empty space: commits an edit and nothing else.
@@ -358,6 +382,10 @@ pub struct Rows<'a> {
     pub tab: Tab,
     pub clips: &'a [ClipRow],
     pub todos: &'a [TodoRow],
+    /// Which clipboard kinds the list shows.
+    pub filter: ClipFilter,
+    /// Which half of the task list the list shows.
+    pub page: TodoPage,
     pub stats: (i64, i64),
     /// The wrapped height of `text` at `width`, in `px`-pixel type, clamped to
     /// `max_lines`. Zero for empty text. Comes from the real font; see the
@@ -366,10 +394,13 @@ pub struct Rows<'a> {
 }
 
 impl<'a> Rows<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         tab: Tab,
         clips: &'a [ClipRow],
         todos: &'a [TodoRow],
+        filter: ClipFilter,
+        page: TodoPage,
         stats: (i64, i64),
         text_height: &'a dyn Fn(&str, f32, f32, usize) -> f32,
     ) -> Self {
@@ -377,6 +408,8 @@ impl<'a> Rows<'a> {
             tab,
             clips,
             todos,
+            filter,
+            page,
             stats,
             text_height,
         }
@@ -431,30 +464,18 @@ fn measure(rows: &Rows<'_>, metrics: &Metrics, width: f32) -> Vec<Measured> {
             })
             .collect(),
         Tab::Todo => {
-            // Two sections, each with its own heading, so a ticked task stays
-            // where the user can un-tick it instead of vanishing from the list.
-            let mut out = Vec::with_capacity(rows.todos.len() + 2);
-            for heading in [Heading::Open, Heading::Done] {
-                let members: Vec<usize> = rows
-                    .todos
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, task)| task.done == (heading == Heading::Done))
-                    .map(|(index, _)| index)
-                    .collect();
-                if members.is_empty() {
-                    continue;
-                }
-                out.push(Measured {
-                    target: RowTarget::Heading(heading),
-                    height: metrics.heading_height(),
-                });
-                out.extend(members.into_iter().map(|index| Measured {
+            // One page at a time, which is what replaces the two headings this
+            // used to draw: the two are buttons under the field now, and the
+            // page's own empty state says which one you are looking at.
+            rows.todos
+                .iter()
+                .enumerate()
+                .filter(|(_, task)| task.done == rows.page.is_done())
+                .map(|(index, task)| Measured {
                     target: RowTarget::Todo(index),
-                    height: todo_height(metrics, &rows.todos[index], rows, width),
-                }));
-            }
-            out
+                    height: todo_height(metrics, task, rows, width),
+                })
+                .collect()
         }
     }
 }
@@ -599,19 +620,57 @@ pub fn layout(window: Rect, metrics: &Metrics, rows: &Rows<'_>, scroll: f32) -> 
         window.right,
         window.bottom,
     );
-    let footer_button = (rows.tab == Tab::Clipboard && rows.stats.0 > 0).then(|| {
+    // One footer button per tab, and what it does depends on the page.
+    let footer_action = match rows.tab {
+        Tab::Clipboard if rows.stats.0 > 0 => Some(FooterAction::ClearUnpinnedClips),
+        Tab::Todo if rows.page.is_done() && rows.todos.iter().any(|task| task.done) => {
+            Some(FooterAction::ClearCompletedTodos)
+        }
+        _ => None,
+    };
+    let footer_button = footer_action.map(|action| {
         let width = metrics.px(84.0);
-        Rect::new(
-            footer.right - metrics.padding() - width,
-            footer.center_y() - metrics.px(10.0),
-            footer.right - metrics.padding(),
-            footer.center_y() + metrics.px(10.0),
+        (
+            action,
+            Rect::new(
+                footer.right - metrics.padding() - width,
+                footer.center_y() - metrics.px(10.0),
+                footer.right - metrics.padding(),
+                footer.center_y() + metrics.px(10.0),
+            ),
         )
     });
 
+    // The segmented row sits between the field and the list: the clipboard's
+    // kinds, or the task list's two pages.
+    let mut segments = Vec::new();
+    let mut left = window.left + metrics.padding();
+    let top = field.bottom + metrics.padding() * 0.5;
+    let bottom = top + metrics.chip_height();
+    match rows.tab {
+        Tab::Clipboard => {
+            for filter in ClipFilter::ALL {
+                segments.push((
+                    Segment::Clip(filter),
+                    Rect::new(left, top, left + metrics.chip_width(), bottom),
+                ));
+                left += metrics.chip_width() + metrics.px(CHIP_GAP);
+            }
+        }
+        Tab::Todo => {
+            for page in TodoPage::ALL {
+                segments.push((
+                    Segment::Todo(page),
+                    Rect::new(left, top, left + metrics.page_width(), bottom),
+                ));
+                left += metrics.page_width() + metrics.px(CHIP_GAP);
+            }
+        }
+    }
+
     let list = Rect::new(
         window.left,
-        field.bottom + metrics.padding() * 0.5,
+        bottom + metrics.padding() * 0.5,
         window.right,
         footer.top,
     );
@@ -653,12 +712,15 @@ pub fn layout(window: Rect, metrics: &Metrics, rows: &Rows<'_>, scroll: f32) -> 
 
     Scene {
         tab: rows.tab,
+        filter: rows.filter,
+        page: rows.page,
         window,
         header,
         tabs,
         close,
         field,
         list,
+        segments,
         rows: built,
         content_height,
         scroll,
@@ -672,24 +734,6 @@ pub fn layout(window: Rect, metrics: &Metrics, rows: &Rows<'_>, scroll: f32) -> 
 /// Place one row's contents inside `rect`.
 fn build_row(metrics: &Metrics, rows: &Rows<'_>, target: RowTarget, rect: Rect) -> Row {
     match target {
-        RowTarget::Heading(_) => Row {
-            target,
-            rect,
-            checkbox: None,
-            badge: None,
-            thumbnail: None,
-            // The label is inset like any other row's text, so the three
-            // left-hand edges line up down the list.
-            title: Rect::new(
-                rect.left + metrics.row_padding(),
-                rect.top,
-                rect.right - metrics.row_padding(),
-                rect.bottom,
-            ),
-            ocr: None,
-            meta: None,
-            buttons: Vec::new(),
-        },
         RowTarget::Todo(index) => {
             let task = &rows.todos[index];
             let padding = metrics.row_padding();
@@ -894,10 +938,21 @@ mod tests {
     }
 
     fn scene(tab: Tab, clips: &[ClipRow], todos: &[TodoRow], scroll: f32) -> Scene {
+        scene_of(tab, clips, todos, scroll, ClipFilter::All, TodoPage::Open)
+    }
+
+    fn scene_of(
+        tab: Tab,
+        clips: &[ClipRow],
+        todos: &[TodoRow],
+        scroll: f32,
+        filter: ClipFilter,
+        page: TodoPage,
+    ) -> Scene {
         layout(
             window(),
             &metrics(),
-            &Rows::new(tab, clips, todos, (clips.len() as i64, 1), &flat),
+            &Rows::new(tab, clips, todos, filter, page, (clips.len() as i64, 1), &flat),
             scroll,
         )
     }
@@ -980,7 +1035,15 @@ mod tests {
             layout(
                 window(),
                 &m,
-                &Rows::new(Tab::Clipboard, std::slice::from_ref(entry), &[], (1, 0), &flat),
+                &Rows::new(
+                    Tab::Clipboard,
+                    std::slice::from_ref(entry),
+                    &[],
+                    ClipFilter::All,
+                    TodoPage::Open,
+                    (1, 0),
+                    &flat,
+                ),
                 0.0,
             )
             .rows[0]
@@ -1010,7 +1073,15 @@ mod tests {
         let scene = layout(
             window(),
             &m,
-            &Rows::new(Tab::Clipboard, std::slice::from_ref(&entry), &[], (1, 0), &flat),
+            &Rows::new(
+                Tab::Clipboard,
+                std::slice::from_ref(&entry),
+                &[],
+                ClipFilter::All,
+                TodoPage::Open,
+                (1, 0),
+                &flat,
+            ),
             0.0,
         );
         let row = &scene.rows[0];
@@ -1035,7 +1106,15 @@ mod tests {
         let scene = layout(
             window(),
             &m,
-            &Rows::new(Tab::Clipboard, std::slice::from_ref(&entry), &[], (1, 0), &flat),
+            &Rows::new(
+                Tab::Clipboard,
+                std::slice::from_ref(&entry),
+                &[],
+                ClipFilter::All,
+                TodoPage::Open,
+                (1, 0),
+                &flat,
+            ),
             0.0,
         );
         let row = &scene.rows[0];
@@ -1119,80 +1198,80 @@ mod tests {
     }
 
     #[test]
-    fn the_task_list_is_split_into_open_and_done() {
+    fn the_two_pages_show_one_half_of_the_list_each() {
         let todos = todos(4);
-        let scene = scene(Tab::Todo, &[], &todos, 0.0);
-        let headings: Vec<Heading> = scene
-            .rows
-            .iter()
-            .filter_map(|row| match row.target {
-                RowTarget::Heading(heading) => Some(heading),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(headings, vec![Heading::Open, Heading::Done]);
-
-        let first = scene
-            .rows
-            .iter()
-            .position(|row| row.target == RowTarget::Heading(Heading::Open))
-            .unwrap();
-        let second = scene
-            .rows
-            .iter()
-            .position(|row| row.target == RowTarget::Heading(Heading::Done))
-            .unwrap();
-        assert!(first < second);
-        for row in &scene.rows[first..second] {
-            if let RowTarget::Todo(index) = row.target {
-                assert!(!todos[index].done, "an unfinished task above the divider");
-            }
+        let open = scene_of(Tab::Todo, &[], &todos, 0.0, ClipFilter::All, TodoPage::Open);
+        assert_eq!(open.rows.len(), 2, "two of the four are unfinished");
+        for row in &open.rows {
+            let RowTarget::Todo(index) = row.target else {
+                panic!("a page holds tasks, nothing else");
+            };
+            assert!(!todos[index].done, "the open page holds open tasks");
         }
-        for row in &scene.rows[second..] {
-            if let RowTarget::Todo(index) = row.target {
-                assert!(todos[index].done, "a finished task below the divider");
-            }
+
+        let done = scene_of(Tab::Todo, &[], &todos, 0.0, ClipFilter::All, TodoPage::Done);
+        assert_eq!(done.rows.len(), 2);
+        for row in &done.rows {
+            let RowTarget::Todo(index) = row.target else {
+                panic!("a page holds tasks, nothing else");
+            };
+            assert!(todos[index].done, "the done page holds finished tasks");
         }
     }
 
     #[test]
-    fn a_section_that_would_be_empty_gets_no_heading() {
-        let open_only: Vec<TodoRow> = (0..3)
+    fn an_empty_page_lays_out_with_no_rows() {
+        let all_open: Vec<TodoRow> = (0..3)
             .map(|index| TodoRow {
                 id: index,
                 title: format!("task {index}"),
                 done: false,
             })
             .collect();
-        let open = scene(Tab::Todo, &[], &open_only, 0.0);
-        assert_eq!(open.rows.len(), 4, "a heading and three tasks");
-        assert_eq!(
-            open.rows[0].target,
-            RowTarget::Heading(Heading::Open),
-            "no heading for a section with nothing in it"
-        );
-
-        let done_only: Vec<TodoRow> = open_only
-            .iter()
-            .map(|task| TodoRow {
-                done: true,
-                ..task.clone()
-            })
-            .collect();
-        let finished = scene(Tab::Todo, &[], &done_only, 0.0);
-        assert_eq!(finished.rows[0].target, RowTarget::Heading(Heading::Done));
+        let done = scene_of(Tab::Todo, &[], &all_open, 0.0, ClipFilter::All, TodoPage::Done);
+        assert!(done.rows.is_empty(), "nothing has been finished yet");
+        assert_eq!(done.content_height, 0.0);
     }
 
     #[test]
-    fn a_heading_is_not_clickable_and_has_nothing_to_hit() {
+    fn the_segmented_row_is_under_the_field_and_out_of_the_list() {
+        let clips = clips(2);
+        let chips = scene(Tab::Clipboard, &clips, &[], 0.0);
+        assert_eq!(chips.segments.len(), 5, "one chip per clipboard kind");
+        let (_, first) = chips.segments[0];
+        assert!(first.top >= chips.field.bottom, "below the field");
+        assert!(first.bottom <= chips.list.top, "above the list");
+        for pair in chips.segments.windows(2) {
+            assert!(pair[0].1.right <= pair[1].1.left, "chips overlap");
+        }
+        assert!(chips
+            .segments
+            .iter()
+            .all(|(_, rect)| rect.right <= chips.window.right));
+
         let todos = todos(2);
-        let scene = scene(Tab::Todo, &[], &todos, 0.0);
-        let heading = &scene.rows[0];
-        assert!(matches!(heading.target, RowTarget::Heading(_)));
-        assert!(heading.buttons.is_empty());
-        assert!(heading.checkbox.is_none());
-        assert!(heading.thumbnail.is_none());
-        assert!(heading.badge.is_none());
+        let todo = scene(Tab::Todo, &[], &todos, 0.0);
+        assert_eq!(todo.segments.len(), 2, "one button per page");
+    }
+
+    #[test]
+    fn the_footer_button_says_what_it_does() {
+        let clips = clips(2);
+        let some = scene(Tab::Clipboard, &clips, &[], 0.0);
+        assert_eq!(
+            some.footer_button.map(|(action, _)| action),
+            Some(FooterAction::ClearUnpinnedClips)
+        );
+        // On the open page there is nothing to clear.
+        let todos = todos(2);
+        let open = scene(Tab::Todo, &[], &todos, 0.0);
+        assert!(open.footer_button.is_none());
+        // …and on the done page there is, as long as something was finished.
+        let done = scene_of(Tab::Todo, &[], &todos, 0.0, ClipFilter::All, TodoPage::Done);
+        assert_eq!(
+            done.footer_button.map(|(action, _)| action),
+            Some(FooterAction::ClearCompletedTodos)
+        );
     }
 
     #[test]
@@ -1283,15 +1362,9 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_button_only_appears_when_there_is_something_to_clear() {
+    fn an_empty_clipboard_has_no_footer_button() {
         let empty = scene(Tab::Clipboard, &[], &[], 0.0);
         assert!(empty.footer_button.is_none());
-        let some = scene(Tab::Clipboard, &clips(2), &[], 0.0);
-        assert!(some.footer_button.is_some());
-        // The task tab has nothing to clear in the footer.
-        let todos = todos(1);
-        let todo = scene(Tab::Todo, &[], &todos, 0.0);
-        assert!(todo.footer_button.is_none());
     }
 
     #[test]
@@ -1309,7 +1382,7 @@ mod tests {
         let normal = layout(
             window(),
             &m,
-            &Rows::new(Tab::Clipboard, &clips, &[], (2, 0), &flat),
+            &Rows::new(Tab::Clipboard, &clips, &[], ClipFilter::All, TodoPage::Open, (2, 0), &flat),
             0.0,
         );
         let big = Metrics::new(192);
@@ -1317,7 +1390,7 @@ mod tests {
         let scaled = layout(
             big_window,
             &big,
-            &Rows::new(Tab::Clipboard, &clips, &[], (2, 0), &flat),
+            &Rows::new(Tab::Clipboard, &clips, &[], ClipFilter::All, TodoPage::Open, (2, 0), &flat),
             0.0,
         );
         let ratio = scaled.rows[0].rect.height() / normal.rows[0].rect.height();
