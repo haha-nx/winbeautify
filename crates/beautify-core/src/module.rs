@@ -103,11 +103,17 @@ impl Registry {
     }
 
     /// Push new settings into every module, honouring enable/disable flips.
-    pub fn apply_all(&self, config: &Config) {
+    ///
+    /// A module an earlier apply disabled has had its threads joined, so an
+    /// enabled module is started before the config is applied: [`Module::start`]
+    /// is contractually idempotent, which makes that a no-op for one already
+    /// running and a revival for one that is not.
+    pub fn apply_all(&self, ctx: &ModuleContext, config: &Config) {
         for module in &self.modules {
             let enabled = module.is_enabled(config);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if enabled {
+                    module.start(ctx.clone())?;
                     module.apply(config)
                 } else {
                     module.stop()
@@ -127,5 +133,132 @@ impl Registry {
         for module in self.modules.iter().rev() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| module.stop()));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A module whose enable flag and lifecycle counters the test drives
+    /// directly, bypassing any real config file. `start`/`stop` honour the
+    /// trait's idempotency contract the way every real module must: a start
+    /// while running is a no-op, so the counters only move on real flips.
+    struct CountingModule {
+        enabled: AtomicBool,
+        running: AtomicBool,
+        starts: AtomicUsize,
+        applies: AtomicUsize,
+        stops: AtomicUsize,
+    }
+
+    impl CountingModule {
+        fn new() -> Self {
+            Self {
+                enabled: AtomicBool::new(false),
+                running: AtomicBool::new(false),
+                starts: AtomicUsize::new(0),
+                applies: AtomicUsize::new(0),
+                stops: AtomicUsize::new(0),
+            }
+        }
+
+        fn set_enabled(&self, enabled: bool) {
+            self.enabled.store(enabled, Ordering::Release);
+        }
+
+        fn starts(&self) -> usize {
+            self.starts.load(Ordering::Acquire)
+        }
+
+        fn stops(&self) -> usize {
+            self.stops.load(Ordering::Acquire)
+        }
+    }
+
+    impl Module for CountingModule {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        fn is_enabled(&self, _config: &Config) -> bool {
+            self.enabled.load(Ordering::Acquire)
+        }
+
+        fn start(&self, _ctx: ModuleContext) -> ModuleResult {
+            if self.running.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            self.starts.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn apply(&self, _config: &Config) -> ModuleResult {
+            self.applies.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn stop(&self) -> ModuleResult {
+            if !self.running.swap(false, Ordering::AcqRel) {
+                return Ok(());
+            }
+            self.stops.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    fn ctx() -> ModuleContext {
+        ModuleContext::new(
+            EventBus::new(),
+            Arc::new(crate::config::ConfigManager::new(std::path::PathBuf::from(
+                "unused.toml",
+            ))),
+        )
+    }
+
+    /// The regression behind "turn the widget off and on in settings and it
+    /// never comes back": disabling joins the module's threads, so re-enabling
+    /// has to start it again — `apply` alone cannot, by contract.
+    #[test]
+    fn re_enabling_a_stopped_module_starts_it_again() {
+        let module = Arc::new(CountingModule::new());
+        let mut registry = Registry::new();
+        registry.register(Arc::clone(&module) as Arc<dyn Module>);
+        let context = ctx();
+
+        module.set_enabled(true);
+        registry.apply_all(&context, &Config::default());
+        assert_eq!(module.starts(), 1, "first enable must start the module");
+
+        module.set_enabled(false);
+        registry.apply_all(&context, &Config::default());
+        assert_eq!(module.stops(), 1, "disabling must stop the module");
+
+        module.set_enabled(true);
+        registry.apply_all(&context, &Config::default());
+        assert_eq!(
+            module.starts(),
+            2,
+            "re-enabling must start the module again, not only apply the config"
+        );
+    }
+
+    /// The flip side: a module that stayed enabled must not be restarted by an
+    /// unrelated config change — a restart would drop live state (and, for the
+    /// todo store, re-run carry-over).
+    #[test]
+    fn an_enabled_module_is_not_restarted_by_a_config_change() {
+        let module = Arc::new(CountingModule::new());
+        let mut registry = Registry::new();
+        registry.register(Arc::clone(&module) as Arc<dyn Module>);
+        let context = ctx();
+
+        module.set_enabled(true);
+        registry.apply_all(&context, &Config::default());
+        registry.apply_all(&context, &Config::default());
+        registry.apply_all(&context, &Config::default());
+        assert_eq!(module.starts(), 1);
+        assert_eq!(module.stops(), 0);
     }
 }

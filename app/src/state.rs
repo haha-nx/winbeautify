@@ -127,7 +127,8 @@ impl AppState {
         if !self.started.load(Ordering::Acquire) {
             return;
         }
-        self.registry.apply_all(config);
+        let ctx = ModuleContext::new(self.bus.clone(), Arc::clone(&self.config));
+        self.registry.apply_all(&ctx, config);
     }
 
     pub fn stop_modules(&self) {

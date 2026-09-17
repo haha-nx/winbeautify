@@ -573,6 +573,13 @@ impl Module for TodoModule {
         let cfg = ctx.config.get();
         self.enabled.store(cfg.todo.enabled, Ordering::Release);
         self.carry_over.store(cfg.todo.carry_over, Ordering::Release);
+        // The registry re-runs start() when a config change re-enables the
+        // module. Reopening the store then would drop the live one, and
+        // carry-over moving tasks twice is worse than skipping it.
+        let mut guard = self.store.write();
+        if guard.is_some() {
+            return Ok(());
+        }
         let store = Arc::new(TaskStore::open(&paths::database_path())?);
         if cfg.todo.carry_over {
             let moved = store.carry_over()?;
@@ -580,7 +587,7 @@ impl Module for TodoModule {
                 tracing::info!(tasks = moved, "carried unfinished tasks into today");
             }
         }
-        *self.store.write() = Some(store);
+        *guard = Some(store);
         Ok(())
     }
 
