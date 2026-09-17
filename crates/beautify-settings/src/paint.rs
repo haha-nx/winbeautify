@@ -230,7 +230,12 @@ impl Painter {
             .flat_map(|card| card.rows.iter())
             .nth(interaction.open_dropdown.unwrap_or(usize::MAX))
         {
-            self.draw_dropdown(canvas, row, metrics, palette, interaction)?;
+            // The row's current value, so the list can show which entry that
+            // is: a dropdown that only marks what the pointer is over leaves the
+            // user guessing what they have chosen.
+            let current = crate::access::read(config, row.field.path);
+            let current = current.as_ref().and_then(|v| v.as_text()).unwrap_or("");
+            self.draw_dropdown(canvas, row, metrics, palette, interaction, current)?;
         }
         Ok(())
     }
@@ -831,6 +836,7 @@ impl Painter {
     }
 
     /// The open dropdown, drawn over the page.
+    #[allow(clippy::too_many_arguments)]
     fn draw_dropdown(
         &self,
         canvas: &Canvas<'_>,
@@ -838,6 +844,7 @@ impl Painter {
         metrics: &Metrics,
         palette: &Palette,
         interaction: &Interaction,
+        current: &str,
     ) -> Result<()> {
         let Kind::Select(choices) = row.field.kind else {
             return Ok(());
@@ -856,10 +863,48 @@ impl Painter {
                 rect.right,
                 rect.top + (index + 1) as f32 * row_height,
             );
+            // The entry under the pointer, and — separately — the entry the
+            // setting is actually set to. They are different questions and a list
+            // that answers only the first is the reason "which one am I on" had
+            // to be worked out by remembering what the box said.
+            let chosen = choice.value == current;
             if interaction.dropdown_highlight == index {
-                canvas.fill_rect(entry.inset_by(metrics.px(3.0), 0.0), palette.accent.with_alpha(0.18));
+                canvas.fill_rect(
+                    entry.inset_by(metrics.px(3.0), 0.0),
+                    palette.accent.with_alpha(0.18),
+                );
             }
-            self.text_in(canvas, entry.inset_by(metrics.px(10.0), 0.0), choice.label, &small, palette.text);
+            if chosen {
+                canvas.fill_rect(
+                    entry.inset_by(metrics.px(3.0), 0.0),
+                    palette.accent.with_alpha(0.10),
+                );
+            }
+            self.text_in(
+                canvas,
+                entry.inset_by(metrics.px(10.0), 0.0),
+                choice.label,
+                &small,
+                if chosen { palette.accent } else { palette.text },
+            );
+            if chosen {
+                // A tick, because the accent alone would also be a hover colour
+                // as soon as the pointer is on another entry.
+                let size = metrics.px(4.0);
+                let cx = entry.right - metrics.px(14.0);
+                let cy = entry.center_y();
+                let _ = canvas.stroke_polyline(
+                    &self.factory,
+                    &[
+                        (cx - size * 0.8, cy),
+                        (cx - size * 0.15, cy + size * 0.7),
+                        (cx + size, cy - size * 0.8),
+                    ],
+                    (0.0, 0.0),
+                    palette.accent,
+                    metrics.px(1.6),
+                );
+            }
         }
         Ok(())
     }

@@ -58,7 +58,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
     CS_DBLCLKS, GWLP_USERDATA, GW_HWNDPREV, HC_ACTION, HWND_TOPMOST, IDC_CROSS, KBDLLHOOKSTRUCT,
     MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WM_TIMER,
+    SWP_NOREDRAW, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WM_TIMER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WM_CLOSE, WM_DESTROY, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
     WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -128,6 +128,14 @@ impl Area {
         self.width() >= 2 && self.height() >= 2
     }
 
+    /// "No selection here", which `union`-style arithmetic can be handed.
+    const EMPTY: Self = Self {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+
     #[cfg(test)]
     fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
@@ -169,6 +177,56 @@ impl Area {
         }
         .clamped(width, height)
     }
+}
+
+/// The strips where one selection differs from another.
+///
+/// Dragging a corner moves two of a selection's four edges; everything inside
+/// both rectangles is the same bright screen as it was a moment ago, so nothing
+/// there has to be composed again. Recomposing the whole rectangle instead is
+/// what made the mask fall behind the pointer: a 1400×900 selection is two and a
+/// half million pixels of blitting *per mouse event*, and the picture the user
+/// is dragging over then lags their mouse by however long the backlog takes.
+///
+/// The symmetric difference of two rectangles is at most four strips — the two
+/// vertical bands between the pairs of left and right edges, and the two
+/// horizontal ones between the pairs of top and bottom — and each is as thin as
+/// the pointer actually moved. `pad` grows every strip by the width of the
+/// selection's own frame, which is drawn outside the selection and so has to be
+/// repainted on both the old and the new position.
+fn changed_strips(previous: Area, next: Area, pad: i32, width: i32, height: i32) -> Vec<Area> {
+    // Nothing to compare against: the whole of the other one changed.
+    if previous.is_empty() {
+        return vec![next.inflated(pad, width, height)];
+    }
+    if next.is_empty() {
+        return vec![previous.inflated(pad, width, height)];
+    }
+
+    let left = previous.left.min(next.left);
+    let right = previous.right.max(next.right);
+    let top = previous.top.min(next.top);
+    let bottom = previous.bottom.max(next.bottom);
+    let band = |l: i32, t: i32, r: i32, b: i32| Area {
+        left: l,
+        top: t,
+        right: r,
+        bottom: b,
+    };
+    [
+        band(left, top, previous.left.max(next.left), bottom),
+        band(previous.right.min(next.right), top, right, bottom),
+        band(left, top, right, previous.top.max(next.top)),
+        band(left, previous.bottom.min(next.bottom), right, bottom),
+    ]
+    .into_iter()
+    // A strip of no thickness is a pair of edges that did not move: there is
+    // nothing to compose, and growing it would only compose a band that never
+    // changed.
+    .filter(|strip| !strip.is_empty())
+    .map(|strip| strip.inflated(pad, width, height))
+    .filter(|strip| !strip.is_empty())
+    .collect()
 }
 
 /// A memory DC with a top-down DIB selected into it.
@@ -555,7 +613,10 @@ fn assert_topmost(hwnd: HWND) -> bool {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            // `SWP_NOREDRAW`: the mask's pixels are ours to push, and a window
+            // manager redraw every time something gets in front would be a
+            // flicker for no gain.
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW,
         );
     }
     true
@@ -1243,7 +1304,8 @@ unsafe extern "system" fn window_proc(
                 // grows: the first frame of a drag has no area yet.
                 let (width, height) = (session.screen.width, session.screen.height);
                 if let Some(previous) = session.selection.take() {
-                    dirty.push(previous.inflated(8, width, height));
+                    // No new selection yet, so the difference is all of it.
+                    dirty.extend(changed_strips(previous, Area::EMPTY, 8, width, height));
                 }
                 dirty.push(Area {
                     left: x,
@@ -1273,11 +1335,13 @@ unsafe extern "system" fn window_proc(
                     let (width, height) = (session.screen.width, session.screen.height);
                     let next = Area::from_drag(session.anchor, (x, y)).clamped(width, height);
                     let previous = session.selection.replace(next);
-                    tracing::debug!(?previous, ?next, "drag");
-                    if let Some(previous) = previous {
-                        dirty.push(previous.inflated(8, width, height));
-                    }
-                    dirty.push(next.inflated(8, width, height));
+                    // Only where the two differ: the inside of the selection is
+                    // the same bright screen it was a moment ago, and a big
+                    // selection is a megapixel that would otherwise be composed
+                    // again on every mouse event.
+                    let strips = changed_strips(previous.unwrap_or(Area::EMPTY), next, 8, width, height);
+                    tracing::debug!(?previous, ?next, strips = strips.len(), "drag");
+                    dirty.extend(strips);
                 }
                 repaint(session, &dirty);
             });
@@ -1493,6 +1557,87 @@ mod tests {
                 blue(y)
             );
         }
+    }
+
+
+    /// Every pixel of `a` and `b` that belongs to only one of them has to be
+    /// inside one of the strips.
+    fn covered_by(strips: &[Area], a: Area, b: Area) -> usize {
+        let mut missed = 0;
+        for y in 0..40 {
+            for x in 0..40 {
+                let in_a = a.contains(x, y);
+                let in_b = b.contains(x, y);
+                if in_a == in_b {
+                    continue;
+                }
+                if !strips.iter().any(|s| s.contains(x, y)) {
+                    missed += 1;
+                }
+            }
+        }
+        missed
+    }
+
+    fn box_at(l: i32, t: i32, r: i32, b: i32) -> Area {
+        Area {
+            left: l,
+            top: t,
+            right: r,
+            bottom: b,
+        }
+    }
+
+    #[test]
+    fn the_strips_cover_where_two_selections_differ() {
+        let cases = [
+            // Growing down-right, one step at a time.
+            (box_at(10, 10, 20, 20), box_at(10, 10, 22, 22)),
+            // Growing up-left (the drag went the other way).
+            (box_at(10, 10, 20, 20), box_at(6, 7, 20, 20)),
+            // Shrinking back.
+            (box_at(6, 7, 20, 20), box_at(10, 10, 20, 20)),
+            // Disjoint: a drag that jumped.
+            (box_at(2, 2, 8, 8), box_at(20, 20, 30, 30)),
+            // Unchanged: nothing to compose.
+            (box_at(10, 10, 20, 20), box_at(10, 10, 20, 20)),
+            // One of them empty, both ways.
+            (box_at(10, 10, 20, 20), Area::EMPTY),
+            (Area::EMPTY, box_at(10, 10, 20, 20)),
+        ];
+        for (a, b) in cases {
+            // No padding: the question is only about the difference itself.
+            let strips = changed_strips(a, b, 0, 100, 100);
+            assert_eq!(
+                covered_by(&strips, a, b),
+                0,
+                "{a:?} -> {b:?} left pixels uncovered: {strips:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_small_drag_only_composes_the_edge_that_moved() {
+        // The point of the exercise: a corner drag on a big selection used to
+        // compose the whole thing, twice, on every mouse event.
+        let big = box_at(0, 0, 1400, 900);
+        let nudged = box_at(0, 0, 1410, 900);
+        let strips = changed_strips(big, nudged, 8, 4000, 2000);
+        let composed: i64 = strips
+            .iter()
+            .map(|s| s.width() as i64 * s.height() as i64)
+            .sum();
+        let whole = big.width() as i64 * big.height() as i64;
+        assert!(
+            composed * 20 < whole,
+            "a ten-pixel nudge composed {composed} of {whole} pixels"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_selection_composes_nothing() {
+        let same = box_at(10, 10, 200, 200);
+        assert!(changed_strips(same, same, 8, 1000, 1000).is_empty());
     }
 
     #[test]

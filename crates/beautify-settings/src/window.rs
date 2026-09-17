@@ -594,9 +594,19 @@ impl Window {
                     self.write_value(row_index, Value::Float(value));
                 }
             }
-            (Kind::Select(_), _) => {
+            (Kind::Select(choices), _) => {
                 self.interaction.open_dropdown = Some(row_index);
-                self.interaction.dropdown_highlight = 0;
+                // Start on the value the row holds, so the list opens where the
+                // user already is rather than at the top of it.
+                self.interaction.dropdown_highlight = choices
+                    .iter()
+                    .position(|choice| {
+                        Some(choice.value)
+                            == crate::access::read(&self.config, field.path)
+                                .as_ref()
+                                .and_then(|value| value.as_text())
+                    })
+                    .unwrap_or(0);
                 self.repaint();
             }
             (Kind::Hotkey, _) => self.begin_recording(row_index),
