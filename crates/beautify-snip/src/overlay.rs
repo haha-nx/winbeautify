@@ -40,9 +40,9 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
-    GetStockObject, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetStretchBltMode,
-    SetTextColor, StretchDIBits, BACKGROUND_MODE, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    COLORONCOLOR, DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX,
+    GetStockObject, IntersectClipRect, ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBkMode,
+    SetStretchBltMode, SetTextColor, StretchDIBits, BACKGROUND_MODE, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, COLORONCOLOR, DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX,
     DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -52,16 +52,16 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongPtrW, LoadCursorW,
+    GetCursorPos, GetMessageW, GetWindow, GetWindowLongPtrW, LoadCursorW,
     PostMessageW, PostQuitMessage,
-    RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    RegisterClassExW, SetCursor, SetWindowLongPtrW, SetTimer, SetWindowPos,
     SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
     CS_DBLCLKS, GWLP_USERDATA, GW_HWNDPREV, HC_ACTION, HWND_TOPMOST, IDC_CROSS, KBDLLHOOKSTRUCT,
     MSG, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_SHOW,
+    SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WM_TIMER,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WH_KEYBOARD_LL, WM_CLOSE, WM_DESTROY, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
-    WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::{self, Shot};
@@ -78,6 +78,17 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 static HOOK_TARGET: AtomicIsize = AtomicIsize::new(0);
 
 const WINDOW_CLASS: PCWSTR = w!("WinBeautify.SnipOverlay");
+
+/// How often the mask re-asserts that it is on top.
+///
+/// Not only per message: the shell raises the taskbar above our windows on its
+/// own, and if that happens while the user is not moving the mouse there is no
+/// message to hang the check off — so the taskbar and the widget bar sit on top
+/// of the mask, undimmed, looking like a patch of screen that was never part of
+/// the picture. A quarter of a second keeps the whole screen consistently the
+/// picture the user is choosing from.
+const TIMER_ASSERT: usize = 1;
+const ASSERT_MS: u32 = 250;
 
 /// A rectangle dragged out on screen, already normalised.
 ///
@@ -122,13 +133,6 @@ impl Area {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
     }
 
-    const EMPTY: Self = Self {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
-    };
-
     /// Does this cover no pixels at all?
     fn is_empty(&self) -> bool {
         self.width() <= 0 || self.height() <= 0
@@ -152,25 +156,6 @@ impl Area {
             top: self.top,
             right: self.right,
             bottom: self.bottom,
-        }
-    }
-
-    /// The bounding box of two areas, for repainting only what moved.
-    ///
-    /// An empty operand is ignored, so "nothing here" can be unioned with the
-    /// real rectangles without dragging the result towards the origin.
-    fn union(self, other: Self) -> Self {
-        if self.is_empty() {
-            return other;
-        }
-        if other.is_empty() {
-            return self;
-        }
-        Self {
-            left: self.left.min(other.left),
-            top: self.top.min(other.top),
-            right: self.right.max(other.right),
-            bottom: self.bottom.max(other.bottom),
         }
     }
 
@@ -269,8 +254,6 @@ struct Session {
     /// Where the pointer is, in window coordinates. The crosshair, the magnifier
     /// and the prompt all hang off it.
     cursor: Option<(i32, i32)>,
-    /// The foreground window from before the hotkey, restored on the way out.
-    previous_foreground: HWND,
     font: HGDIOBJ,
     options: Options,
     /// What ended the session: the chosen area, or `None` for a cancel.
@@ -377,7 +360,16 @@ fn select(options: Options) -> Result<Captured, Failure> {
 
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            // `WS_EX_NOACTIVATE` is load-bearing, not decoration: a full-screen
+            // window that also takes the foreground is what the shell calls a
+            // full-screen application, and it reacts by switching the desktop
+            // into its full-screen state — the pointer turns into the busy ring
+            // for as long as the mask is up, the taskbar is reconfigured, and
+            // our own taskbar module resets the taskbar's appearance, which is
+            // what makes the shell re-raise the taskbar over our windows. The
+            // mask needs none of that: the mouse is captured explicitly and the
+            // two keys that end a session come through the keyboard hook.
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             WINDOW_CLASS,
             w!("WinBeautify 截图"),
             WS_POPUP,
@@ -415,7 +407,6 @@ fn select(options: Options) -> Result<Captured, Failure> {
         selection: None,
         dragging: false,
         cursor: None,
-        previous_foreground: unsafe { GetForegroundWindow() },
         font: message_font(),
         options,
         result: None,
@@ -436,7 +427,7 @@ fn select(options: Options) -> Result<Captured, Failure> {
     let raw = Box::into_raw(session);
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize);
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -444,14 +435,10 @@ fn select(options: Options) -> Result<Captured, Failure> {
             rect.top,
             width,
             height,
-            SWP_SHOWWINDOW,
+            SWP_SHOWWINDOW | SWP_NOACTIVATE,
         );
-        // Best effort: refused whenever the hotkey was pressed while another
-        // application held the foreground, which is the normal case. Nothing
-        // depends on it — the mouse is captured explicitly, and Escape is caught
-        // by the hook below.
-        let _ = SetForegroundWindow(hwnd);
         SetCapture(hwnd);
+        show_crosshair();
     }
     with_session(hwnd, |session| {
         let mut point = POINT::default();
@@ -465,8 +452,9 @@ fn select(options: Options) -> Result<Captured, Failure> {
             right: session.screen.width,
             bottom: session.screen.height,
         };
-        repaint(session, full);
+        repaint(session, &[full]);
     });
+    unsafe { SetTimer(Some(hwnd), TIMER_ASSERT, ASSERT_MS, None) };
     HOOK_TARGET.store(hwnd.0 as isize, Ordering::Release);
     let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }.ok();
 
@@ -505,7 +493,6 @@ fn select(options: Options) -> Result<Captured, Failure> {
     let session = unsafe { Box::from_raw(raw) };
     let area = session.result;
     let origin = session.origin;
-    let previous_foreground = session.previous_foreground;
     // The crop happens while the session still owns the undimmed pixels.
     let shot = area.and_then(|area| {
         session
@@ -514,12 +501,6 @@ fn select(options: Options) -> Result<Captured, Failure> {
     });
     let pin_at = area.map(|area| (origin.0 + area.left, origin.1 + area.top));
     drop(session);
-
-    if !previous_foreground.is_invalid() {
-        unsafe {
-            let _ = SetForegroundWindow(previous_foreground);
-        }
-    }
 
     let mut shot = shot.ok_or(Failure::Cancelled)?;
     // A screen DC has no alpha channel, so every captured pixel came back with
@@ -530,6 +511,23 @@ fn select(options: Options) -> Result<Captured, Failure> {
         shot,
         pin_at: options.auto_pin.then_some(pin_at).flatten(),
     })
+}
+
+/// Show the crosshair.
+///
+/// Called from every path that can leave the pointer showing something else.
+/// While a window holds the mouse capture, Windows stops sending it
+/// `WM_SETCURSOR` — the capturing window is responsible for its own cursor — so
+/// whatever the pointer happened to be showing when the capture was taken stays
+/// on screen for the whole session. That is how the mask came to be drawn with
+/// the busy ring: the desktop was momentarily busy as it appeared, and nothing
+/// ever corrected it.
+fn show_crosshair() {
+    unsafe {
+        if let Ok(cursor) = LoadCursorW(None, IDC_CROSS) {
+            SetCursor(Some(cursor));
+        }
+    }
 }
 
 /// Put the mask back on top of everything.
@@ -563,24 +561,39 @@ fn assert_topmost(hwnd: HWND) -> bool {
     true
 }
 
-/// Swallow exactly one key — Escape — while a session is up.
+/// Swallow the two keys that end a session — Escape and Enter.
 ///
-/// The overlay usually cannot take the foreground, so this is the only way
-/// Escape reaches it. See the module comment for why that is.
+/// The overlay deliberately does not take the foreground (see the window style
+/// where it is created), so keyboard messages follow the focus to whatever
+/// application the user was in. This is how the mask hears them anyway: it is
+/// installed for the life of the session and swallows exactly the keys the mask
+/// owns while it is up.
 unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 && wparam.0 as u32 == WM_KEYDOWN {
         let event = lparam.0 as *const KBDLLHOOKSTRUCT;
-        if !event.is_null() && unsafe { (*event).vkCode } == VK_ESCAPE.0 as u32 {
+        let owned = !event.is_null()
+            && matches!(
+                unsafe { (*event).vkCode },
+                k if k == VK_ESCAPE.0 as u32 || k == VK_RETURN.0 as u32
+            );
+        if owned {
             let target = HOOK_TARGET.load(Ordering::Acquire);
             if target != 0 {
                 // Posted rather than handled here: the hook runs inside another
                 // message's dispatch, and destroying the window from there would
                 // unwind back through the hook.
                 let hwnd = HWND(target as *mut core::ffi::c_void);
+                let key = unsafe { (*event).vkCode };
                 unsafe {
-                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    if key == VK_ESCAPE.0 as u32 {
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    } else {
+                        // Enter takes the selection as it stands, which the
+                        // window procedure already knows how to do.
+                        let _ = PostMessageW(Some(hwnd), WM_KEYDOWN, WPARAM(key as usize), LPARAM(0));
+                    }
                 }
-                // Swallow it: while the overlay is up, Escape belongs to us.
+                // Swallow it: while the overlay is up, these two are ours.
                 return LRESULT(1);
             }
         }
@@ -588,32 +601,84 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// Compose `area` of the frame, then ask for exactly that much to be blitted.
-fn repaint(session: &mut Session, area: Area) {
+/// Compose and push a set of areas, one at a time.
+///
+/// # Why a set and not a bounding box
+///
+/// This used to union everything that changed into one rectangle and hand that
+/// to `InvalidateRect`. The crosshair alone runs the width and the height of the
+/// monitor, so the union of "the crosshair moved" is the whole screen: every
+/// mouse move recomposed and re-pushed ~30 MB. That starves the message loop
+/// badly enough that Windows decides the window is not responding — the pointer
+/// turns into the busy ring while the mask is up — and the picture falls behind
+/// the pointer by however long the backlog takes to drain.
+///
+/// The strips are what actually changed. Composing and pushing them individually
+/// costs about a megabyte a move, and the loop stays responsive.
+fn repaint(session: &mut Session, areas: &[Area]) {
+    let started = std::time::Instant::now();
     let (width, height) = (session.screen.width, session.screen.height);
-    let area = area.clamped(width, height);
-    if area.width() <= 0 || area.height() <= 0 {
+    let dc = unsafe { GetDC(Some(session.hwnd)) };
+    if dc.is_invalid() {
         return;
     }
-    compose(session, area);
-    let rect = area.to_rect();
+    let mut pixels = 0i64;
+    let mut pushed = 0usize;
+    for area in areas {
+        let area = area.clamped(width, height);
+        if area.is_empty() {
+            continue;
+        }
+        compose(session, area);
+        pixels += area.width() as i64 * area.height() as i64;
+        pushed += 1;
+        // Straight to the window rather than through `InvalidateRect`: WM_PAINT
+        // reports the *bounding box* of the update region, which would put the
+        // whole screen back in play — and would blit parts of the frame nothing
+        // had composed.
+        unsafe {
+            let _ = BitBlt(
+                dc,
+                area.left,
+                area.top,
+                area.width(),
+                area.height(),
+                Some(session.frame.dc),
+                area.left,
+                area.top,
+                SRCCOPY,
+            );
+        }
+    }
+    unsafe { ReleaseDC(Some(session.hwnd), dc) };
     tracing::debug!(
-        left = area.left,
-        top = area.top,
-        right = area.right,
-        bottom = area.bottom,
-        selection = ?session.selection,
+        strips = pushed,
+        pixels,
+        micros = started.elapsed().as_micros() as u64,
         "overlay repaint"
     );
-    unsafe {
-        let _ = InvalidateRect(Some(session.hwnd), Some(&rect), false);
-    }
 }
 
 /// Draw `area` of the frame: the dimmed screen, the bright selection over it,
 /// then the selection's frame.
 fn compose(session: &Session, area: Area) {
     let dc = session.frame.dc;
+    // Everything below draws into the frame buffer, which is the size of the
+    // whole desktop and knows nothing about `area`. Clipping here is what makes
+    // "composed" and "pushed" the same set of pixels: a fill or a frame that
+    // crossed the edge of the area would otherwise be composed but never shown,
+    // leaving the window with an older frame in those pixels.
+    let saved = unsafe { SaveDC(dc) };
+    unsafe {
+        let _ = IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
+    }
+    compose_inner(session, dc, area);
+    unsafe {
+        let _ = RestoreDC(dc, saved);
+    }
+}
+
+fn compose_inner(session: &Session, dc: HDC, area: Area) {
     // 1. The darkened screen, so anything the selection no longer covers goes
     //    back to reading as "not taken".
     blit_dib(dc, &session.dimmed, area);
@@ -703,14 +768,6 @@ fn furniture(session: &Session) -> Vec<Area> {
     }
 
     areas.into_iter().filter(|area| !area.is_empty()).collect()
-}
-
-/// The bounding box of everything in [`furniture`], for invalidating it.
-fn furniture_bounds(session: &Session) -> Area {
-    furniture(session)
-        .into_iter()
-        .fold(Area::EMPTY, Area::union)
-        .clamped(session.screen.width, session.screen.height)
 }
 
 impl Session {
@@ -1142,6 +1199,18 @@ unsafe extern "system" fn window_proc(
             let dc = unsafe { BeginPaint(hwnd, &mut paint) };
             with_session(hwnd, |session| {
                 let target = paint.rcPaint;
+                // The frame buffer is only composed where it was pushed, so an
+                // area the system exposes has to be composed here before it can
+                // be copied out of it.
+                compose(
+                    session,
+                    Area {
+                        left: target.left,
+                        top: target.top,
+                        right: target.right,
+                        bottom: target.bottom,
+                    },
+                );
                 unsafe {
                     let _ = BitBlt(
                         dc,
@@ -1163,63 +1232,54 @@ unsafe extern "system" fn window_proc(
             let (x, y) = point_of(lparam);
             with_session(hwnd, |session| {
                 // The prompt only shows before the first drag, so where it was
-                // has to be repainted along with the new selection.
-                let prompt = furniture_bounds(session);
+                // has to be repainted along with the new selection. The pointer
+                // furniture moves with the click, too.
+                let mut dirty = furniture(session);
                 session.dragging = true;
                 session.anchor = (x, y);
                 session.cursor = Some((x, y));
+                dirty.extend(furniture(session));
                 // Wipe the previous selection's frame even if the new drag never
                 // grows: the first frame of a drag has no area yet.
-                let here = Area {
+                let (width, height) = (session.screen.width, session.screen.height);
+                if let Some(previous) = session.selection.take() {
+                    dirty.push(previous.inflated(8, width, height));
+                }
+                dirty.push(Area {
                     left: x,
                     top: y,
                     right: x,
                     bottom: y,
-                };
-                let (width, height) = (session.screen.width, session.screen.height);
-                let dirty = match session.selection.take() {
-                    Some(previous) => previous.inflated(8, width, height).union(here),
-                    None => here,
-                };
-                repaint(session, dirty.union(prompt).union(furniture_bounds(session)));
+                });
+                repaint(session, &dirty);
             });
             unsafe { SetCapture(hwnd) };
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
             let (x, y) = point_of(lparam);
+            show_crosshair();
             with_session(hwnd, |session| {
                 // The crosshair, the magnifier and the prompt all follow the
-                // pointer, so what they covered a moment ago has to be repainted
-                // along with what they cover now.
-                let stale = furniture_bounds(session);
+                // pointer, so the strips they covered a moment ago are pushed
+                // along with the strips they cover now — as strips, not as the
+                // box around them, which is the whole screen.
+                let stale = furniture(session);
                 session.cursor = Some((x, y));
-                let fresh = furniture_bounds(session);
+                let mut dirty = stale;
+                dirty.extend(furniture(session));
 
-                if !session.dragging {
-                    repaint(session, stale.union(fresh));
-                    return;
+                if session.dragging {
+                    let (width, height) = (session.screen.width, session.screen.height);
+                    let next = Area::from_drag(session.anchor, (x, y)).clamped(width, height);
+                    let previous = session.selection.replace(next);
+                    tracing::debug!(?previous, ?next, "drag");
+                    if let Some(previous) = previous {
+                        dirty.push(previous.inflated(8, width, height));
+                    }
+                    dirty.push(next.inflated(8, width, height));
                 }
-                let (width, height) = (session.screen.width, session.screen.height);
-                let next = Area::from_drag(session.anchor, (x, y)).clamped(width, height);
-                let previous = session.selection.replace(next);
-                // Only what changed is recomposed: this runs per mouse event, and
-                // a full frame is tens of megabytes.
-                let dirty = match previous {
-                    Some(previous) => previous
-                        .inflated(8, width, height)
-                        .union(next.inflated(8, width, height)),
-                    None => next.inflated(8, width, height),
-                };
-                tracing::debug!(
-                    ?previous,
-                    ?next,
-                    dirty = ?dirty,
-                    stale = ?stale,
-                    fresh = ?fresh,
-                    "drag"
-                );
-                repaint(session, dirty.union(stale).union(fresh));
+                repaint(session, &dirty);
             });
             LRESULT(0)
         }
@@ -1252,14 +1312,16 @@ unsafe extern "system" fn window_proc(
             });
             LRESULT(0)
         }
+        WM_TIMER => {
+            if wparam.0 == TIMER_ASSERT {
+                assert_topmost(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_SETCURSOR => {
             // Answering without deferring keeps Windows from resetting the
             // crosshair to the class arrow whenever the mouse moves.
-            unsafe {
-                if let Ok(cursor) = LoadCursorW(None, IDC_CROSS) {
-                    SetCursor(Some(cursor));
-                }
-            }
+            show_crosshair();
             LRESULT(1)
         }
         WM_CLOSE => {
@@ -1526,24 +1588,4 @@ mod tests {
         assert!(left >= 0);
     }
 
-    #[test]
-    fn the_union_covers_both_rectangles() {
-        let a = Area {
-            left: 10,
-            top: 10,
-            right: 20,
-            bottom: 20,
-        };
-        let b = Area {
-            left: 50,
-            top: 5,
-            right: 60,
-            bottom: 40,
-        };
-        let union = a.union(b);
-        assert_eq!(
-            (union.left, union.top, union.right, union.bottom),
-            (10, 5, 60, 40)
-        );
-    }
 }
