@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextFormat, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    DWRITE_TEXT_ALIGNMENT_CENTER,
 };
 
 use beautify_widget::canvas::{Canvas, TextEngine};
@@ -56,8 +57,14 @@ pub struct Interaction {
     pub focused_row: Option<usize>,
     /// Text being typed into the box that has focus.
     pub editing: String,
+    /// The row whose hotkey field is recording, with what has been pressed so
+    /// far ("Ctrl+Alt+"), so the field can show the combination as it is built.
+    pub recording: Option<usize>,
+    pub recording_text: String,
     /// Label of the currently active sidebar entry, for hover.
     pub hover_nav: Option<usize>,
+    /// The title-bar button under the pointer, if any.
+    pub hover_window: Option<WindowButton>,
 }
 
 /// Live values the status rows show.
@@ -205,7 +212,7 @@ impl Painter {
         canvas.fill_rect(layout.titlebar, palette.titlebar);
 
         self.draw_nav(canvas, layout, metrics, palette, interaction)?;
-        self.draw_titlebar(canvas, layout, metrics, palette)?;
+        self.draw_titlebar(canvas, layout, metrics, palette, interaction)?;
 
         // The page is clipped to its viewport so a row scrolling up disappears
         // under the header instead of over it.
@@ -336,6 +343,7 @@ impl Painter {
         layout: &Layout,
         metrics: &Metrics,
         palette: &Palette,
+        interaction: &Interaction,
     ) -> Result<()> {
         let format = self.text.format(metrics.label_size(), TITLE_WEIGHT)?;
         let rect = Rect::new(
@@ -345,12 +353,59 @@ impl Painter {
             layout.titlebar.bottom,
         );
         self.text_in(canvas, rect, "WinBeautify 设置", &format, palette.text);
-        // Two window buttons, drawn as glyphs so no icon font is needed.
+        // The window buttons. The glyphs are drawn as geometry rather than text
+        // so they stay crisp at any DPI and do not depend on an icon font that
+        // may not be installed.
         for button in window_buttons(layout, metrics) {
-            if button.kind == WindowButton::Close {
-                canvas.fill_rounded(button.rect, metrics.px(4.0), palette.danger.with_alpha(0.9));
-            } else {
-                canvas.fill_rounded(button.rect, metrics.px(4.0), palette.hover);
+            let hovered = interaction.hover_window == Some(button.kind);
+            let (wash, ink) = match button.kind {
+                WindowButton::Close if hovered => (palette.danger, palette.on_accent),
+                WindowButton::Close => (Rgba::TRANSPARENT, palette.text_dim),
+                _ if hovered => (palette.hover, palette.text),
+                _ => (Rgba::TRANSPARENT, palette.text_dim),
+            };
+            if wash.a > 0.0 {
+                canvas.fill_rounded(button.rect, metrics.px(4.0), wash);
+            }
+            self.draw_window_glyph(canvas, &button, metrics, ink)?;
+        }
+        Ok(())
+    }
+
+    /// The stroke inside a window button: a bar for minimise, a cross for close.
+    fn draw_window_glyph(
+        &self,
+        canvas: &Canvas<'_>,
+        button: &PositionedButton,
+        metrics: &Metrics,
+        ink: Rgba,
+    ) -> Result<()> {
+        let centre = (
+            (button.rect.left + button.rect.right) * 0.5,
+            button.rect.center_y(),
+        );
+        let arm = metrics.px(5.0);
+        let thickness = metrics.px(1.4);
+        match button.kind {
+            WindowButton::Minimize => canvas.fill_rect(
+                Rect::new(
+                    centre.0 - arm,
+                    centre.1 - thickness * 0.5,
+                    centre.0 + arm,
+                    centre.1 + thickness * 0.5,
+                ),
+                ink,
+            ),
+            WindowButton::Close => {
+                // Two strokes, each a thin rotated bar. A cross made of two
+                // rectangles reads correctly even at 10 px.
+                for tilt in [-1.0f32, 1.0] {
+                    self.polygon(
+                        canvas,
+                        &bar_points(centre, arm, thickness, tilt),
+                        ink,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -371,6 +426,11 @@ impl Painter {
         let hint_format = self.text.format(metrics.description_size(), LABEL_WEIGHT)?;
         let label_format = self.text.format(metrics.label_size(), LABEL_WEIGHT)?;
         let small_format = self.text.format(metrics.hint_size(), LABEL_WEIGHT)?;
+        // Text that sits inside a drawn box is centred in it; text in a column
+        // (labels, values, list entries) is left-aligned.
+        let box_format = self
+            .text
+            .format_aligned(metrics.hint_size(), LABEL_WEIGHT, DWRITE_TEXT_ALIGNMENT_CENTER)?;
 
         // The section's own explanation, in the space the layout reserved for
         // it between the heading and the first card.
@@ -447,6 +507,7 @@ impl Painter {
                     status,
                     current,
                     &small_format,
+                    &box_format,
                     &label_format,
                 )?;
             }
@@ -496,6 +557,7 @@ impl Painter {
         status: &StatusText,
         row_index: usize,
         small: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+        centred: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         label: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     ) -> Result<()> {
         let parts = controls::parts(row.field, row.control, metrics);
@@ -694,7 +756,33 @@ impl Painter {
                 .min(slot.width());
                 let pill = Rect::new(slot.left, slot.top, slot.left + width, slot.bottom);
                 canvas.fill_rounded(pill, pill.height() * 0.5, colour.with_alpha(0.16));
-                self.text_in(canvas, Rect::new(pill.left + metrics.px(10.0), pill.top, pill.right, pill.bottom), text, small, colour);
+                self.text_in(canvas, pill, text, centred, colour);
+            }
+            Kind::Hotkey => {
+                let rect = parts.boxes[0];
+                let recording = interaction.recording == Some(row_index);
+                canvas.fill_rounded(rect, metrics.px(5.0), palette.control);
+                // The border is the whole affordance a recorder has: it says
+                // whether the field is listening.
+                canvas.stroke_rounded(
+                    rect,
+                    metrics.px(5.0),
+                    if recording {
+                        palette.accent
+                    } else {
+                        palette.control_border
+                    },
+                    if recording { 2.0 } else { 1.0 },
+                );
+                let stored = value.as_ref().and_then(|v| v.as_text()).unwrap_or("");
+                let (text, colour) = if recording {
+                    (interaction.recording_text.as_str(), palette.accent)
+                } else if stored.is_empty() {
+                    ("点击后按组合键", palette.text_faint)
+                } else {
+                    (stored, palette.text)
+                };
+                self.text_in(canvas, rect.inset_by(metrics.px(9.0), 0.0), text, small, colour);
             }
             // A read-only value. The label column already says what it is, so
             // this is just the text, and it is deliberately not styled like a
@@ -712,14 +800,13 @@ impl Painter {
                     } else {
                         palette.accent
                     };
-                    let hovered = hovered
-                        && interaction.hover_part == Some(Part::Button(index));
+                    let lit = hovered && interaction.hover_part == Some(Part::Button(index));
                     canvas.fill_rounded(
                         rect,
                         metrics.px(5.0),
-                        colour.with_alpha(if hovered { 0.24 } else { 0.14 }),
+                        colour.with_alpha(if lit { 0.24 } else { 0.14 }),
                     );
-                    self.text_in(canvas, rect, button.label, small, colour);
+                    self.text_in(canvas, rect, button.label, centred, colour);
                 }
             }
         }
@@ -801,6 +888,22 @@ pub fn dropdown_rect(
         row.control.right,
         top + height,
     ))
+}
+
+/// The four corners of a thin bar through `centre`, tilted by `tilt` (a slope).
+fn bar_points(centre: (f32, f32), arm: f32, thickness: f32, tilt: f32) -> [(f32, f32); 4] {
+    let half = thickness * 0.5;
+    // A unit vector along the bar, and its perpendicular.
+    let (ax, ay) = (1.0, tilt);
+    let length = (ax * ax + ay * ay).sqrt();
+    let (ux, uy) = (ax / length * arm, ay / length * arm);
+    let (px, py) = (-ay / length * half, ax / length * half);
+    [
+        (centre.0 - ux + px, centre.1 - uy + py),
+        (centre.0 + ux + px, centre.1 + uy + py),
+        (centre.0 + ux - px, centre.1 + uy - py),
+        (centre.0 - ux - px, centre.1 - uy - py),
+    ]
 }
 
 /// The sidebar's window buttons, in the title bar.

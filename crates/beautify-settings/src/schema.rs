@@ -150,6 +150,10 @@ pub enum Kind {
     Text {
         placeholder: &'static str,
     },
+    /// A key combination, recorded by pressing it rather than typed. Typing was
+    /// the wrong affordance: the string is not the thing the user has in mind,
+    /// the key press is, and a typo silently registers nothing.
+    Hotkey,
     /// A live read-out; not editable.
     Status(StatusKind),
     /// A read-only key/value line whose value the host supplies. The label comes
@@ -470,6 +474,17 @@ const fn color(path: &'static str, label: &'static str) -> Field {
         label,
         hint: None,
         kind: Kind::Color,
+        when: None,
+    }
+}
+
+/// Shorthand for a hotkey row.
+const fn hotkey(path: &'static str, label: &'static str, hint: &'static str) -> Field {
+    Field {
+        path,
+        label,
+        hint: Some(hint),
+        kind: Kind::Hotkey,
         when: None,
     }
 }
@@ -933,30 +948,17 @@ const SYSTEM: &[Card] = &[
                 "开机自动启动",
                 "写入当前用户的启动项，不需要管理员权限。",
             ),
-            hint(
-                Field {
-                    path: "clipboard.hotkey",
-                    label: "剪贴板快捷键",
-                    hint: None,
-                    kind: Kind::Text {
-                        placeholder: "Ctrl+Alt+V",
-                    },
-                    when: None,
-                },
-                "格式如 Ctrl+Alt+V；留空则不注册。修改后立即生效。",
+            hotkey(
+                "clipboard.hotkey",
+                "剪贴板快捷键",
+                "打开剪贴板历史。点一下再按组合键即可记录，按 Backspace 清空则不注册。",
             ),
-            hint(
-                Field {
-                    path: "todo.hotkey",
-                    label: "任务清单快捷键",
-                    hint: None,
-                    kind: Kind::Text {
-                        placeholder: "Ctrl+Alt+T",
-                    },
-                    when: None,
-                },
-                "留空则不注册。",
+            hotkey(
+                "clipboard.pin_hotkey",
+                "贴图快捷键",
+                "把剪贴板里的图片贴到屏幕最上层（与 Snipaste 的 F3 一致）。再按一次收起。",
             ),
+            hotkey("todo.hotkey", "任务清单快捷键", "打开任务清单。留空则不注册。"),
         ],
     },
     Card {
@@ -1012,17 +1014,10 @@ const SNIP: &[Card] = &[
         fields: &[
             switch("snip.enabled", "启用截图"),
             when(
-                hint(
-                    Field {
-                        path: "snip.hotkey",
-                        label: "截图快捷键",
-                        hint: None,
-                        kind: Kind::Text {
-                            placeholder: "Ctrl+Alt+A",
-                        },
-                        when: None,
-                    },
-                    "按下后在整块桌面上拖出要截取的区域。Esc 或右键取消；留空则不注册快捷键。",
+                hotkey(
+                    "snip.hotkey",
+                    "截图快捷键",
+                    "点一下再按组合键即可记录。按下后在整块桌面上拖出要截取的区域，Esc 或右键取消；                     按 Backspace 清空则不注册。",
                 ),
                 snip_on,
             ),

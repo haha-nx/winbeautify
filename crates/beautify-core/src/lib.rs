@@ -7,6 +7,7 @@
 pub mod config;
 pub mod event;
 pub mod geometry;
+pub mod hotkey;
 pub mod logging;
 pub mod model;
 pub mod module;

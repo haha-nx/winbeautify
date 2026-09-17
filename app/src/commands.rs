@@ -449,6 +449,12 @@ pub fn close_pins() {
     crate::snip::close_pins();
 }
 
+/// Pin the clipboard's image to the desktop, or take it away again.
+#[tauri::command]
+pub fn pin_clipboard_image(app: AppHandle) -> R<String> {
+    crate::snip::pin_clipboard(&app)
+}
+
 /// Read the clipboard's text, for a paste into the flyout.
 #[tauri::command]
 pub fn clipboard_text() -> Option<String> {
@@ -557,6 +563,7 @@ pub fn refresh_hotkeys(app: &AppHandle, config: &Config) {
             (HotkeyAction::OpenClipboard, config.clipboard.hotkey.clone()),
             (HotkeyAction::OpenTodo, config.todo.hotkey.clone()),
             (HotkeyAction::Snip, config.snip.hotkey.clone()),
+            (HotkeyAction::PinClipboard, config.clipboard.pin_hotkey.clone()),
         ],
         app.clone(),
     );

@@ -36,25 +36,24 @@
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetStockObject, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    StretchDIBits, BACKGROUND_MODE, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DEFAULT_GUI_FONT,
-    DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC,
-    HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
+    GetStockObject, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetStretchBltMode,
+    SetTextColor, StretchDIBits, BACKGROUND_MODE, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    COLORONCOLOR, DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN,
-};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW,
+    PostQuitMessage,
     RegisterClassExW, SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     SetWindowsHookExW, ShowWindow, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
     CS_DBLCLKS, GWLP_USERDATA, HC_ACTION, HWND_TOPMOST, IDC_CROSS, KBDLLHOOKSTRUCT, MSG,
@@ -122,6 +121,18 @@ impl Area {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
     }
 
+    const EMPTY: Self = Self {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+
+    /// Does this cover no pixels at all?
+    fn is_empty(&self) -> bool {
+        self.width() <= 0 || self.height() <= 0
+    }
+
     /// Clamp into a `width` by `height` box, keeping it non-inverted.
     fn clamped(self, width: i32, height: i32) -> Self {
         let left = self.left.clamp(0, width);
@@ -144,7 +155,16 @@ impl Area {
     }
 
     /// The bounding box of two areas, for repainting only what moved.
+    ///
+    /// An empty operand is ignored, so "nothing here" can be unioned with the
+    /// real rectangles without dragging the result towards the origin.
     fn union(self, other: Self) -> Self {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
         Self {
             left: self.left.min(other.left),
             top: self.top.min(other.top),
@@ -203,6 +223,10 @@ impl Frame {
             }
         };
         let previous = unsafe { SelectObject(dc, bitmap.into()) };
+        // The magnifier scales a patch of the capture into the frame, and a
+        // screenshot tool is expected to show the pixel grid rather than a
+        // smoothed guess at it.
+        unsafe { SetStretchBltMode(dc, COLORONCOLOR) };
         Some(Self {
             dc,
             bitmap,
@@ -235,6 +259,9 @@ struct Session {
     anchor: (i32, i32),
     selection: Option<Area>,
     dragging: bool,
+    /// Where the pointer is, in window coordinates. The crosshair, the magnifier
+    /// and the prompt all hang off it.
+    cursor: Option<(i32, i32)>,
     /// The foreground window from before the hotkey, restored on the way out.
     previous_foreground: HWND,
     font: HGDIOBJ,
@@ -380,6 +407,7 @@ fn select(options: Options) -> Result<Captured, Failure> {
         anchor: (0, 0),
         selection: None,
         dragging: false,
+        cursor: None,
         previous_foreground: unsafe { GetForegroundWindow() },
         font: message_font(),
         options,
@@ -418,6 +446,20 @@ fn select(options: Options) -> Result<Captured, Failure> {
         let _ = SetForegroundWindow(hwnd);
         SetCapture(hwnd);
     }
+    with_session(hwnd, |session| {
+        let mut point = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut point);
+        }
+        session.cursor = Some((point.x - session.origin.0, point.y - session.origin.1));
+        let full = Area {
+            left: 0,
+            top: 0,
+            right: session.screen.width,
+            bottom: session.screen.height,
+        };
+        repaint(session, full);
+    });
     HOOK_TARGET.store(hwnd.0 as isize, Ordering::Release);
     let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }.ok();
 
@@ -520,37 +562,412 @@ fn compose(session: &Session, area: Area) {
     //    back to reading as "not taken".
     blit_dib(dc, &session.dimmed, area);
 
-    let Some(selection) = session.selection else {
-        return;
-    };
-    // 2. The selection itself, at full brightness.
-    let bright = Area {
-        left: area.left.max(selection.left),
-        top: area.top.max(selection.top),
-        right: area.right.min(selection.right),
-        bottom: area.bottom.min(selection.bottom),
-    };
-    if bright.width() > 0 && bright.height() > 0 {
-        blit_dib(dc, &session.screen, bright);
+    // 2. The selection, if there is one: the same rectangle at full brightness,
+    //    so the part that will be taken stands out from the part that will not.
+    if let Some(selection) = session.selection {
+        let bright = Area {
+            left: area.left.max(selection.left),
+            top: area.top.max(selection.top),
+            right: area.right.min(selection.right),
+            bottom: area.bottom.min(selection.bottom),
+        };
+        if bright.width() > 0 && bright.height() > 0 {
+            blit_dib(dc, &session.screen, bright);
+        }
+
+        // A thin frame around it, drawn as four bands so the pixels inside stay
+        // exactly as captured.
+        let thickness = (session.screen.width / 1000).clamp(1, 3);
+        let brush = unsafe { CreateSolidBrush(COLORREF(session.options.accent.to_bgr_u32())) };
+        for band in border_bands(selection, thickness) {
+            let clipped = Area {
+                left: band.left.max(area.left),
+                top: band.top.max(area.top),
+                right: band.right.min(area.right),
+                bottom: band.bottom.min(area.bottom),
+            };
+            if clipped.width() > 0 && clipped.height() > 0 {
+                let rect = clipped.to_rect();
+                unsafe { FillRect(dc, &rect, brush) };
+            }
+        }
+        unsafe { let _ = DeleteObject(brush.into()); };
     }
 
-    // 3. A thin frame around it, drawn as four bands so the pixels inside stay
-    //    exactly as captured.
-    let thickness = (session.screen.width / 1000).clamp(1, 3);
-    let brush = unsafe { CreateSolidBrush(COLORREF(session.options.accent.to_bgr_u32())) };
-    for band in border_bands(selection, thickness) {
+    // 3. The pointer furniture, on top of the picture: where the pointer is,
+    //    what is under it, and how big the selection is. Deliberately outside
+    //    the block above — an early return for "no selection yet" is exactly
+    //    what left the crosshair and the magnifier missing.
+    if let Some(cursor) = session.cursor {
+        draw_crosshair(session, dc, area, cursor);
+        if session.selection.is_none() && !session.dragging {
+            draw_hint(session, dc, area, cursor);
+        }
+        draw_magnifier(session, dc, area, cursor);
+    }
+    draw_badge(session, dc, area);
+}
+
+/// Everything drawn on top of the screen picture, anchored to the pointer or to
+/// the selection.
+///
+/// These live in the frame buffer rather than being painted straight to the
+/// window, so a strip repaint restores exactly the pixels that were there —
+/// including erasing furniture that has moved away.
+fn furniture(session: &Session) -> Vec<Area> {
+    let mut areas = Vec::new();
+
+    if let Some(cursor) = session.cursor {
+        // The crosshair: one line across the monitor's width and one down its
+        // height, so it reads as a ruler rather than as a mark on the picture.
+        let monitor = session.cursor_monitor();
+        areas.push(Area {
+            left: monitor.left - session.origin.0,
+            top: cursor.1,
+            right: monitor.right - session.origin.0,
+            bottom: cursor.1 + CROSSHAIR,
+        });
+        areas.push(Area {
+            left: cursor.0,
+            top: monitor.top - session.origin.1,
+            right: cursor.0 + CROSSHAIR,
+            bottom: monitor.bottom - session.origin.1,
+        });
+        // The prompt, while there is nothing to describe yet, and the magnifier
+        // for as long as the session lasts.
+        if session.selection.is_none() && !session.dragging {
+            areas.push(hint_area(session, cursor));
+        }
+        areas.push(magnifier_area(session, cursor));
+    }
+
+    if let Some(selection) = session.selection {
+        let (badge, _) = badge_plate(session, selection);
+        areas.push(badge);
+    }
+
+    areas.into_iter().filter(|area| !area.is_empty()).collect()
+}
+
+/// The bounding box of everything in [`furniture`], for invalidating it.
+fn furniture_bounds(session: &Session) -> Area {
+    furniture(session)
+        .into_iter()
+        .fold(Area::EMPTY, Area::union)
+        .clamped(session.screen.width, session.screen.height)
+}
+
+impl Session {
+    /// The monitor the pointer is on.
+    fn cursor_monitor(&self) -> RECT {
+        let point = self
+            .cursor
+            .map(|(x, y)| (self.origin.0 + x, self.origin.1 + y))
+            .unwrap_or(self.origin);
+        capture::monitor_rect_at(point.0, point.1).unwrap_or(RECT {
+            left: self.origin.0,
+            top: self.origin.1,
+            right: self.origin.0 + self.screen.width,
+            bottom: self.origin.1 + self.screen.height,
+        })
+    }
+}
+
+/// Draw the crosshair through the pointer.
+fn draw_crosshair(session: &Session, dc: HDC, area: Area, cursor: (i32, i32)) {
+    let monitor = session.cursor_monitor();
+    let ink = COLORREF(0x00FF_FFFF);
+    let brush = unsafe { CreateSolidBrush(ink) };
+    for line in [
+        Area {
+            left: monitor.left - session.origin.0,
+            top: cursor.1,
+            right: monitor.right - session.origin.0,
+            bottom: cursor.1 + CROSSHAIR,
+        },
+        Area {
+            left: cursor.0,
+            top: monitor.top - session.origin.1,
+            right: cursor.0 + CROSSHAIR,
+            bottom: monitor.bottom - session.origin.1,
+        },
+    ] {
         let clipped = Area {
-            left: band.left.max(area.left),
-            top: band.top.max(area.top),
-            right: band.right.min(area.right),
-            bottom: band.bottom.min(area.bottom),
+            left: line.left.max(area.left),
+            top: line.top.max(area.top),
+            right: line.right.min(area.right),
+            bottom: line.bottom.min(area.bottom),
         };
-        if clipped.width() > 0 && clipped.height() > 0 {
+        if !clipped.is_empty() {
             let rect = clipped.to_rect();
             unsafe { FillRect(dc, &rect, brush) };
         }
     }
     unsafe { let _ = DeleteObject(brush.into()); };
+}
+
+/// How much of the surrounding screen the magnifier shows.
+const MAGNIFIER_SOURCE: i32 = 21;
+/// How far each source pixel is blown up.
+const MAGNIFIER_ZOOM: i32 = 8;
+/// Thickness of the crosshair lines.
+const CROSSHAIR: i32 = 1;
+
+/// Where the magnifier patch goes: next to the pointer, flipped near an edge.
+fn magnifier_area(session: &Session, cursor: (i32, i32)) -> Area {
+    let monitor = session.cursor_monitor();
+    let (width, height) = (session.screen.width, session.screen.height);
+    let gap = 18;
+    let plate = (MAGNIFIER_SOURCE * MAGNIFIER_ZOOM, MAGNIFIER_SOURCE * MAGNIFIER_ZOOM + 18);
+
+    // Prefer down-right of the pointer, which is where a right-handed user is
+    // not about to drag a selection.
+    let mut left = cursor.0 + gap;
+    let mut top = cursor.1 + gap;
+    if left + plate.0 > monitor.right - session.origin.0 {
+        left = cursor.0 - gap - plate.0;
+    }
+    if top + plate.1 > monitor.bottom - session.origin.1 {
+        top = cursor.1 - gap - plate.1;
+    }
+    Area {
+        left: left.max(monitor.left - session.origin.0),
+        top: top.max(monitor.top - session.origin.1),
+        right: left.max(monitor.left - session.origin.0) + plate.0,
+        bottom: top.max(monitor.top - session.origin.1) + plate.1,
+    }
+    .clamped(width, height)
+}
+
+/// The magnifier: the pixels around the pointer, blown up, with the pixel under
+/// it marked and its colour written underneath.
+///
+/// This is the part of a screenshot tool that makes a selection land on the
+/// pixel you meant, which guessing at full-screen zoom never does.
+fn draw_magnifier(session: &Session, dc: HDC, area: Area, cursor: (i32, i32)) {
+    let plate = magnifier_area(session, cursor);
+    if !intersects(plate, area.to_rect()) {
+        return;
+    }
+    let patch = Area {
+        left: plate.left,
+        top: plate.top,
+        right: plate.right,
+        bottom: plate.bottom - 18,
+    };
+    let zoom = patch.width() / MAGNIFIER_SOURCE;
+    // The source rectangle, relative to the pointer and clamped to the picture
+    // so a corner does not read outside it.
+    let half = MAGNIFIER_SOURCE / 2;
+    let source_x = (cursor.0 - half).clamp(0, (session.screen.width - MAGNIFIER_SOURCE).max(0));
+    let source_y = (cursor.1 - half).clamp(0, (session.screen.height - MAGNIFIER_SOURCE).max(0));
+
+    blit_dib_scaled(
+        dc,
+        &session.screen,
+        Area {
+            left: source_x,
+            top: source_y,
+            right: source_x + MAGNIFIER_SOURCE,
+            bottom: source_y + MAGNIFIER_SOURCE,
+        },
+        patch,
+    );
+
+    // The pixel the pointer is on, outlined inside the patch.
+    let centre_x = patch.left + (cursor.0 - source_x) * zoom;
+    let centre_y = patch.top + (cursor.1 - source_y) * zoom;
+    let cell = Area {
+        left: centre_x,
+        top: centre_y,
+        right: centre_x + zoom,
+        bottom: centre_y + zoom,
+    };
+    let outline = cell.to_rect();
+    let brush = unsafe { CreateSolidBrush(COLORREF(0x00FF_FFFF)) };
+    unsafe {
+        FrameRect(dc, &outline, brush);
+        // …and a border around the whole patch, which also separates it from a
+        // bright or busy background.
+        let frame = plate.to_rect();
+        FrameRect(dc, &frame, brush);
+        let _ = DeleteObject(brush.into());
+    }
+
+    // The coordinate and colour read-out, in the strip under the patch.
+    let (red, green, blue) = pixel_at(&session.screen, cursor.0, cursor.1);
+    let label = format!(
+        "{} × {}   #{:02X}{:02X}{:02X}",
+        session.origin.0 + cursor.0,
+        session.origin.1 + cursor.1,
+        red,
+        green,
+        blue
+    );
+    let strip = Area {
+        left: plate.left,
+        top: patch.bottom,
+        right: plate.right,
+        bottom: plate.bottom,
+    };
+    let plate_brush = unsafe { CreateSolidBrush(COLORREF(0x0010_1010)) };
+    let strip_rect = strip.to_rect();
+    unsafe {
+        FillRect(dc, &strip_rect, plate_brush);
+        let _ = DeleteObject(plate_brush.into());
+    }
+    let mut bounds = strip.to_rect();
+    let mut wide: Vec<u16> = label.encode_utf16().collect();
+    unsafe {
+        let font = SelectObject(dc, session.font);
+        let colour = SetTextColor(dc, COLORREF(0x00FF_FFFF));
+        let mode = SetBkMode(dc, TRANSPARENT);
+        DrawTextW(
+            dc,
+            &mut wide,
+            &mut bounds,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SetBkMode(dc, BACKGROUND_MODE(mode as u32));
+        SetTextColor(dc, colour);
+        SelectObject(dc, font);
+    }
+}
+
+/// The colour of one pixel of a shot, as `(r, g, b)`.
+fn pixel_at(shot: &Shot, x: i32, y: i32) -> (u8, u8, u8) {
+    if x < 0 || y < 0 || x >= shot.width || y >= shot.height {
+        return (0, 0, 0);
+    }
+    let index = y as usize * shot.stride() + x as usize * 4;
+    // Stored BGRA.
+    (shot.bgra[index + 2], shot.bgra[index + 1], shot.bgra[index])
+}
+
+/// Where the "drag to select" prompt goes, anchored to the pointer.
+///
+/// To the *left* of the pointer, because the magnifier takes the right: the two
+/// would otherwise be drawn on top of each other, and the magnifier wins.
+fn hint_area(session: &Session, cursor: (i32, i32)) -> Area {
+    let monitor = session.cursor_monitor();
+    let plate = (360, 30);
+    let gap = 22;
+    let mut left = cursor.0 - gap - plate.0;
+    if left < monitor.left - session.origin.0 {
+        // Not enough room on the left; the magnifier flips in that case too, so
+        // above the pointer is the one place that is always free.
+        left = cursor.0 - plate.0 / 2;
+    }
+    let left = left
+        .max(monitor.left - session.origin.0)
+        .min(monitor.right - session.origin.0 - plate.0)
+        .max(0);
+    let top = (cursor.1 + gap).min(monitor.bottom - session.origin.1 - plate.1);
+    Area {
+        left,
+        top: top.max(monitor.top - session.origin.1),
+        right: left + plate.0,
+        bottom: top.max(monitor.top - session.origin.1) + plate.1,
+    }
+    .clamped(session.screen.width, session.screen.height)
+}
+
+/// Draw the prompt next to the pointer.
+fn draw_hint(session: &Session, dc: HDC, area: Area, cursor: (i32, i32)) {
+    let hint = hint_area(session, cursor);
+    if !intersects(hint, area.to_rect()) {
+        return;
+    }
+    let brush = unsafe { CreateSolidBrush(COLORREF(0x0018_1818)) };
+    let bounds = hint.to_rect();
+    unsafe {
+        FillRect(dc, &bounds, brush);
+        let _ = DeleteObject(brush.into());
+    }
+    draw_centered(dc, session.font, "拖动选择区域 · Esc 或右键取消", bounds);
+}
+
+/// Copy a region of a shot into `destination`, scaled to fit it.
+fn blit_dib_scaled(dc: HDC, shot: &Shot, source: Area, destination: Area) {
+    if source.is_empty() || destination.is_empty() {
+        return;
+    }
+    if source.left < 0
+        || source.top < 0
+        || source.right > shot.width
+        || source.bottom > shot.height
+    {
+        return;
+    }
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: shot.width,
+            biHeight: -shot.height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    unsafe {
+        StretchDIBits(
+            dc,
+            destination.left,
+            destination.top,
+            destination.width(),
+            destination.height(),
+            source.left,
+            source.top,
+            source.width(),
+            source.height(),
+            Some(shot.bgra.as_ptr() as *const core::ffi::c_void),
+            &bmi,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+}
+
+/// Where the badge goes: above the selection, or below when there is no room.
+///
+/// Also used to keep it inside the window horizontally, so a selection at the
+/// screen edge does not push it out of sight.
+fn badge_origin(selection: Area, badge: (i32, i32), window: (i32, i32)) -> (i32, i32) {
+    let gap = 6;
+    let above = selection.top - gap - badge.1;
+    let top = if above >= 0 {
+        above
+    } else {
+        selection.bottom + gap
+    };
+    let mut left = selection.left;
+    // Flip to the left of the selection's right edge rather than run off screen.
+    if left + badge.0 > window.0 {
+        left = selection.right - badge.0;
+    }
+    (
+        left.clamp(0, (window.0 - badge.0).max(0)),
+        top.clamp(0, (window.1 - badge.1).max(0)),
+    )
+}
+
+/// Where the size badge goes, and the plate it is drawn on.
+fn badge_plate(session: &Session, selection: Area) -> (Area, String) {
+    let label = format!("{} × {}", selection.width(), selection.height());
+    // Measured with the font it is drawn in, so a four-digit pair of numbers
+    // cannot overflow the plate.
+    let (text_width, text_height) = measure_text(session.frame.dc, session.font, &label);
+    let plate = (text_width + 16, text_height + 10);
+    let origin = badge_origin(selection, plate, (session.screen.width, session.screen.height));
+    let area = Area {
+        left: origin.0,
+        top: origin.1,
+        right: origin.0 + plate.0,
+        bottom: origin.1 + plate.1,
+    };
+    (area, label)
 }
 
 /// The four bands of a selection's frame.
@@ -663,8 +1080,6 @@ unsafe extern "system" fn window_proc(
                         SRCCOPY,
                     );
                 }
-                draw_badge(session, dc, target);
-                draw_hint(session, dc, target);
             });
             unsafe { let _ = EndPaint(hwnd, &paint); };
             LRESULT(0)
@@ -672,8 +1087,12 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONDOWN => {
             let (x, y) = point_of(lparam);
             with_session(hwnd, |session| {
+                // The prompt only shows before the first drag, so where it was
+                // has to be repainted along with the new selection.
+                let prompt = furniture_bounds(session);
                 session.dragging = true;
                 session.anchor = (x, y);
+                session.cursor = Some((x, y));
                 // Wipe the previous selection's frame even if the new drag never
                 // grows: the first frame of a drag has no area yet.
                 let here = Area {
@@ -687,7 +1106,7 @@ unsafe extern "system" fn window_proc(
                     Some(previous) => previous.inflated(8, width, height).union(here),
                     None => here,
                 };
-                repaint(session, dirty);
+                repaint(session, dirty.union(prompt).union(furniture_bounds(session)));
             });
             unsafe { SetCapture(hwnd) };
             LRESULT(0)
@@ -695,21 +1114,29 @@ unsafe extern "system" fn window_proc(
         WM_MOUSEMOVE => {
             let (x, y) = point_of(lparam);
             with_session(hwnd, |session| {
+                // The crosshair, the magnifier and the prompt all follow the
+                // pointer, so what they covered a moment ago has to be repainted
+                // along with what they cover now.
+                let stale = furniture_bounds(session);
+                session.cursor = Some((x, y));
+                let fresh = furniture_bounds(session);
+
                 if !session.dragging {
+                    repaint(session, stale.union(fresh));
                     return;
                 }
                 let (width, height) = (session.screen.width, session.screen.height);
                 let next = Area::from_drag(session.anchor, (x, y)).clamped(width, height);
                 let previous = session.selection.replace(next);
-                // Only the strips that changed are recomposed: this runs per
-                // mouse event, and a full frame is tens of megabytes.
+                // Only what changed is recomposed: this runs per mouse event, and
+                // a full frame is tens of megabytes.
                 let dirty = match previous {
                     Some(previous) => previous
                         .inflated(8, width, height)
                         .union(next.inflated(8, width, height)),
                     None => next.inflated(8, width, height),
                 };
-                repaint(session, dirty);
+                repaint(session, dirty.union(stale).union(fresh));
             });
             LRESULT(0)
         }
@@ -770,83 +1197,23 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-/// The `320 × 240` badge beside the selection.
-fn draw_badge(session: &Session, dc: HDC, target: RECT) {
+/// Draw the `320 × 240` badge beside the selection.
+fn draw_badge(session: &Session, dc: HDC, area: Area) {
     let Some(selection) = session.selection else {
         return;
     };
-    let label = format!("{} × {}", selection.width(), selection.height());
-    let size = measure_text(dc, session.font, &label);
-    let plate = (size.0 + 16, size.1 + 8);
-    let origin = badge_origin(
-        selection,
-        plate,
-        (session.screen.width, session.screen.height),
-    );
-    let badge = Area {
-        left: origin.0,
-        top: origin.1,
-        right: origin.0 + plate.0,
-        bottom: origin.1 + plate.1,
-    };
-    if !intersects(badge, target) {
+    let (badge, label) = badge_plate(session, selection);
+    if !intersects(badge, area.to_rect()) {
         return;
     }
-    // A dark plate under light text, which is legible over any wallpaper.
-    let brush = unsafe { CreateSolidBrush(COLORREF(0x0020_2020)) };
+    // A dark plate under light text, which stays legible over any wallpaper.
+    let brush = unsafe { CreateSolidBrush(COLORREF(0x0018_1818)) };
     let bounds = badge.to_rect();
     unsafe {
         FillRect(dc, &bounds, brush);
         let _ = DeleteObject(brush.into());
     }
     draw_centered(dc, session.font, &label, bounds);
-}
-
-/// Where the badge goes: above the selection, or below when there is no room.
-fn badge_origin(selection: Area, badge: (i32, i32), window: (i32, i32)) -> (i32, i32) {
-    let gap = 6;
-    let above = selection.top - gap - badge.1;
-    let top = if above >= 0 {
-        above
-    } else {
-        selection.bottom + gap
-    };
-    let mut left = selection.left;
-    // Flip to the left of the selection's right edge rather than run off screen.
-    if left + badge.0 > window.0 {
-        left = selection.right - badge.0;
-    }
-    (
-        left.clamp(0, (window.0 - badge.0).max(0)),
-        top.clamp(0, (window.1 - badge.1).max(0)),
-    )
-}
-
-/// The "drag to select" prompt, shown until a drag starts.
-fn draw_hint(session: &Session, dc: HDC, target: RECT) {
-    if session.selection.is_some() || session.dragging {
-        return;
-    }
-    let text = "拖动鼠标选择区域 · Esc 或右键取消";
-    let size = measure_text(dc, session.font, text);
-    let plate = (size.0 + 36, size.1 + 18);
-    let top = (session.screen.height / 8).max(24);
-    let hint = Area {
-        left: (session.screen.width - plate.0) / 2,
-        top,
-        right: (session.screen.width + plate.0) / 2,
-        bottom: top + plate.1,
-    };
-    if !intersects(hint, target) {
-        return;
-    }
-    let brush = unsafe { CreateSolidBrush(COLORREF(0x0018_1818)) };
-    let bounds = hint.to_rect();
-    unsafe {
-        FillRect(dc, &bounds, brush);
-        let _ = DeleteObject(brush.into());
-    }
-    draw_centered(dc, session.font, text, bounds);
 }
 
 /// Draw one line of white text, centred in `bounds`.

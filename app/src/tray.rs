@@ -21,7 +21,8 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             &MenuItem::with_id(app, "flyout-todo", "任务清单", true, None::<&str>)?,
             &MenuItem::with_id(app, "flyout-clipboard", "剪贴板历史", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, "snip", "截图", true, None::<&str>)?,
+            &MenuItem::with_id(app, "snip", "截图（F1）", true, None::<&str>)?,
+            &MenuItem::with_id(app, "pin-clipboard", "贴图：剪贴板图片（F3）", true, None::<&str>)?,
             &MenuItem::with_id(app, "close-pins", "关闭全部贴图", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "reload", "重新载入配置", true, None::<&str>)?,
@@ -56,6 +57,10 @@ fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
                 tracing::warn!("could not start a capture: {e}");
             }
         }
+        "pin-clipboard" => match crate::snip::pin_clipboard(app) {
+            Ok(size) => tracing::info!("贴图 {size}"),
+            Err(e) => tracing::warn!("{e}"),
+        },
         "close-pins" => crate::snip::close_pins(),
         "reload" => reload(app),
         "quit" => crate::shutdown(app),

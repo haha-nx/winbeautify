@@ -185,9 +185,22 @@ fn read_files() -> Option<(String, Vec<String>)> {
     Some((joined, paths))
 }
 
-fn read_image(max_bytes: u32) -> Option<(Vec<u8>, i32, i32, i64)> {
+/// The raw `CF_DIB` payload, exactly as Windows hands it over.
+///
+/// The clipboard owns the memory, so it is copied out. Used by the snipper: it
+/// wants the pixels, not a file.
+pub fn clipboard_dib() -> Option<Vec<u8>> {
+    let _guard = ClipboardGuard::open(HWND::default())?;
+    read_dib()
+}
+
+fn read_dib() -> Option<Vec<u8>> {
     let handle = unsafe { GetClipboardData(CF_DIB.0 as u32) }.ok()?;
-    let dib_bytes = unsafe { with_global(handle, |bytes| bytes.to_vec()) }?;
+    unsafe { with_global(handle, |bytes| bytes.to_vec()) }
+}
+
+fn read_image(max_bytes: u32) -> Option<(Vec<u8>, i32, i32, i64)> {
+    let dib_bytes = read_dib()?;
     if max_bytes > 0 && dib_bytes.len() as u64 > max_bytes as u64 {
         tracing::debug!(
             bytes = dib_bytes.len(),

@@ -248,6 +248,9 @@ pub struct ClipboardConfig {
     /// Global hotkey that opens the flyout on the Clipboard tab, e.g.
     /// `"Ctrl+Alt+V"`. Empty disables it.
     pub hotkey: String,
+    /// Global hotkey that pins the clipboard's image to the desktop. Matches
+    /// Snipaste's F3. Empty disables it.
+    pub pin_hotkey: String,
     /// Include text copied by password managers etc. Off by default because
     /// Windows marks such clips with a "do not record" format.
     pub capture_sensitive: bool,
@@ -261,6 +264,7 @@ impl Default for ClipboardConfig {
             capture_images: true,
             max_image_bytes: 8 * 1024 * 1024,
             hotkey: "Ctrl+Alt+V".to_string(),
+            pin_hotkey: "F3".to_string(),
             capture_sensitive: false,
         }
     }
@@ -463,7 +467,8 @@ impl Default for SnipConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            hotkey: "Ctrl+Alt+A".to_string(),
+            // Snipaste's default, and what the owner asked for.
+            hotkey: "F1".to_string(),
             copy_to_clipboard: true,
             auto_pin: false,
             dim: 0.45,

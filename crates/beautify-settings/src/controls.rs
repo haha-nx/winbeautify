@@ -111,7 +111,7 @@ pub fn parts(field: &Field, control: Rect, metrics: &Metrics) -> Parts {
                 .boxes
                 .push(Rect::new(track.right, control.top, control.right, control.bottom));
         }
-        Kind::Select(_) | Kind::Number { .. } | Kind::Text { .. } => {
+        Kind::Select(_) | Kind::Number { .. } | Kind::Text { .. } | Kind::Hotkey => {
             parts.boxes.push(boxed(metrics.control_height()));
         }
         Kind::Color => {

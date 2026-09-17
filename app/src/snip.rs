@@ -39,6 +39,35 @@ pub fn close_pins() {
     beautify_snip::close_all_pins();
 }
 
+/// Pin whatever image the clipboard holds — Snipaste's F3.
+///
+/// Returns the size, for the log and the settings page's "last action" line.
+pub fn pin_clipboard(app: &AppHandle) -> Result<String, String> {
+    let state = app.state::<Arc<AppState>>();
+    if !state.config.get().snip.enabled {
+        return Err("截图功能已在设置中关闭".into());
+    }
+    let dib = beautify_clipboard::capture::clipboard_dib()
+        .ok_or_else(|| "剪贴板里没有图片".to_string())?;
+    let shot = beautify_snip::Shot::from_dib(&dib)
+        .ok_or_else(|| "剪贴板里的图片格式不支持".to_string())?;
+    let size = format!("{}×{}", shot.width, shot.height);
+
+    // Pinning the same image twice would stack identical windows, and the
+    // clipboard list's button is a toggle — so a second press takes it away.
+    let fingerprint = shot.fingerprint();
+    if beautify_snip::is_pinned(fingerprint) {
+        beautify_snip::close_pinned_image(fingerprint);
+        *state.last_action.write() = format!("已取消贴图 {size}");
+        return Ok(size);
+    }
+    if !beautify_snip::pin(shot, None) {
+        return Err("无法创建贴图窗口".into());
+    }
+    *state.last_action.write() = format!("贴图 {size}");
+    Ok(size)
+}
+
 /// Called from the capture thread once a capture has finished.
 struct SnipHost {
     app: AppHandle,

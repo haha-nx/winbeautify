@@ -25,8 +25,11 @@ use std::sync::Arc;
 use beautify_core::geometry::Color;
 use windows::Win32::Foundation::HWND;
 
-pub use capture::{grab, virtual_screen, virtual_screen_rect, Shot};
-pub use pin::close_all as close_all_pins;
+pub use capture::{grab, monitor_rect_at, virtual_screen, virtual_screen_rect, Shot};
+pub use pin::{
+    close_all as close_all_pins, close_fingerprint as close_pinned_image, is_pinned,
+    on_change as on_pins_changed, pinned as pinned_images,
+};
 
 /// How a capture should behave.
 #[derive(Debug, Clone, Copy, PartialEq)]

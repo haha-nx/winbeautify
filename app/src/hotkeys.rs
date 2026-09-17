@@ -5,6 +5,7 @@
 //! loop is enough — no hidden window, no subclassing. That also keeps hotkey
 //! handling completely independent of whichever window happens to have focus.
 
+use beautify_core::hotkey::{Binding, Modifier, Modifiers};
 use tauri::{AppHandle, Manager};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -27,6 +28,8 @@ pub enum HotkeyAction {
     OpenClipboard,
     OpenTodo,
     Snip,
+    /// Pin whatever image the clipboard holds to the desktop — Snipaste's F3.
+    PinClipboard,
 }
 
 impl HotkeyAction {
@@ -35,6 +38,7 @@ impl HotkeyAction {
             HotkeyAction::OpenClipboard => 1,
             HotkeyAction::OpenTodo => 2,
             HotkeyAction::Snip => 3,
+            HotkeyAction::PinClipboard => 4,
         }
     }
 
@@ -43,109 +47,30 @@ impl HotkeyAction {
             1 => Some(HotkeyAction::OpenClipboard),
             2 => Some(HotkeyAction::OpenTodo),
             3 => Some(HotkeyAction::Snip),
+            4 => Some(HotkeyAction::PinClipboard),
             _ => None,
         }
     }
 }
 
-/// A parsed `"Ctrl+Alt+V"` style binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Binding {
-    pub modifiers: u32,
-    pub virtual_key: u32,
-}
-
-impl Binding {
-    pub const fn new(modifiers: u32, virtual_key: u32) -> Self {
-        Self {
-            modifiers,
-            virtual_key,
-        }
-    }
-}
-
-/// Parse a human-written accelerator.
+/// `RegisterHotKey`'s modifier flags for a binding.
 ///
-/// Accepts `Ctrl`/`Control`, `Alt`, `Shift`, `Win`/`Super`/`Meta` in any order
-/// and case, then exactly one key. Returns `None` for anything else, including
-/// bindings with no modifier — a bare letter would shadow typing everywhere.
-pub fn parse(spec: &str) -> Option<Binding> {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return None;
-    }
-
-    let mut modifiers = 0u32;
-    let mut key: Option<u32> = None;
-
-    for part in spec.split('+').map(str::trim).filter(|p| !p.is_empty()) {
-        match part.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => modifiers |= MOD_CONTROL.0,
-            "alt" => modifiers |= MOD_ALT.0,
-            "shift" => modifiers |= MOD_SHIFT.0,
-            "win" | "super" | "meta" | "cmd" => modifiers |= MOD_WIN.0,
-            other => {
-                if key.is_some() {
-                    return None; // more than one non-modifier
-                }
-                key = Some(parse_key(other)?);
-            }
+/// The spec itself is parsed by [`beautify_core::hotkey`], which the settings
+/// window also uses to *write* one; a second parser here is how a binding ends up
+/// displayed as one thing and registered as another.
+fn win_modifiers(modifiers: Modifiers) -> HOT_KEY_MODIFIERS {
+    let mut flags = MOD_NOREPEAT.0;
+    for (modifier, flag) in [
+        (Modifier::Control, MOD_CONTROL.0),
+        (Modifier::Alt, MOD_ALT.0),
+        (Modifier::Shift, MOD_SHIFT.0),
+        (Modifier::Win, MOD_WIN.0),
+    ] {
+        if modifiers.contains(modifier) {
+            flags |= flag;
         }
     }
-
-    let virtual_key = key?;
-    if modifiers == 0 {
-        return None;
-    }
-    Some(Binding::new(modifiers, virtual_key))
-}
-
-fn parse_key(token: &str) -> Option<u32> {
-    // Single character: letters and digits map straight onto their VK code.
-    let mut chars = token.chars();
-    if let (Some(c), None) = (chars.next(), chars.next()) {
-        if c.is_ascii_alphabetic() {
-            return Some(c.to_ascii_uppercase() as u32);
-        }
-        if c.is_ascii_digit() {
-            return Some(c as u32);
-        }
-    }
-    if let Some(rest) = token.strip_prefix('f') {
-        if let Ok(n) = rest.parse::<u32>() {
-            if (1..=24).contains(&n) {
-                return Some(0x70 + n - 1); // VK_F1
-            }
-        }
-    }
-    match token {
-        "space" => Some(0x20),
-        "tab" => Some(0x09),
-        "enter" | "return" => Some(0x0D),
-        "backspace" => Some(0x08),
-        "delete" | "del" => Some(0x2E),
-        "insert" | "ins" => Some(0x2D),
-        "home" => Some(0x24),
-        "end" => Some(0x23),
-        "pageup" => Some(0x21),
-        "pagedown" => Some(0x22),
-        "up" => Some(0x26),
-        "down" => Some(0x28),
-        "left" => Some(0x25),
-        "right" => Some(0x27),
-        "`" | "backquote" => Some(0xC0),
-        "-" => Some(0xBD),
-        "=" => Some(0xBB),
-        "[" => Some(0xDB),
-        "]" => Some(0xDD),
-        "\\" => Some(0xDC),
-        ";" => Some(0xBA),
-        "'" => Some(0xDE),
-        "," => Some(0xBC),
-        "." => Some(0xBE),
-        "/" => Some(0xBF),
-        _ => None,
-    }
+    HOT_KEY_MODIFIERS(flags)
 }
 
 /// Owns the hotkey thread. Dropping it unregisters everything.
@@ -162,7 +87,7 @@ impl HotkeyRegistry {
     pub fn start(bindings: Vec<(HotkeyAction, String)>, app: AppHandle) -> Option<Self> {
         let parsed: Vec<(HotkeyAction, Binding)> = bindings
             .into_iter()
-            .filter_map(|(action, spec)| match parse(&spec) {
+            .filter_map(|(action, spec)| match beautify_core::hotkey::parse(&spec) {
                 Some(binding) => Some((action, binding)),
                 None => {
                     if !spec.trim().is_empty() {
@@ -225,8 +150,14 @@ fn run(
 
     let mut registered = Vec::new();
     for (action, binding) in &bindings {
-        let modifiers = HOT_KEY_MODIFIERS(binding.modifiers | MOD_NOREPEAT.0);
-        let ok = unsafe { RegisterHotKey(None, action.id(), modifiers, binding.virtual_key) };
+        let ok = unsafe {
+            RegisterHotKey(
+                None,
+                action.id(),
+                win_modifiers(binding.modifiers),
+                binding.virtual_key,
+            )
+        };
         if ok.is_ok() {
             registered.push(action.id());
             tracing::info!(
@@ -276,18 +207,25 @@ fn run(
 }
 
 fn dispatch(app: &AppHandle, action: HotkeyAction) {
-    // A capture is not a flyout: it takes the screen over until it is done, and
-    // reports back through its own host.
+    // Neither of these is a flyout: one takes the screen over, the other puts a
+    // window on the desktop.
     if action == HotkeyAction::Snip {
         if let Err(e) = crate::snip::start(app) {
             tracing::warn!("could not start a capture: {e}");
         }
         return;
     }
+    if action == HotkeyAction::PinClipboard {
+        match crate::snip::pin_clipboard(app) {
+            Ok(size) => tracing::info!("贴图 {size}"),
+            Err(e) => tracing::warn!("could not pin the clipboard image: {e}"),
+        }
+        return;
+    }
     let tab = match action {
         HotkeyAction::OpenClipboard => beautify_core::model::FlyoutTab::Clipboard,
         HotkeyAction::OpenTodo => beautify_core::model::FlyoutTab::Todo,
-        HotkeyAction::Snip => unreachable!("handled above"),
+        HotkeyAction::Snip | HotkeyAction::PinClipboard => unreachable!("handled above"),
     };
     // Toggle: pressing the hotkey while the flyout is up should put it away.
     let visible = app
@@ -306,63 +244,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_the_documented_defaults() {
-        let binding = parse("Ctrl+Alt+V").unwrap();
-        assert_eq!(binding.modifiers, MOD_CONTROL.0 | MOD_ALT.0);
-        assert_eq!(binding.virtual_key, 'V' as u32);
-
-        let binding = parse("Ctrl+Alt+T").unwrap();
-        assert_eq!(binding.virtual_key, 'T' as u32);
-    }
-
-    #[test]
-    fn modifier_order_and_case_do_not_matter() {
-        let a = parse("alt+ctrl+v").unwrap();
-        let b = parse("CTRL + ALT + V").unwrap();
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn win_key_spellings_are_accepted() {
-        for spec in ["Win+1", "Super+1", "Meta+1", "cmd+1"] {
-            assert_eq!(parse(spec).unwrap().modifiers, MOD_WIN.0, "{spec}");
-        }
-    }
-
-    #[test]
-    fn function_and_named_keys_resolve() {
-        assert_eq!(parse("Ctrl+F5").unwrap().virtual_key, 0x74);
-        assert_eq!(parse("Ctrl+Shift+Space").unwrap().virtual_key, 0x20);
-        assert_eq!(parse("Ctrl+PageUp").unwrap().virtual_key, 0x21);
-        assert_eq!(parse("Ctrl+1").unwrap().virtual_key, '1' as u32);
-    }
-
-    #[test]
-    fn a_bare_key_is_rejected_because_it_would_shadow_typing() {
-        assert!(parse("V").is_none());
-        assert!(parse("F5").is_none());
-    }
-
-    #[test]
-    fn nonsense_is_rejected() {
-        assert!(parse("").is_none());
-        assert!(parse("   ").is_none());
-        assert!(parse("Ctrl+").is_none());
-        assert!(parse("Ctrl+Alt").is_none(), "no key");
-        assert!(parse("Ctrl+V+B").is_none(), "two keys");
-        assert!(parse("Ctrl+Banana").is_none());
-        assert!(parse("Ctrl+F99").is_none());
-    }
-
-    #[test]
     fn action_ids_round_trip() {
         for action in [
             HotkeyAction::OpenClipboard,
             HotkeyAction::OpenTodo,
             HotkeyAction::Snip,
+            HotkeyAction::PinClipboard,
         ] {
             assert_eq!(HotkeyAction::from_id(action.id()), Some(action));
         }
         assert_eq!(HotkeyAction::from_id(99), None);
+    }
+
+    #[test]
+    fn the_modifier_flags_match_the_spec() {
+        let binding = beautify_core::hotkey::parse("Ctrl+Alt+V").unwrap();
+        let flags = win_modifiers(binding.modifiers);
+        assert_eq!(flags.0 & MOD_CONTROL.0, MOD_CONTROL.0);
+        assert_eq!(flags.0 & MOD_ALT.0, MOD_ALT.0);
+        assert_eq!(flags.0 & MOD_SHIFT.0, 0);
+        // Every registration carries MOD_NOREPEAT, or holding the key down
+        // fires the action dozens of times.
+        assert_eq!(flags.0 & MOD_NOREPEAT.0, MOD_NOREPEAT.0);
+    }
+
+    #[test]
+    fn a_bare_function_key_registers_with_no_modifiers() {
+        let binding = beautify_core::hotkey::parse("F1").unwrap();
+        let flags = win_modifiers(binding.modifiers);
+        assert_eq!(flags.0 & (MOD_CONTROL.0 | MOD_ALT.0 | MOD_SHIFT.0 | MOD_WIN.0), 0);
+        assert_eq!(flags.0 & MOD_NOREPEAT.0, MOD_NOREPEAT.0);
     }
 }

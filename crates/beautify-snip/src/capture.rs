@@ -154,6 +154,98 @@ impl Shot {
         beautify_clipboard::dib::dib_to_bmp(&dib).map(|(bmp, _, _)| bmp)
     }
 
+    /// Decode a `CF_DIB` payload — what the clipboard hands over.
+    ///
+    /// Shared with the pin feature: pinning the clipboard's image means turning
+    /// that payload back into pixels, and doing it here keeps the 24-vs-32-bit
+    /// and top-down-vs-bottom-up handling in one place.
+    pub fn from_dib(dib: &[u8]) -> Option<Self> {
+        use beautify_clipboard::dib::{parse_header, pixel_offset, BITMAPFILEHEADER_SIZE};
+        let header = parse_header(dib)?;
+        if header.width <= 0 {
+            return None;
+        }
+        let width = header.width;
+        let height = header.height.unsigned_abs() as i32;
+        if height == 0 {
+            return None;
+        }
+        let top_down = header.height < 0;
+        // `pixel_offset` speaks in .bmp-file terms, where a 14-byte file header
+        // sits in front of the DIB.
+        let start = pixel_offset(&header).checked_sub(BITMAPFILEHEADER_SIZE)?;
+
+        let source_stride = match header.bit_count {
+            32 => width as usize * 4,
+            // Rows are padded to four bytes.
+            24 => (width as usize * 3 + 3) & !3,
+            _ => {
+                tracing::debug!(bits = header.bit_count, "unsupported clipboard image depth");
+                return None;
+            }
+        };
+        if start + source_stride * height as usize > dib.len() {
+            return None;
+        }
+
+        let mut bgra = vec![0u8; width as usize * height as usize * 4];
+        for row in 0..height as usize {
+            // A bottom-up bitmap stores its last row first.
+            let source_row = if top_down { row } else { height as usize - 1 - row };
+            let source = start + source_row * source_stride;
+            let destination = row * width as usize * 4;
+            match header.bit_count {
+                32 => bgra[destination..destination + width as usize * 4]
+                    .copy_from_slice(&dib[source..source + width as usize * 4]),
+                _ => {
+                    for column in 0..width as usize {
+                        let pixel = source + column * 3;
+                        let out = destination + column * 4;
+                        bgra[out] = dib[pixel];
+                        bgra[out + 1] = dib[pixel + 1];
+                        bgra[out + 2] = dib[pixel + 2];
+                        bgra[out + 3] = 0xFF;
+                    }
+                }
+            }
+        }
+
+        // A 32-bit `BI_RGB` DIB carries an alpha channel that most producers
+        // leave at zero — a screen capture does — so an all-transparent image is
+        // read as opaque rather than as nothing at all.
+        if header.bit_count == 32 && bgra.chunks_exact(4).all(|pixel| pixel[3] == 0) {
+            for pixel in bgra.chunks_exact_mut(4) {
+                pixel[3] = 0xFF;
+            }
+        }
+
+        Some(Self {
+            width,
+            height,
+            bgra,
+        })
+    }
+
+    /// A cheap content fingerprint, for matching a pinned image against a
+    /// clipboard entry without keeping the pixels around.
+    ///
+    /// FNV-1a over the size and every fourth byte: enough to tell two different
+    /// screenshots apart, and it does not have to survive an adversary.
+    pub fn fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |byte: u8| {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for byte in self.width.to_le_bytes().iter().chain(self.height.to_le_bytes().iter()) {
+            mix(*byte);
+        }
+        for byte in self.bgra.iter().step_by(4) {
+            mix(*byte);
+        }
+        hash
+    }
+
     /// Encode as a `CF_DIB` payload ready for the clipboard.
     ///
     /// Bottom-up (positive `biHeight`), unlike [`Self::to_bmp`]: `CF_DIB` is a
@@ -262,6 +354,27 @@ pub fn grab(x: i32, y: i32, width: i32, height: i32) -> Option<Shot> {
             bgra,
         })
     }
+}
+
+/// The rectangle of the monitor containing a point, in virtual-screen
+/// coordinates.
+///
+/// The hint and the magnifier are placed inside one monitor: centred across the
+/// virtual desktop they land on the seam between two screens, which is what
+/// "截图显示异常" looked like on a two-monitor desk.
+pub fn monitor_rect_at(x: i32, y: i32) -> Option<RECT> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    let monitor = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetMonitorInfoW(monitor, &mut info) }
+        .as_bool()
+        .then_some(info.rcMonitor)
 }
 
 /// The bounding box of every monitor, in virtual-screen coordinates.
@@ -397,6 +510,78 @@ mod tests {
         assert_eq!(height, -2, "negative height means top-down");
         let width = i32::from_le_bytes(bmp[14 + 4..14 + 8].try_into().unwrap());
         assert_eq!(width, 3);
+    }
+
+    #[test]
+    fn a_clipboard_dib_decodes_back_to_the_same_pixels() {
+        // The round trip the pin feature depends on: what we write to the
+        // clipboard has to come back as the image we took.
+        let mut source = shot(3, 2, 0);
+        source.bgra[0..4].copy_from_slice(&[0x11, 0x22, 0x33, 0xFF]);
+        source.bgra[4..8].copy_from_slice(&[0x44, 0x55, 0x66, 0xFF]);
+        let back = Shot::from_dib(&source.to_dib()).expect("a decodable DIB");
+        assert_eq!((back.width, back.height), (3, 2));
+        assert_eq!(&back.bgra[0..4], &[0x11, 0x22, 0x33, 0xFF]);
+        assert_eq!(&back.bgra[4..8], &[0x44, 0x55, 0x66, 0xFF]);
+    }
+
+    #[test]
+    fn a_24_bit_dib_is_widened_to_bgra() {
+        // Clipboard images from older applications are often 24-bit, with rows
+        // padded to four bytes.
+        let mut dib = Vec::new();
+        let header = BITMAPINFOHEADER {
+            biSize: 40,
+            biWidth: 2,
+            biHeight: 1,
+            biPlanes: 1,
+            biBitCount: 24,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        dib.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(
+                &header as *const BITMAPINFOHEADER as *const u8,
+                std::mem::size_of::<BITMAPINFOHEADER>(),
+            )
+        });
+        // BGR plus two bytes of row padding.
+        dib.extend_from_slice(&[1, 2, 3, 4, 5, 6, 0, 0]);
+
+        let decoded = Shot::from_dib(&dib).expect("a decodable DIB");
+        assert_eq!((decoded.width, decoded.height), (2, 1));
+        assert_eq!(&decoded.bgra[0..4], &[1, 2, 3, 0xFF]);
+        assert_eq!(&decoded.bgra[4..8], &[4, 5, 6, 0xFF]);
+    }
+
+    #[test]
+    fn a_transparent_32_bit_dib_is_read_as_opaque() {
+        // Screen captures arrive with alpha = 0 throughout; taken literally the
+        // image would be invisible.
+        let source = shot(2, 2, 0x40);
+        let mut dib = source.to_dib();
+        // Zero the alpha byte of every pixel.
+        for pixel in dib[40..].chunks_exact_mut(4) {
+            pixel[3] = 0;
+        }
+        let decoded = Shot::from_dib(&dib).expect("a decodable DIB");
+        assert!(decoded.bgra.chunks_exact(4).all(|pixel| pixel[3] == 0xFF));
+    }
+
+    #[test]
+    fn rubbish_is_refused_rather_than_guessed_at() {
+        assert!(Shot::from_dib(&[]).is_none());
+        assert!(Shot::from_dib(&[0u8; 40]).is_none(), "a zeroed header");
+    }
+
+    #[test]
+    fn the_fingerprint_separates_different_images() {
+        let a = shot(4, 4, 0x10);
+        let b = shot(4, 4, 0x11);
+        let c = shot(5, 4, 0x10);
+        assert_eq!(a.fingerprint(), shot(4, 4, 0x10).fingerprint());
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert_ne!(a.fingerprint(), c.fingerprint());
     }
 
     #[test]

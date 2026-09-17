@@ -48,8 +48,8 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL,
-    VK_ESCAPE, VK_SHIFT,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK,
+    VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
@@ -72,6 +72,7 @@ use crate::layout::{self, Layout, Metrics};
 use crate::paint::{self, Interaction, Painter, StatusText, WindowButton};
 use crate::palette::Palette;
 use crate::schema::{ActionId, Kind, Section, SECTIONS};
+use beautify_core::hotkey::Modifiers;
 
 /// Posted to make the window repaint and re-read the config.
 pub const WM_APP_REFRESH: u32 = WM_APP + 81;
@@ -392,7 +393,23 @@ impl Window {
             self.interaction.hover_row,
             self.interaction.hover_part,
             self.interaction.hover_nav,
+            self.interaction.hover_window,
         );
+
+        // The title-bar buttons are above the page and belong to no row, so
+        // they are checked first and independently.
+        let window_button = if inside {
+            self.layout.as_ref().and_then(|layout| {
+                paint::window_buttons(layout, &self.metrics)
+                    .into_iter()
+                    .find(|button| button.rect.contains(x, y))
+                    .map(|button| button.kind)
+            })
+        } else {
+            None
+        };
+        self.interaction.hover_window = window_button;
+        let inside = inside && window_button.is_none();
 
         let (row, part, nav) = if inside {
             let row = self.row_at(x, y);
@@ -438,6 +455,7 @@ impl Window {
                 self.interaction.hover_row,
                 self.interaction.hover_part,
                 self.interaction.hover_nav,
+                self.interaction.hover_window,
             )
     }
 
@@ -534,6 +552,7 @@ impl Window {
             }
             Hit::Nothing => {
                 // A click on empty space commits any edit in progress.
+                self.stop_recording();
                 self.commit_edit();
             }
             Hit::Row(row_index) => self.click_row(row_index, x, y),
@@ -552,6 +571,7 @@ impl Window {
         };
         let parts = controls::parts(field, control, &self.metrics);
         let Some(part) = parts.part_at(x, y) else {
+            self.stop_recording();
             self.commit_edit();
             return;
         };
@@ -579,6 +599,7 @@ impl Window {
                 self.interaction.dropdown_highlight = 0;
                 self.repaint();
             }
+            (Kind::Hotkey, _) => self.begin_recording(row_index),
             // Every editable box puts the caret in the text, so the value can be
             // corrected by hand as well as dragged.
             (Kind::Color, _) | (Kind::Number { .. }, _) | (Kind::Text { .. }, _) => {
@@ -621,6 +642,7 @@ impl Window {
         if self.active.id == section.id {
             return;
         }
+        self.stop_recording();
         self.commit_edit();
         self.active = section;
         self.scroll = 0.0;
@@ -669,6 +691,70 @@ impl Window {
         self.interaction.focused_row = Some(row_index);
         self.interaction.editing = current;
         self.repaint();
+    }
+
+    /// Arm a hotkey field: the next combination pressed goes into it.
+    fn begin_recording(&mut self, row_index: usize) {
+        self.commit_edit();
+        self.interaction.recording = Some(row_index);
+        self.interaction.recording_text = "请按下组合键…".to_string();
+        self.repaint();
+    }
+
+    /// Stop recording, leaving the stored binding as it was.
+    fn stop_recording(&mut self) {
+        if self.interaction.recording.take().is_some() {
+            self.interaction.recording_text.clear();
+        }
+    }
+
+    /// Handle a key press while a hotkey field is armed.
+    ///
+    /// The modifiers come from the keyboard state, not from the message:
+    /// `WM_KEYDOWN` reports the key that changed, not the ones already held, and
+    /// a combination is built from both.
+    fn record_key(&mut self, key: u32) {
+        use beautify_core::hotkey::{is_modifier_key, Binding, Modifier};
+
+        let held = |virtual_key: i32| unsafe { GetKeyState(virtual_key) } < 0;
+        let modifiers = Modifiers::NONE
+            .with(Modifier::Control, held(VK_CONTROL.0 as i32))
+            .with(Modifier::Alt, held(VK_MENU.0 as i32))
+            .with(Modifier::Shift, held(VK_SHIFT.0 as i32))
+            .with(Modifier::Win, held(VK_LWIN.0 as i32) || held(VK_RWIN.0 as i32));
+
+        let Some(row_index) = self.interaction.recording else {
+            return;
+        };
+
+        // A modifier on its own begins a combination; it is not one.
+        if is_modifier_key(key) {
+            self.interaction.recording_text = modifiers.prefix();
+            self.repaint();
+            return;
+        }
+        if key == VK_ESCAPE.0 as u32 {
+            self.stop_recording();
+            self.repaint();
+            return;
+        }
+        if key == VK_BACK.0 as u32 || key == VK_DELETE.0 as u32 {
+            // Clearing is how a hotkey is unregistered, so it must be reachable
+            // without editing text.
+            self.stop_recording();
+            self.write_value(row_index, Value::Text(String::new()));
+            return;
+        }
+
+        let binding = Binding::new(modifiers, key);
+        if !binding.is_usable() {
+            // A bare letter or digit would swallow that key everywhere.
+            self.interaction.recording_text = "需要 Ctrl / Alt / Shift / Win".to_string();
+            self.repaint();
+            return;
+        }
+        self.stop_recording();
+        self.write_value(row_index, Value::Text(binding.to_string()));
     }
 
     /// Write an edit back, if one is in progress.
@@ -737,6 +823,12 @@ impl Window {
 
     /// A key press.
     fn key(&mut self, key: u32, shift: bool, control: bool) {
+        // A recorder consumes everything while it is armed: Escape there means
+        // "stop recording", not "close the window".
+        if self.interaction.recording.is_some() {
+            self.record_key(key);
+            return;
+        }
         // A dropdown consumes the keyboard while it is open.
         if let Some(row_index) = self.interaction.open_dropdown {
             let count = self
@@ -925,7 +1017,8 @@ impl Window {
                 // arrows Windows draws for them.
                 if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
                     let clickable = self.interaction.hover_part.is_some()
-                        || self.interaction.hover_nav.is_some();
+                        || self.interaction.hover_nav.is_some()
+                        || self.interaction.hover_window.is_some();
                     set_cursor(clickable);
                     return Some(LRESULT(1));
                 }

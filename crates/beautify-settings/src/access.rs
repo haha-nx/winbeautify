@@ -181,7 +181,7 @@ mod tests {
                     matches!(value, Value::Bool(_) | Value::Integer(_))
                 }
                 Kind::Slider(_) => matches!(value, Value::Float(_) | Value::Integer(_)),
-                Kind::Select(_) | Kind::Color | Kind::Text { .. } => {
+                Kind::Select(_) | Kind::Color | Kind::Text { .. } | Kind::Hotkey => {
                     matches!(value, Value::Text(_))
                 }
                 Kind::Status(_) | Kind::Info(_) | Kind::Action(_) => false,
@@ -232,7 +232,7 @@ mod tests {
                     );
                     assert_eq!(read(&config, path).unwrap().as_text().unwrap(), "#123456");
                 }
-                Kind::Text { .. } => {
+                Kind::Text { .. } | Kind::Hotkey => {
                     assert!(
                         write(&mut config, path, Value::Text("Ctrl+Alt+Q".into())),
                         "{path} refused"

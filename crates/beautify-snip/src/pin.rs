@@ -27,10 +27,10 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
-    DeleteObject, EndPaint, FrameRect, SelectObject, SetStretchBltMode, StretchDIBits, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, COLORONCOLOR, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT,
-    SRCCOPY,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush,
+    DeleteDC, DeleteObject, EndPaint, FillRect, FrameRect, InvalidateRect, LineTo, MoveToEx,
+    SelectObject, SetStretchBltMode, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    COLORONCOLOR, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, PS_SOLID, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -39,45 +39,136 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    CS_DBLCLKS, GWLP_USERDATA, IDC_ARROW, IDC_SIZEALL, MSG, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, CS_DBLCLKS, GWLP_USERDATA, IDC_ARROW, IDC_HAND, IDC_SIZEALL, MSG,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 use crate::capture::Shot;
 
 const WINDOW_CLASS: PCWSTR = w!("WinBeautify.SnipPin");
 
+/// The close button in the corner of a pin, in pixels.
+///
+/// A pin is a window a user has to be able to get rid of without knowing that
+/// Escape works, and without a click that also happens to start a drag.
+const CLOSE_SIZE: i32 = 22;
+/// How far the close button sits from the corner.
+const CLOSE_INSET: i32 = 4;
+
 /// Smallest and largest zoom, as a multiple of the original pixels.
 const MIN_SCALE: f32 = 0.1;
 const MAX_SCALE: f32 = 8.0;
 /// One wheel notch multiplies the zoom by this.
 const ZOOM_STEP: f32 = 1.1;
-/// The live pins, so the whole set can be dismissed at shutdown.
-///
-/// Handles rather than window objects: each pin lives on its own thread, and all
-/// this registry does is post a close message to each.
-fn registry() -> &'static Mutex<Vec<isize>> {
-    static PINS: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
-    PINS.get_or_init(|| Mutex::new(Vec::new()))
+/// One image currently shown as a pin.
+#[derive(Debug, Clone, Copy)]
+struct Live {
+    /// Content fingerprint of the image, so a list of clipboard entries can tell
+    /// which of them is already on screen.
+    fingerprint: u64,
+    /// The window handle, as a plain integer: each pin lives on its own thread
+    /// and all this registry does is post a message to it.
+    hwnd: isize,
 }
 
-fn lock_registry() -> std::sync::MutexGuard<'static, Vec<isize>> {
-    registry().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// The live pins, and whoever wants to hear about them changing.
+///
+/// The listener is how the clipboard list knows to re-draw its pin buttons: the
+/// pins live in this crate, the list lives in another, and neither should have to
+/// poll the other.
+#[derive(Default)]
+struct Registry {
+    live: Vec<Live>,
+    listener: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+fn registry() -> &'static Mutex<Registry> {
+    static PINS: OnceLock<Mutex<Registry>> = OnceLock::new();
+    PINS.get_or_init(|| Mutex::new(Registry::default()))
+}
+
+fn lock_registry() -> std::sync::MutexGuard<'static, Registry> {
+    registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Tell `f` whenever the set of pinned images changes.
+///
+/// One listener at a time, and the newest wins: there is a single clipboard
+/// list, and a stale listener would be a leak.
+pub fn on_change(f: impl Fn() + Send + Sync + 'static) {
+    lock_registry().listener = Some(std::sync::Arc::new(f));
+}
+
+/// Called with the lock released, so a listener that asks about the pin set
+/// cannot deadlock against the update that triggered it.
+fn announce() {
+    let listener = lock_registry().listener.clone();
+    if let Some(listener) = listener {
+        listener();
+    }
+}
+
+/// Fingerprints of every image on screen right now.
+pub fn pinned() -> Vec<u64> {
+    lock_registry()
+        .live
+        .iter()
+        .map(|pin| pin.fingerprint)
+        .collect()
+}
+
+/// Is an image with this fingerprint already pinned?
+pub fn is_pinned(fingerprint: u64) -> bool {
+    lock_registry()
+        .live
+        .iter()
+        .any(|pin| pin.fingerprint == fingerprint)
+}
+
+/// Dismiss the pin showing this image, if there is one.
+pub fn close_fingerprint(fingerprint: u64) -> bool {
+    let handle = {
+        let mut registry = lock_registry();
+        match registry.live.iter().position(|pin| pin.fingerprint == fingerprint) {
+            Some(index) => registry.live.remove(index).hwnd,
+            None => return false,
+        }
+    };
+    unsafe {
+        let _ = PostMessageW(
+            Some(HWND(handle as *mut core::ffi::c_void)),
+            WM_CLOSE,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+    announce();
+    true
 }
 
 /// Close every pinned image. Safe to call when there are none.
 pub fn close_all() {
-    let handles: Vec<isize> = std::mem::take(&mut lock_registry());
+    let handles: Vec<isize> = {
+        let mut registry = lock_registry();
+        std::mem::take(&mut registry.live)
+            .into_iter()
+            .map(|pin| pin.hwnd)
+            .collect()
+    };
     for raw in handles {
         let hwnd = HWND(raw as *mut core::ffi::c_void);
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
+    announce();
     tracing::debug!("all pinned images dismissed");
 }
 
@@ -98,6 +189,7 @@ pub fn pin(shot: Shot, at: Option<(i32, i32)>) -> bool {
 
 /// One pin's whole lifetime: create, pump, destroy.
 fn run(shot: Shot, at: Option<(i32, i32)>) -> Result<(), String> {
+    let fingerprint = shot.fingerprint();
     let instance = unsafe { GetModuleHandleW(None) }.map_err(|e| e.to_string())?;
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -137,12 +229,17 @@ fn run(shot: Shot, at: Option<(i32, i32)>) -> Result<(), String> {
         frame: None,
         frame_size: (0, 0),
         dragging: None,
+        hover_close: false,
     }));
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize);
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
-    lock_registry().push(hwnd.0 as isize);
+    lock_registry().live.push(Live {
+        fingerprint,
+        hwnd: hwnd.0 as isize,
+    });
+    announce();
 
     let mut message = MSG::default();
     loop {
@@ -158,7 +255,11 @@ fn run(shot: Shot, at: Option<(i32, i32)>) -> Result<(), String> {
 
     // The window is gone; reclaim the pin and its backing store.
     drop(unsafe { Box::from_raw(raw) });
-    lock_registry().retain(|entry| *entry != hwnd.0 as isize);
+    {
+        let mut registry = lock_registry();
+        registry.live.retain(|pin| pin.hwnd != hwnd.0 as isize);
+    }
+    announce();
     Ok(())
 }
 
@@ -183,6 +284,8 @@ struct Pin {
     frame_size: (i32, i32),
     /// Where inside the window the drag started, in client coordinates.
     dragging: Option<(i32, i32)>,
+    /// Is the pointer over the close button? Drives its colour.
+    hover_close: bool,
 }
 
 impl Pin {
@@ -254,6 +357,23 @@ impl Pin {
             // A size change makes Windows invalidate the window, so the new
             // frame is drawn without asking.
             let _ = SetWindowPos(self.hwnd, None, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    /// The close button, in client coordinates.
+    fn close_button(&self) -> RECT {
+        let (width, height) = self.frame_size;
+        let size = CLOSE_SIZE.min(width).min(height);
+        // The button has to stay inside the picture: a pin a few pixels across
+        // would otherwise put its only control outside itself.
+        let inset = CLOSE_INSET
+            .min((width - size).max(0))
+            .min((height - size).max(0));
+        RECT {
+            left: width - size - inset,
+            top: inset,
+            right: width - inset,
+            bottom: inset + size,
         }
     }
 
@@ -346,6 +466,8 @@ fn paint(pin: &mut Pin, paint_struct: &PAINTSTRUCT) {
         FrameRect(memory, &bounds, brush);
         let _ = DeleteObject(brush.into());
 
+        draw_close_button(pin, memory);
+
         let target = paint_struct.rcPaint;
         let _ = BitBlt(
             paint_struct.hdc,
@@ -367,6 +489,47 @@ fn paint(pin: &mut Pin, paint_struct: &PAINTSTRUCT) {
 ///
 /// As in the overlay: `WM_DESTROY` must not be answered through this borrow,
 /// because `DestroyWindow` delivers it synchronously from inside a handler.
+/// Is a point inside a rectangle?
+fn inside(rect: RECT, x: i32, y: i32) -> bool {
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
+/// The little ✕ in the corner.
+///
+/// Drawn as two strokes rather than as a glyph so it needs no icon font and
+/// stays crisp: it is the one control a pinned image has.
+fn draw_close_button(pin: &Pin, dc: HDC) {
+    let button = pin.close_button();
+    if button.right <= button.left || button.bottom <= button.top {
+        return;
+    }
+    // A wash behind it, so it reads against whatever the image happens to be.
+    let wash = unsafe {
+        CreateSolidBrush(COLORREF(if pin.hover_close {
+            0x0030_3030
+        } else {
+            0x0018_1818
+        }))
+    };
+    unsafe {
+        FillRect(dc, &button, wash);
+        let _ = DeleteObject(wash.into());
+    }
+
+    let ink = COLORREF(if pin.hover_close { 0x0060_8080FF } else { 0x00D0_D0D0 });
+    let pen = unsafe { CreatePen(PS_SOLID, 2, ink) };
+    let previous = unsafe { SelectObject(dc, pen.into()) };
+    let inset = 6;
+    unsafe {
+        let _ = MoveToEx(dc, button.left + inset, button.top + inset, None);
+        let _ = LineTo(dc, button.right - inset, button.bottom - inset);
+        let _ = MoveToEx(dc, button.right - inset, button.top + inset, None);
+        let _ = LineTo(dc, button.left + inset, button.bottom - inset);
+        SelectObject(dc, previous);
+        let _ = DeleteObject(pen.into());
+    }
+}
+
 fn with_pin<R>(hwnd: HWND, f: impl FnOnce(&mut Pin) -> R) -> Option<R> {
     let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Pin;
     if raw.is_null() {
@@ -394,13 +557,33 @@ unsafe extern "system" fn window_proc(
             // deliberate click target, so activating it is what the user means.
             let _ = unsafe { SetFocus(Some(hwnd)) };
             let (x, y) = point_of(lparam);
-            with_pin(hwnd, |pin| pin.dragging = Some((x, y)));
-            unsafe { SetCapture(hwnd) };
+            let closed = with_pin(hwnd, |pin| {
+                if inside(pin.close_button(), x, y) {
+                    pin.close();
+                    true
+                } else {
+                    pin.dragging = Some((x, y));
+                    false
+                }
+            })
+            .unwrap_or(false);
+            if !closed {
+                unsafe { SetCapture(hwnd) };
+            }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
             let (x, y) = point_of(lparam);
             with_pin(hwnd, |pin| {
+                // Light the close button up as the pointer reaches it, which is
+                // the only thing that makes an ✕ in a corner discoverable.
+                let over_close = inside(pin.close_button(), x, y);
+                if over_close != pin.hover_close {
+                    pin.hover_close = over_close;
+                    unsafe {
+                        let _ = InvalidateRect(Some(pin.hwnd), None, false);
+                    }
+                }
                 let Some((grab_x, grab_y)) = pin.dragging else {
                     return;
                 };
@@ -454,9 +637,18 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_SETCURSOR => {
-            let dragging = with_pin(hwnd, |pin| pin.dragging.is_some()).unwrap_or(false);
+            let (dragging, over_close) = with_pin(hwnd, |pin| {
+                (pin.dragging.is_some(), pin.hover_close)
+            })
+            .unwrap_or((false, false));
             unsafe {
-                let id = if dragging { IDC_SIZEALL } else { IDC_ARROW };
+                let id = if over_close {
+                    IDC_HAND
+                } else if dragging {
+                    IDC_SIZEALL
+                } else {
+                    IDC_ARROW
+                };
                 if let Ok(cursor) = LoadCursorW(None, id) {
                     SetCursor(Some(cursor));
                 }
@@ -508,6 +700,7 @@ mod tests {
             frame: None,
             frame_size: (0, 0),
             dragging: None,
+            hover_close: false,
         }
     }
 
@@ -521,6 +714,9 @@ mod tests {
     #[test]
     fn dismissing_with_no_pins_is_harmless() {
         close_all();
+        assert!(pinned().is_empty());
+        assert!(!close_fingerprint(1234));
+        assert!(!is_pinned(1234));
     }
 
     #[test]
@@ -531,6 +727,19 @@ mod tests {
         // A tiny zoom on a tiny capture must still leave a window to draw in.
         let smallest = pin_with(MIN_SCALE, 4, 4).wanted_size();
         assert!(smallest.0 >= 1 && smallest.1 >= 1);
+    }
+
+    #[test]
+    fn the_close_button_sits_in_the_corner_and_shrinks_to_fit() {
+        let mut pin = pin_with(1.0, 400, 300);
+        pin.frame_size = (400, 300);
+        let button = pin.close_button();
+        assert!(button.right <= 400 && button.top >= 0);
+        assert!(button.right - button.left > 8, "it has to be clickable");
+        // A pin of a few pixels still gets a button that fits inside it.
+        pin.frame_size = (12, 12);
+        let tiny = pin.close_button();
+        assert!(tiny.right <= 12 && tiny.bottom <= 12);
     }
 
     #[test]

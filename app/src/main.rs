@@ -97,6 +97,7 @@ fn main() {
             commands::close_settings,
             commands::start_snip,
             commands::close_pins,
+            commands::pin_clipboard_image,
             commands::clipboard_text,
             commands::quit_app,
             commands::open_path,
