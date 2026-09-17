@@ -74,6 +74,13 @@ impl Metrics {
         self.px(8.0)
     }
 
+    /// Air above a section title. A title flush with the top edge of the content
+    /// area reads as if it had been clipped by it, and every page starts with
+    /// one.
+    pub fn section_top_gap(&self) -> f32 {
+        self.px(13.0)
+    }
+
     pub fn description_size(&self) -> f32 {
         self.px(11.5)
     }
@@ -224,6 +231,8 @@ pub struct Card {
 /// The scrollable page.
 #[derive(Debug, Clone)]
 pub struct Content {
+    /// The section's own heading, at the top of the page.
+    pub title: Rect,
     pub cards: Vec<Card>,
     /// Height of the whole page, used to size the scrollbar.
     pub height: f32,
@@ -416,11 +425,12 @@ fn layout_content(
     let label_width = (inner_width - control_width - metrics.control_gap()).max(0.0);
 
     // Lay out from the top of the page, then shift by the scroll offset, so the
-    // scroll position does not change any of the internal arithmetic.
-    let mut cursor = viewport.top;
+    // scroll position does not change any of the internal arithmetic. The page
+    // opens with air above the title, not on it.
+    let mut cursor = viewport.top + metrics.section_top_gap();
     let mut cards = Vec::new();
 
-    let title_rect = Rect::new(left, cursor, right, cursor + metrics.section_title_size());
+    let mut title_rect = Rect::new(left, cursor, right, cursor + metrics.section_title_size());
     cursor = title_rect.bottom + metrics.section_title_gap();
 
     let mut description_rect = Rect::EMPTY;
@@ -479,6 +489,7 @@ fn layout_content(
 
     // Shift everything by the scroll offset now that the page height is known.
     let shift = |rect: Rect| rect.shifted(-scroll);
+    title_rect = shift(title_rect);
     description_rect = shift(description_rect);
     for card in &mut cards {
         card.rect = shift(card.rect);
@@ -492,6 +503,7 @@ fn layout_content(
     }
 
     Content {
+        title: title_rect,
         cards,
         height,
         description: description_rect,
@@ -609,6 +621,31 @@ mod tests {
             scroll,
             &fake_measure,
         )
+    }
+
+    #[test]
+    fn every_page_opens_with_air_above_its_title() {
+        // The title used to sit exactly on the top edge of the content area,
+        // which reads as clipped rather than as a heading.
+        for section in SECTIONS {
+            let metrics = Metrics::new(96);
+            let layout = layout(
+                window(),
+                &metrics,
+                section,
+                &Config::default(),
+                0.0,
+                &fake_measure,
+            );
+            let title = layout.content.title;
+            assert!(
+                title.top >= layout.viewport.top + metrics.section_top_gap() - 0.01,
+                "{}: the title starts at {} in a viewport from {}",
+                section.id,
+                title.top,
+                layout.viewport.top
+            );
+        }
     }
 
     #[test]

@@ -237,6 +237,73 @@ pub fn build_path(
     }
 }
 
+/// The vertical extent of the ink of the probe glyph, drawn on its own.
+///
+/// `format` is the format the text will be drawn with, including its paragraph
+/// alignment, because that is what decides where the line box sits inside the box
+/// being measured. Returns `(top, bottom)` in pixels from the top of that box, or
+/// `None` when there is nothing to draw into.
+pub fn render_probe_ink(format: &IDWriteTextFormat, width: u32, height: u32) -> Option<(f32, f32)> {
+    use windows::Win32::Graphics::Direct2D::{
+        ID2D1Factory, D2D1CreateFactory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        D2D1_RENDER_TARGET_PROPERTIES,
+    };
+    use windows::Win32::Graphics::Imaging::{
+        IWICBitmap, IWICBitmapLock, WICBitmapCacheOnLoad, WICBitmapLockRead,
+        GUID_WICPixelFormat32bppPBGRA,
+    };
+
+    let factory: ID2D1Factory =
+        unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }.ok()?;
+    let wic = crate::images::create_wic_factory().ok()?;
+    let bitmap: IWICBitmap = unsafe {
+        wic.CreateBitmap(
+            width,
+            height,
+            &GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapCacheOnLoad,
+        )
+    }
+    .ok()?;
+    let properties = D2D1_RENDER_TARGET_PROPERTIES {
+        dpiX: 96.0,
+        dpiY: 96.0,
+        ..Default::default()
+    };
+    let target = unsafe { factory.CreateWicBitmapRenderTarget(&bitmap, &properties) }.ok()?;
+
+    let canvas = Canvas::new(&target).ok()?;
+    canvas.begin();
+    canvas.clear(Rgba::from_rgb(0, 0, 0));
+    // No optical offset: this is the measurement that produces it.
+    let box_rect = Rect::new(0.0, 0.0, width as f32, height as f32);
+    canvas.text(PROBE, format, box_rect, Rgba::from_rgb(255, 255, 255), 0.0);
+    canvas.end().ok()?;
+
+    let lock: IWICBitmapLock =
+        unsafe { bitmap.Lock(std::ptr::null(), WICBitmapLockRead.0 as u32) }.ok()?;
+    let stride = unsafe { lock.GetStride() }.ok()? as usize;
+    let mut pointer = std::ptr::null_mut();
+    let mut length = 0u32;
+    unsafe { lock.GetDataPointer(&mut length, &mut pointer) }.ok()?;
+    let pixels = unsafe { std::slice::from_raw_parts(pointer, length as usize) };
+
+    let (mut top, mut bottom) = (f32::MAX, f32::MIN);
+    for row in 0..height as usize {
+        for column in 0..width as usize {
+            let at = row * stride + column * 4;
+            if at + 4 <= pixels.len() && pixels[at] > 32 {
+                top = top.min(row as f32);
+                bottom = bottom.max(row as f32);
+            }
+        }
+    }
+    (top <= bottom).then_some((top, bottom))
+}
+
+/// The glyph the optical correction is measured from.
+pub const PROBE: &str = "国";
+
 /// Font selection and text measurement.
 ///
 /// Measure and draw must go through the same object, or the bar can be sized
@@ -392,23 +459,37 @@ impl TextEngine {
             .unwrap_or(0.0)
     }
 
-    /// Measure the correction for a freshly built format.
+    /// The correction for a freshly built format: draw the probe and look.
+    ///
+    /// # Why this is drawn rather than derived
+    ///
+    /// The first version computed it from the line metrics, assuming a CJK glyph
+    /// box runs from `baseline - size` to `baseline`. It does not: the
+    /// ideographic box sits about a tenth of an em *below* the baseline in the
+    /// CJK faces this machine falls back to, so every line in the app was drawn a
+    /// tenth of an em too low. At a 12.5-pixel label that is 1.5 pixels — too
+    /// small to point at, and enough that everything reads as "not quite in the
+    /// middle".
+    ///
+    /// Measuring the ink needs a render target, which is why this is the one
+    /// place the text engine touches Direct2D. The probe is one glyph on a
+    /// handful of pixels, and the answer is cached with the format, so it happens
+    /// once per size and weight.
+    ///
+    /// The probe is CJK because what is measured is a property of the font, and
+    /// the app's labels are Chinese: the ideographic box is the band they should
+    /// be centred by. Digits and capitals land within half a pixel of the same
+    /// place, and text with descenders hangs below it, which is what descenders
+    /// are for.
     fn measure_correction(&self, format: &IDWriteTextFormat, size: f32) -> f32 {
-        // Any single-line string gives the same line metrics; the font decides.
-        let probe: Vec<u16> = "国".encode_utf16().collect();
-        let Ok(layout) = (unsafe { self.factory.CreateTextLayout(&probe, format, 1000.0, 100.0) })
-        else {
+        let height = (size * 4.0).ceil().max(8.0);
+        let width = (size * 2.0).ceil().max(8.0);
+        let Some((top, bottom)) = render_probe_ink(format, width as u32, height as u32) else {
+            // No render target — a thread that never asked for COM, or no WIC:
+            // no correction beats a guessed one.
             return 0.0;
         };
-        let mut lines = [DWRITE_LINE_METRICS::default(); 1];
-        let mut count = 0u32;
-        if unsafe { layout.GetLineMetrics(Some(&mut lines), &mut count) }.is_err() || count == 0 {
-            return 0.0;
-        }
-        let line = lines[0];
-        // The ideographic em box runs from `baseline - size` to `baseline`, so
-        // its centre is `baseline - size/2`; the line box is centred on itself.
-        line.height * 0.5 - (line.baseline - size * 0.5)
+        height * 0.5 - (top + bottom) * 0.5
     }
 
     /// Natural width of `text` on a single line.
@@ -506,35 +587,162 @@ mod tests {
         assert_eq!(rounded(Rect::new(0.0, 0.0, 10.0, 10.0), -4.0).radiusX, 0.0);
     }
 
-    #[test]
-    fn the_optical_correction_is_small_and_downwards() {
-        // Measured against DirectWrite: the line box is centred correctly but
-        // CJK ink sits above it, so the correction must be a small positive
-        // number. A large or negative value means the formula is wrong.
+
+    /// Give this thread an apartment, once per test.
+    fn init_com() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            );
+        }
+    }
+
+    /// Draw one line in a box and report where the ink actually landed.
+    ///
+    /// The whole question about the optical correction is what the pixels do, so
+    /// this renders for real and reads the ink back: white glyphs on black in a
+    /// bitmap, the bounding box of everything not black, and its centre compared
+    /// with the box's centre. "国" is the honest probe — its ink is the full em
+    /// box, so its ink centre *is* the em centre, which is what the correction
+    /// claims to place in the middle.
+    fn ink_centre(text: &str, px: f32, width: u32, height: u32) -> (f32, f32, f32) {
+        use windows::Win32::Graphics::Direct2D::{
+            ID2D1Factory, D2D1CreateFactory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            D2D1_RENDER_TARGET_PROPERTIES,
+        };
+        use windows::Win32::Graphics::Imaging::{
+            IWICBitmap, IWICBitmapLock, WICBitmapCacheOnLoad, WICBitmapLockRead,
+            GUID_WICPixelFormat32bppPBGRA,
+        };
+
+        // WIC wants an apartment. `format()` now measures its correction by
+        // drawing, so every test that builds a format needs one too.
+        init_com();
+        let factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
+                .expect("Direct2D is available");
+        let wic = crate::images::create_wic_factory().expect("a WIC factory");
+        let bitmap: IWICBitmap = unsafe {
+            wic.CreateBitmap(width, height, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad)
+        }
+        .expect("a bitmap");
+        let properties = D2D1_RENDER_TARGET_PROPERTIES {
+            dpiX: 96.0,
+            dpiY: 96.0,
+            ..Default::default()
+        };
+        let target = unsafe { factory.CreateWicBitmapRenderTarget(&bitmap, &properties) }
+            .expect("a render target");
+        let canvas = Canvas::new(&target).expect("a canvas");
         let engine = TextEngine::new().expect("DirectWrite is available");
         let format = engine
-            .format(15.0, DWRITE_FONT_WEIGHT_NORMAL)
+            .format(px, DWRITE_FONT_WEIGHT_NORMAL)
             .expect("a UI font exists");
-        let correction = engine.vertical_correction(&format);
+        let offset = engine.vertical_correction(&format);
+        let rect = Rect::new(0.0, 0.0, width as f32, height as f32);
+        canvas.begin();
+        canvas.clear(Rgba::from_rgb(0, 0, 0));
+        canvas.text(text, &format, rect, Rgba::from_rgb(255, 255, 255), offset);
+        canvas.end().expect("a frame");
+
+        let lock: IWICBitmapLock =
+            unsafe { bitmap.Lock(std::ptr::null(), WICBitmapLockRead.0 as u32) }.expect("a lock");
+        let stride = unsafe { lock.GetStride() }.expect("a stride") as usize;
+        let mut pointer = std::ptr::null_mut();
+        let mut length = 0u32;
+        unsafe { lock.GetDataPointer(&mut length, &mut pointer) }.expect("pixels");
+        let pixels = unsafe { std::slice::from_raw_parts(pointer, length as usize) };
+
+        let (mut top, mut bottom) = (f32::MAX, f32::MIN);
+        for row in 0..height as usize {
+            for column in 0..width as usize {
+                let at = row * stride + column * 4;
+                if pixels[at] > 128 {
+                    top = top.min(row as f32);
+                    bottom = bottom.max(row as f32);
+                }
+            }
+        }
+        assert!(top <= bottom, "nothing was drawn");
+        (top, bottom, (top + bottom) * 0.5)
+    }
+
+    #[test]
+    fn a_cjk_glyph_is_centred_in_the_box_it_is_drawn_in() {
+        // The probe glyph's ink is the ideographic box, so its centre is what the
+        // correction is supposed to place in the middle of the box.
+        let (top, bottom, centre) = ink_centre(PROBE, 20.0, 60, 60);
         assert!(
-            (0.2..6.0).contains(&correction),
-            "correction should be a couple of pixels at most, got {correction}"
+            (centre - 30.0).abs() <= 1.0,
+            "the ink spans {top}..{bottom}, centre {centre}, box centre 30"
+        );
+    }
+
+
+    /// Every size the app draws text at, in pixels.
+    const UI_SIZES: [f32; 5] = [9.0, 10.5, 11.0, 12.5, 20.0];
+
+    #[test]
+    fn text_is_centred_at_every_size_the_app_draws_at() {
+        // The property that matters, and the one the old formula got wrong: at
+        // each size, the ink ends up in the middle of the box it was drawn in.
+        for size in UI_SIZES {
+            let (top, bottom, centre) = ink_centre(PROBE, size, 80, (size * 4.0) as u32);
+            let box_centre = (size * 4.0) as f32 * 0.5;
+            assert!(
+                (centre - box_centre).abs() <= 1.0,
+                "at {size}px the ink spans {top}..{bottom}, centre {centre}, box centre {box_centre}"
+            );
+        }
+    }
+
+    #[test]
+    fn digits_and_capitals_are_centred_too() {
+        // Numbers are half the Latin text in this app ("800 × 600", "1.8 MB"),
+        // and they have no descenders, so they are the fair test of a single
+        // correction serving both scripts.
+        for text in ["800", "AV", "1.8 MB"] {
+            let (top, bottom, centre) = ink_centre(text, 12.5, 80, 50);
+            assert!(
+                (centre - 25.0).abs() <= 1.5,
+                "{text} spans {top}..{bottom}, centre {centre}, box centre 25"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_of_text_with_a_descender_hangs_below_the_middle() {
+        // Not a defect: typography centres the ink band of the script, so a "g"
+        // reaching below the baseline is supposed to reach below the middle. This
+        // is here so that "everything looks centred" does not get "fixed" by
+        // centring each string on its own ink, which would put a row of "mmm"
+        // lower than a row of "MMM".
+        let (_, _, plain) = ink_centre("800", 20.0, 80, 80);
+        let (_, _, descender) = ink_centre("80g", 20.0, 80, 80);
+        assert!(
+            descender > plain,
+            "a descender should sit lower: {descender} vs {plain}"
         );
     }
 
     #[test]
-    fn the_correction_scales_with_the_font_size() {
+    fn the_correction_stays_small() {
+        // Sanity bound on a measured quantity: a correction that grew to a
+        // fraction of the font size would mean the measurement went wrong rather
+        // than that the font is unusual.
+        init_com();
         let engine = TextEngine::new().expect("DirectWrite is available");
-        let small = engine
-            .format(11.0, DWRITE_FONT_WEIGHT_NORMAL)
-            .expect("a UI font exists");
-        let large = engine
-            .format(30.0, DWRITE_FONT_WEIGHT_NORMAL)
-            .expect("a UI font exists");
-        assert!(
-            engine.vertical_correction(&large) > engine.vertical_correction(&small),
-            "a bigger font needs a bigger correction"
-        );
+        for size in UI_SIZES {
+            let format = engine
+                .format(size, DWRITE_FONT_WEIGHT_NORMAL)
+                .expect("a UI font exists");
+            let correction = engine.vertical_correction(&format);
+            assert!(
+                correction.abs() <= size * 0.15,
+                "at {size}px the correction is {correction}"
+            );
+        }
     }
 
     #[test]

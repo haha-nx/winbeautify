@@ -432,6 +432,20 @@ impl Painter {
             .text
             .format_aligned(metrics.hint_size(), LABEL_WEIGHT, DWRITE_TEXT_ALIGNMENT_CENTER)?;
 
+        // The section's own heading, where the layout put it — which is a little
+        // below the top of the page, not on it. This used to be recomputed here
+        // from the viewport's top edge (with a padding that cancelled itself
+        // out), so the air the layout reserved above the title was reserved and
+        // then ignored: every page's title sat flush against the top, looking
+        // clipped.
+        self.text_in(
+            canvas,
+            layout.content.title,
+            current_section_title(layout),
+            &title_format,
+            palette.text,
+        );
+
         // The section's own explanation, in the space the layout reserved for
         // it between the heading and the first card.
         if !layout.content.description.is_empty() {
@@ -447,19 +461,6 @@ impl Painter {
 
         let mut row_index = 0usize;
         for card in &layout.content.cards {
-            // Section heading sits above the first card.
-            if layout.content.cards.first().is_some_and(|first| std::ptr::eq(card, first)) {
-                let heading = Rect::new(
-                    card.rect.left,
-                    layout.viewport.top + metrics.content_padding()
-                        - metrics.content_padding(),
-                    card.rect.right,
-                    card.rect.top,
-                );
-                self.text_in(canvas, Rect::new(heading.left, heading.top, heading.right, heading.top + metrics.section_title_size()), current_section_title(layout), &title_format, palette.text);
-                let _ = heading;
-            }
-
             canvas.fill_rounded(card.rect, metrics.card_radius(), palette.card);
             canvas.stroke_rounded(card.rect, metrics.card_radius(), palette.card_border, 1.0);
 
