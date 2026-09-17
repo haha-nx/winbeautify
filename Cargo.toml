@@ -1,0 +1,60 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/beautify-core",
+    "crates/beautify-taskbar",
+    "crates/beautify-media",
+    "crates/beautify-clipboard",
+    "crates/beautify-todo",
+    "crates/beautify-snip",
+    "crates/beautify-widget",
+    "app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+authors = ["WinBeautify"]
+repository = "https://github.com/winbeautify/winbeautify"
+
+[workspace.dependencies]
+beautify-core = { path = "crates/beautify-core" }
+beautify-taskbar = { path = "crates/beautify-taskbar" }
+beautify-media = { path = "crates/beautify-media" }
+beautify-clipboard = { path = "crates/beautify-clipboard" }
+beautify-todo = { path = "crates/beautify-todo" }
+beautify-widget = { path = "crates/beautify-widget" }
+
+windows = "0.62"
+# Direct2D takes windows_numerics::Vector2 / Matrix3x2 for points and
+# transforms; the `windows` crate uses them but does not re-export them.
+windows-numerics = "0.3.1"
+tokio = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+rustfft = "6"
+rusqlite = { version = "0.37", features = ["bundled"] }
+anyhow = "1"
+
+# Release profile tuned for a long-running background daemon: small, fast, no
+# debug info; the binary is expected to idle below 1% CPU. `panic` stays on
+# unwind on purpose so a module thread that panics can be caught and restarted
+# instead of taking the whole tray process down.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

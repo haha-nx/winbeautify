@@ -1,0 +1,253 @@
+/* Widget bar
+ *
+ * The window is exactly as large as the pill, and the pill is transparent
+ * outside its rounded rectangle, so the taskbar shows through. Sizes here are
+ * physical-ish CSS pixels; the webview runs at the taskbar's DPI.
+ */
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.bar {
+  --pill-bg: rgba(20, 22, 28, 0.92);
+  --pill-fg: #e9ebf2;
+  --pill-dim: #9ba3b7;
+
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: calc(100% - 4px);
+  padding: 0 6px;
+  margin: 2px;
+  border-radius: var(--radius);
+  background: var(--pill-bg);
+  color: var(--pill-fg);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+  transition: width var(--widget-anim) cubic-bezier(0.22, 0.61, 0.36, 1);
+  will-change: width;
+}
+
+.bar[data-light="true"] {
+  --pill-bg: rgba(250, 251, 253, 0.94);
+  --pill-fg: #1b1f2a;
+  --pill-dim: #5a6376;
+}
+
+.bar[data-empty="true"] {
+  /* Nothing but the launcher: drop the pill chrome so it reads as a single
+   * floating button rather than a bar with a hole in it. */
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* ---------------------------------------------------------------- launcher */
+
+.launcher {
+  position: relative;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--pill-fg);
+  transition: background 120ms ease;
+}
+
+.launcher svg {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+.launcher:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.bar[data-light="true"] .launcher:hover {
+  background: rgba(0, 0, 0, 0.07);
+}
+
+.launcher[aria-expanded="true"] {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.badge {
+  position: absolute;
+  top: 1px;
+  right: 0;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 14px;
+  text-align: center;
+}
+
+.launcher[aria-expanded="true"] .badge {
+  background: #fff;
+  color: var(--accent);
+}
+
+/* ------------------------------------------------------- audio component */
+
+.audio {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 100%;
+  /* Width is set from script after measuring the lyric; the transition is what
+   * makes the bar grow and shrink smoothly. */
+  transition: width var(--widget-anim) cubic-bezier(0.22, 0.61, 0.36, 1);
+  will-change: width;
+  overflow: hidden;
+}
+
+.audio[hidden] {
+  display: none;
+}
+
+.cover {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: linear-gradient(140deg, var(--accent), #a56cff);
+  display: grid;
+  place-items: center;
+}
+
+.cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.cover-fallback svg {
+  width: 15px;
+  height: 15px;
+  fill: rgba(255, 255, 255, 0.92);
+}
+
+/* The lyric and the transport controls occupy the same slot; hover swaps
+ * which one is laid out, so the bar width is driven by whichever is visible. */
+.slot {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+
+.lyric,
+.controls {
+  transition: opacity 130ms ease;
+}
+
+.lyric {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--pill-fg);
+}
+
+.lyric[data-fallback="true"] {
+  color: var(--pill-dim);
+}
+
+.controls {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.audio:hover .lyric,
+.audio[data-hover="true"] .lyric {
+  opacity: 0;
+}
+
+.audio:hover .controls,
+.audio[data-hover="true"] .controls {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.controls button {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  color: var(--pill-fg);
+  transition: background 110ms ease;
+}
+
+.controls button svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+
+.controls button:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.bar[data-light="true"] .controls button:hover {
+  background: rgba(0, 0, 0, 0.07);
+}
+
+.controls button:disabled {
+  opacity: 0.3;
+  cursor: default;
+  background: none;
+}
+
+.controls button.primary {
+  width: 28px;
+  height: 28px;
+}
+
+.controls button.primary svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* -------------------------------------------------------------- spectrum */
+
+.spectrum {
+  flex: 0 0 auto;
+  display: block;
+  height: 22px;
+  opacity: 0.95;
+}
+
+.spectrum[hidden] {
+  display: none;
+}

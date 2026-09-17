@@ -1,0 +1,14 @@
+# Rust
+/target
+
+# Tauri generates these from tauri.conf.json on every build.
+/app/gen
+
+# Front end
+/ui/node_modules
+/ui/dist
+
+# Local scratch
+*.log
+
+/docs

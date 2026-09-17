@@ -1,0 +1,18 @@
+[package]
+name = "beautify-snip"
+description = "Screen capture for WinBeautify's screenshot feature."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+beautify-clipboard.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+]

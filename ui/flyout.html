@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WinBeautify</title>
+    <link rel="stylesheet" href="./src/shared/tokens.css" />
+    <link rel="stylesheet" href="./src/flyout/flyout.css" />
+  </head>
+  <body>
+    <div class="flyout">
+      <header class="tabs" role="tablist">
+        <button class="tab" id="tab-todo" role="tab" data-tab="todo" type="button">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M3 3.2h10v1.6H3zM3 7.2h10v1.6H3zM3 11.2h6.5v1.6H3z"
+              opacity=".85"
+            />
+          </svg>
+          任务清单
+          <span class="count" id="todo-count"></span>
+        </button>
+        <button class="tab" id="tab-clipboard" role="tab" data-tab="clipboard" type="button">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path
+              d="M6 1.5h4a1 1 0 0 1 1 1V3h1.2a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H3.8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1H5v-.5a1 1 0 0 1 1-1zm.6 1.6v.7h2.8v-.7z"
+            />
+          </svg>
+          剪贴板
+          <span class="count" id="clip-count"></span>
+        </button>
+        <div class="tab-actions">
+          <button class="icon-btn" id="open-settings" type="button" title="设置中心">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M8 5.2A2.8 2.8 0 1 0 8 10.8 2.8 2.8 0 0 0 8 5.2zm0 4.3a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z"
+              />
+              <path
+                d="m13.4 9.1.9.7-1 1.7-1.1-.4a4.9 4.9 0 0 1-1 .6l-.2 1.2H8.9l-.2-1.2a4.9 4.9 0 0 1-1-.6l-1.1.4-1-1.7.9-.7a4.7 4.7 0 0 1 0-1.2l-.9-.7 1-1.7 1.1.4c.3-.2.6-.4 1-.5l.2-1.2h2.1l.2 1.2c.4.1.7.3 1 .5l1.1-.4 1 1.7-.9.7c.1.4.1.8 0 1.2z"
+                opacity=".55"
+              />
+            </svg>
+          </button>
+          <button class="icon-btn" id="close-flyout" type="button" title="关闭 (Esc)">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="m4.2 3.4 8.4 8.4-1.2 1.2-8.4-8.4z" />
+              <path d="m11.4 3.4 1.2 1.2-8.4 8.4-1.2-1.2z" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- ------------------------------------------------------- todo -->
+      <section class="pane" id="pane-todo" role="tabpanel">
+        <form class="composer" id="todo-form">
+          <input
+            id="todo-input"
+            type="text"
+            placeholder="添加任务，回车确认"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <select id="todo-filter" title="筛选">
+            <option value="today">今天</option>
+            <option value="open">未完成</option>
+            <option value="all">全部</option>
+            <option value="done">已完成</option>
+          </select>
+        </form>
+
+        <ul class="list" id="todo-list"></ul>
+
+        <footer class="pane-footer">
+          <span id="todo-summary">—</span>
+          <div class="footer-actions">
+            <button class="text-btn" id="todo-export-md" type="button">复制 Markdown</button>
+            <button class="text-btn" id="todo-export-json" type="button">复制 JSON</button>
+            <button class="text-btn danger" id="todo-clear-done" type="button">
+              清除已完成
+            </button>
+          </div>
+        </footer>
+      </section>
+
+      <!-- -------------------------------------------------- clipboard -->
+      <section class="pane" id="pane-clipboard" role="tabpanel" hidden>
+        <div class="composer">
+          <input
+            id="clip-search"
+            type="search"
+            placeholder="搜索剪贴板历史"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button class="text-btn danger" id="clip-clear" type="button">清空</button>
+        </div>
+        <!-- Filled in from CLIP_FILTERS so the list has one definition. -->
+        <div class="chips" id="clip-filters" role="tablist" aria-label="剪贴板分类"></div>
+
+        <ul class="list" id="clip-list"></ul>
+
+        <footer class="pane-footer">
+          <span id="clip-summary">—</span>
+          <div class="footer-actions">
+            <button class="text-btn" id="clip-clear-pinned" type="button">
+              清空（含收藏）
+            </button>
+          </div>
+        </footer>
+      </section>
+
+      <div class="toast" id="toast" hidden></div>
+    </div>
+
+    <script type="module" src="./src/flyout/main.ts"></script>
+  </body>
+</html>

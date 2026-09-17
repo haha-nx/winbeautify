@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the WinBeautify windows: the widget bar, the flyout and the settings centre. All of them talk to the Rust side through custom commands, so the only built-in capabilities they need are window control and event listening.",
+  "windows": ["widget", "flyout", "settings"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-close",
+    "core:window:allow-set-position",
+    "core:window:allow-set-size",
+    "core:window:allow-set-focus",
+    "core:webview:allow-internal-toggle-devtools"
+  ]
+}
