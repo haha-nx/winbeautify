@@ -423,32 +423,36 @@ pub fn widget_height(app: AppHandle) -> i32 {
 }
 
 #[tauri::command]
-pub fn open_settings(app: AppHandle) -> R<()> {
-    win::open_settings(&app).map_err(|e| err("opening the settings window", e))
+pub fn open_settings(app: AppHandle) {
+    crate::settings::open(&app);
 }
 
 #[tauri::command]
-pub fn minimize_settings(app: AppHandle) -> R<()> {
-    if let Some(window) = app.get_webview_window(win::SETTINGS) {
-        window
-            .minimize()
-            .map_err(|e| err("minimizing the settings window", e))?;
-    }
-    Ok(())
+pub fn minimize_settings(app: AppHandle) {
+    crate::settings::minimize(&app);
 }
 
-/// Close the settings window *and* free its webview.
-///
-/// An idle WebView2 costs tens of megabytes; the settings are opened rarely
-/// enough that rebuilding on demand is the better trade.
 #[tauri::command]
-pub fn close_settings(app: AppHandle) -> R<()> {
-    if let Some(window) = app.get_webview_window(win::SETTINGS) {
-        window
-            .destroy()
-            .map_err(|e| err("closing the settings window", e))?;
-    }
-    Ok(())
+pub fn close_settings(app: AppHandle) {
+    crate::settings::close(&app);
+}
+
+/// Start a region capture, from the flyout or the tray.
+#[tauri::command]
+pub fn start_snip(app: AppHandle) -> R<()> {
+    crate::snip::start(&app)
+}
+
+/// Dismiss every image pinned to the desktop.
+#[tauri::command]
+pub fn close_pins() {
+    crate::snip::close_pins();
+}
+
+/// Read the clipboard's text, for a paste into the flyout.
+#[tauri::command]
+pub fn clipboard_text() -> Option<String> {
+    beautify_clipboard::capture::clipboard_text()
 }
 
 #[tauri::command]
@@ -459,6 +463,11 @@ pub fn quit_app(app: AppHandle) {
 /// Reveal a directory in Explorer.
 #[tauri::command]
 pub fn open_path(path: String) -> R<()> {
+    reveal_path(&path)
+}
+
+/// The body of [`open_path`], for the native settings window's action rows.
+pub fn reveal_path(path: &str) -> R<()> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -486,6 +495,12 @@ pub fn open_path(path: String) -> R<()> {
 /// outcome, so the settings page can say *why* lyrics are empty.
 #[tauri::command]
 pub fn test_lyric_provider(state: State<'_, std::sync::Arc<AppState>>) -> R<String> {
+    test_lyric_provider_impl(state.inner())
+}
+
+/// The body of [`test_lyric_provider`], reachable from the native settings
+/// window's action rows as well as over IPC.
+pub fn test_lyric_provider_impl(state: &std::sync::Arc<AppState>) -> R<String> {
     let config = state.config.get();
     let provider = config.media.lyric_provider;
     if !provider.is_online() {
@@ -541,6 +556,7 @@ pub fn refresh_hotkeys(app: &AppHandle, config: &Config) {
         vec![
             (HotkeyAction::OpenClipboard, config.clipboard.hotkey.clone()),
             (HotkeyAction::OpenTodo, config.todo.hotkey.clone()),
+            (HotkeyAction::Snip, config.snip.hotkey.clone()),
         ],
         app.clone(),
     );

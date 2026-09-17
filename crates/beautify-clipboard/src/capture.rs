@@ -213,6 +213,16 @@ pub fn clipboard_image_bmp(max_bytes: u32) -> Option<Vec<u8>> {
     read_image(max_bytes).map(|(bmp, _, _, _)| bmp)
 }
 
+/// The text currently on the clipboard, if it holds any.
+///
+/// The same `CF_UNICODETEXT` path the history reads, exposed for the settings
+/// window's text fields: those are drawn rather than being child `EDIT`
+/// controls, so a paste into one has to be done by hand.
+pub fn clipboard_text() -> Option<String> {
+    let _guard = ClipboardGuard::open(HWND::default())?;
+    read_text()
+}
+
 /// Returns `None` when the clipboard is empty, locked by another process, or
 /// holds nothing we record.
 pub fn capture(hwnd: HWND, capture_sensitive: bool, max_image_bytes: u32) -> Option<NewClip> {

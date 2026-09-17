@@ -97,10 +97,13 @@ pub fn parts(field: &Field, control: Rect, metrics: &Metrics) -> Parts {
             // area is the full row height even though the track is drawn thin:
             // a four-pixel target is not something anyone can hit.
             let readout = metrics.slider_readout_width();
+            // A full gap, not half: the knob is drawn *centred* on the track's
+            // end, so it sticks out by its own radius, and at the maximum value
+            // it would otherwise sit on top of the number it is showing.
             let track = Rect::new(
                 control.left,
                 control.top,
-                (control.right - readout - metrics.control_gap() * 0.5).max(control.left),
+                (control.right - readout - metrics.control_gap()).max(control.left),
                 control.bottom,
             );
             parts.slider = Some(track);
@@ -132,6 +135,9 @@ pub fn parts(field: &Field, control: Rect, metrics: &Metrics) -> Parts {
                 .boxes
                 .push(Rect::new(control.left, top, control.right, top + height));
         }
+        // A read-only value has nothing to click and nothing to type; the
+        // painter reads its rectangle straight off the row.
+        Kind::Info(_) => {}
         Kind::Action(buttons) => {
             // Right to left, so the first button in the schema sits at the
             // trailing edge and the row grows leftwards.
@@ -188,11 +194,21 @@ mod tests {
         let (m, control) = (metrics(), control());
         for field in all_fields() {
             let parts = parts(field, control, &m);
-            assert!(
-                !parts.boxes.is_empty() || parts.slider.is_some() || !parts.buttons.is_empty(),
-                "field {:?} produced no interactive area",
-                field.label
-            );
+            let produced =
+                !parts.boxes.is_empty() || parts.slider.is_some() || !parts.buttons.is_empty();
+            if field.kind.is_interactive() {
+                assert!(
+                    produced,
+                    "field {:?} produced no interactive area",
+                    field.label
+                );
+            } else {
+                assert!(
+                    !produced,
+                    "field {:?} is read-only but offers something to click",
+                    field.label
+                );
+            }
         }
     }
 

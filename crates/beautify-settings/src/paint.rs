@@ -32,7 +32,7 @@ use crate::controls::{self, Part};
 use crate::geom::Rect;
 use crate::layout::{Layout, Metrics, Row};
 use crate::palette::Palette;
-use crate::schema::{Field, Kind, StatusKind};
+use crate::schema::{Field, InfoKey, Kind, StatusKind};
 
 /// Font weights, named for what they are used for.
 const LABEL_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_NORMAL;
@@ -69,6 +69,30 @@ pub struct StatusText {
     pub spectrum_tone: Tone,
     pub clipboard: String,
     pub clipboard_tone: Tone,
+    /// Live values for the 关于 page's read-only rows.
+    pub info: Vec<(InfoKey, String)>,
+}
+
+impl StatusText {
+    /// The value a 关于 row shows, or an empty string when the host had nothing
+    /// to say — a missing value is not worth a placeholder in the middle of a
+    /// list of facts.
+    pub fn info(&self, key: InfoKey) -> &str {
+        self.info
+            .iter()
+            .find(|(entry, _)| *entry == key)
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("")
+    }
+
+    /// Record one value, replacing any earlier one for the same key.
+    pub fn set_info(&mut self, key: InfoKey, value: impl Into<String>) {
+        let value = value.into();
+        match self.info.iter_mut().find(|(entry, _)| *entry == key) {
+            Some((_, slot)) => *slot = value,
+            None => self.info.push((key, value)),
+        }
+    }
 }
 
 /// What a status pill's colour says.
@@ -150,22 +174,46 @@ impl Painter {
             return Ok(());
         };
         let canvas = Canvas::new(&target)?;
+        // Direct2D only presents a frame when `BeginDraw` and `EndDraw` are
+        // matched; every call between them is buffered and any call outside is
+        // silently discarded. Getting this wrong produces a window that is
+        // created, painted and completely blank.
+        canvas.begin();
+        let drawn = self.draw_frame(&canvas, layout, metrics, palette, config, interaction, status);
+        // `EndDraw` runs even when a shape failed: leaving the target in a
+        // drawing state makes it refuse every later frame.
+        let presented = canvas.end();
+        drawn?;
+        presented
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_frame(
+        &self,
+        canvas: &Canvas<'_>,
+        layout: &Layout,
+        metrics: &Metrics,
+        palette: &Palette,
+        config: &beautify_core::config::Config,
+        interaction: &Interaction,
+        status: &StatusText,
+    ) -> Result<()> {
         canvas.clear(palette.window);
 
         let sidebar = layout.sidebar;
         canvas.fill_rect(sidebar, palette.sidebar);
         canvas.fill_rect(layout.titlebar, palette.titlebar);
 
-        self.draw_nav(&canvas, layout, metrics, palette, interaction)?;
-        self.draw_titlebar(&canvas, layout, metrics, palette)?;
+        self.draw_nav(canvas, layout, metrics, palette, interaction)?;
+        self.draw_titlebar(canvas, layout, metrics, palette)?;
 
         // The page is clipped to its viewport so a row scrolling up disappears
         // under the header instead of over it.
         canvas.clipped(layout.viewport, || {
-            self.draw_content(&canvas, layout, metrics, palette, config, interaction, status)
+            self.draw_content(canvas, layout, metrics, palette, config, interaction, status)
         })?;
 
-        self.draw_scrollbar(&canvas, layout, metrics, palette)?;
+        self.draw_scrollbar(canvas, layout, metrics, palette)?;
 
         // The dropdown floats above everything, including the scrollbar.
         if let Some(row) = layout
@@ -175,7 +223,7 @@ impl Painter {
             .flat_map(|card| card.rows.iter())
             .nth(interaction.open_dropdown.unwrap_or(usize::MAX))
         {
-            self.draw_dropdown(&canvas, row, metrics, palette, interaction)?;
+            self.draw_dropdown(canvas, row, metrics, palette, interaction)?;
         }
         Ok(())
     }
@@ -194,6 +242,54 @@ impl Painter {
         }
         let offset = self.text.vertical_correction(format);
         canvas.text(text, format, rect, colour, offset);
+    }
+
+    /// The text being typed into `row`, when it is the focused one.
+    fn typing<'a>(&self, interaction: &'a Interaction, row: usize) -> Option<&'a str> {
+        (interaction.focused_row == Some(row)).then_some(interaction.editing.as_str())
+    }
+
+    /// Draw the contents of an editable box, with a caret while it has focus.
+    ///
+    /// The caret is drawn rather than delegated to Windows: these are not child
+    /// `EDIT` controls (they would not composite into the Direct2D surface), so
+    /// there is no system caret, and a text field with no visible insertion
+    /// point is unusable. Measuring the string is the only way to know where the
+    /// end of it is, since no text layout is retained between frames.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_box_text(
+        &self,
+        canvas: &Canvas<'_>,
+        rect: Rect,
+        stored: &str,
+        placeholder: &str,
+        format: &IDWriteTextFormat,
+        palette: &Palette,
+        metrics: &Metrics,
+        typing: Option<&str>,
+    ) {
+        let inner = rect.inset_by(metrics.px(9.0), 0.0);
+        let (text, colour) = match typing {
+            Some(typed) => (typed, palette.text),
+            None if stored.is_empty() => (placeholder, palette.text_faint),
+            None => (stored, palette.text),
+        };
+        self.text_in(canvas, inner, text, format, colour);
+
+        if typing.is_none() {
+            return;
+        }
+        let typed = self.text.measure(text, format, inner.width()).min(inner.width());
+        let x = (inner.left + typed).min(inner.right - metrics.px(1.0));
+        canvas.fill_rect(
+            Rect::new(
+                x,
+                inner.top + metrics.px(4.0),
+                x + metrics.px(1.5),
+                inner.bottom - metrics.px(4.0),
+            ),
+            palette.accent,
+        );
     }
 
     /// Fill a polygon given in absolute coordinates.
@@ -276,6 +372,19 @@ impl Painter {
         let label_format = self.text.format(metrics.label_size(), LABEL_WEIGHT)?;
         let small_format = self.text.format(metrics.hint_size(), LABEL_WEIGHT)?;
 
+        // The section's own explanation, in the space the layout reserved for
+        // it between the heading and the first card.
+        if !layout.content.description.is_empty() {
+            self.draw_wrapped(
+                canvas,
+                layout.content.description,
+                current_section_description(layout),
+                &hint_format,
+                palette.text_faint,
+                metrics,
+            );
+        }
+
         let mut row_index = 0usize;
         for card in &layout.content.cards {
             // Section heading sits above the first card.
@@ -345,7 +454,12 @@ impl Painter {
         Ok(())
     }
 
-    /// Draw text wrapped to the box, at most two lines.
+    /// Draw text wrapped to the box.
+    ///
+    /// Every line is drawn, because the layout reserved exactly the height they
+    /// need: it measures with the same wrap and the same line spacing. Capping
+    /// this at a fixed number of lines instead would leave visible gaps wherever
+    /// a hint ran longer.
     fn draw_wrapped(
         &self,
         canvas: &Canvas<'_>,
@@ -356,10 +470,12 @@ impl Painter {
         metrics: &Metrics,
     ) {
         let lines = self.text.wrap(text, format, rect.width());
-        let line_height = metrics.hint_size() * 1.35;
-        for (index, line) in lines.iter().take(2).enumerate() {
+        let line_height = metrics.description_size() * crate::layout::LINE_SPACING;
+        for (index, line) in lines.iter().enumerate() {
             let top = rect.top + index as f32 * line_height;
-            if top + line_height > rect.bottom + line_height {
+            // A hair of slack: the reserved height is a float multiple of the
+            // line height, so the last line can land a fraction past it.
+            if top + line_height > rect.bottom + 1.0 {
                 break;
             }
             let line_rect = Rect::new(rect.left, top, rect.right, top + line_height);
@@ -458,7 +574,13 @@ impl Painter {
 
                 let readout = parts.boxes[0];
                 let text = slider.format.render(current);
-                self.text_in(canvas, readout, &text, small, palette.text_dim);
+                self.text_in(
+                    canvas,
+                    readout.inset_by(metrics.px(6.0), 0.0),
+                    &text,
+                    small,
+                    palette.text_dim,
+                );
             }
             Kind::Select(choices) => {
                 let rect = parts.boxes[0];
@@ -494,10 +616,8 @@ impl Painter {
             Kind::Color => {
                 let swatch = parts.boxes[0];
                 let hex = parts.boxes[1];
-                let colour = value
-                    .as_ref()
-                    .and_then(|v| v.as_text())
-                    .and_then(|text| text.parse::<beautify_core::geometry::Color>().ok());
+                let stored = value.as_ref().and_then(|v| v.as_text()).unwrap_or("");
+                let colour = stored.parse::<beautify_core::geometry::Color>().ok();
                 canvas.fill_rounded(swatch, metrics.px(5.0), palette.control);
                 if let Some(colour) = colour {
                     canvas.fill_rounded(
@@ -509,32 +629,49 @@ impl Painter {
                 canvas.stroke_rounded(swatch, metrics.px(5.0), palette.control_border, 1.0);
                 canvas.fill_rounded(hex, metrics.px(5.0), palette.control);
                 canvas.stroke_rounded(hex, metrics.px(5.0), palette.control_border, 1.0);
-                self.text_in(canvas, hex.inset_by(metrics.px(9.0), 0.0), value.as_ref().and_then(|v| v.as_text()).unwrap_or(""), small, palette.text);
+                self.draw_box_text(
+                    canvas,
+                    hex,
+                    stored,
+                    "",
+                    small,
+                    palette,
+                    metrics,
+                    self.typing(interaction, row_index),
+                );
             }
             Kind::Number { suffix, .. } => {
                 let rect = parts.boxes[0];
                 canvas.fill_rounded(rect, metrics.px(5.0), palette.control);
                 canvas.stroke_rounded(rect, metrics.px(5.0), palette.control_border, 1.0);
                 let number = value.as_ref().and_then(|v| v.as_number()).unwrap_or(0.0);
-                let text = format!("{} {suffix}", number.round() as i64);
-                self.text_in(canvas, rect.inset_by(metrics.px(9.0), 0.0), &text, small, palette.text);
+                let stored = format!("{} {suffix}", number.round() as i64);
+                self.draw_box_text(
+                    canvas,
+                    rect,
+                    &stored,
+                    "",
+                    small,
+                    palette,
+                    metrics,
+                    self.typing(interaction, row_index),
+                );
             }
             Kind::Text { placeholder } => {
                 let rect = parts.boxes[0];
                 canvas.fill_rounded(rect, metrics.px(5.0), palette.control);
                 canvas.stroke_rounded(rect, metrics.px(5.0), palette.control_border, 1.0);
-                let editing = interaction.focused_row == Some(row_index);
-                let text = if editing {
-                    interaction.editing.clone()
-                } else {
-                    value.as_ref().and_then(|v| v.as_text()).unwrap_or("").to_string()
-                };
-                let (content, colour) = if text.is_empty() {
-                    (placeholder.to_string(), palette.text_faint)
-                } else {
-                    (text, palette.text)
-                };
-                self.text_in(canvas, rect.inset_by(metrics.px(9.0), 0.0), &content, small, colour);
+                let stored = value.as_ref().and_then(|v| v.as_text()).unwrap_or("");
+                self.draw_box_text(
+                    canvas,
+                    rect,
+                    stored,
+                    placeholder,
+                    small,
+                    palette,
+                    metrics,
+                    self.typing(interaction, row_index),
+                );
             }
             Kind::Status(kind) => {
                 let slot = parts.boxes[0];
@@ -558,6 +695,12 @@ impl Painter {
                 let pill = Rect::new(slot.left, slot.top, slot.left + width, slot.bottom);
                 canvas.fill_rounded(pill, pill.height() * 0.5, colour.with_alpha(0.16));
                 self.text_in(canvas, Rect::new(pill.left + metrics.px(10.0), pill.top, pill.right, pill.bottom), text, small, colour);
+            }
+            // A read-only value. The label column already says what it is, so
+            // this is just the text, and it is deliberately not styled like a
+            // control: nothing here can be clicked or typed into.
+            Kind::Info(key) => {
+                self.text_in(canvas, row.control, status.info(key), small, palette.text_dim);
             }
             Kind::Action(buttons) => {
                 for (index, button) in buttons.iter().enumerate() {
@@ -700,6 +843,16 @@ fn current_section_title(layout: &Layout) -> &'static str {
         .iter()
         .find(|item| item.active)
         .map(|item| item.section.title)
+        .unwrap_or("")
+}
+
+/// The active section's own explanation, drawn under the page heading.
+fn current_section_description(layout: &Layout) -> &'static str {
+    layout
+        .nav
+        .iter()
+        .find(|item| item.active)
+        .map(|item| item.section.description)
         .unwrap_or("")
 }
 

@@ -26,6 +26,7 @@ const WM_APP_SHUTDOWN: u32 = WM_APP + 31;
 pub enum HotkeyAction {
     OpenClipboard,
     OpenTodo,
+    Snip,
 }
 
 impl HotkeyAction {
@@ -33,6 +34,7 @@ impl HotkeyAction {
         match self {
             HotkeyAction::OpenClipboard => 1,
             HotkeyAction::OpenTodo => 2,
+            HotkeyAction::Snip => 3,
         }
     }
 
@@ -40,6 +42,7 @@ impl HotkeyAction {
         match id {
             1 => Some(HotkeyAction::OpenClipboard),
             2 => Some(HotkeyAction::OpenTodo),
+            3 => Some(HotkeyAction::Snip),
             _ => None,
         }
     }
@@ -273,9 +276,18 @@ fn run(
 }
 
 fn dispatch(app: &AppHandle, action: HotkeyAction) {
+    // A capture is not a flyout: it takes the screen over until it is done, and
+    // reports back through its own host.
+    if action == HotkeyAction::Snip {
+        if let Err(e) = crate::snip::start(app) {
+            tracing::warn!("could not start a capture: {e}");
+        }
+        return;
+    }
     let tab = match action {
         HotkeyAction::OpenClipboard => beautify_core::model::FlyoutTab::Clipboard,
         HotkeyAction::OpenTodo => beautify_core::model::FlyoutTab::Todo,
+        HotkeyAction::Snip => unreachable!("handled above"),
     };
     // Toggle: pressing the hotkey while the flyout is up should put it away.
     let visible = app
@@ -344,7 +356,11 @@ mod tests {
 
     #[test]
     fn action_ids_round_trip() {
-        for action in [HotkeyAction::OpenClipboard, HotkeyAction::OpenTodo] {
+        for action in [
+            HotkeyAction::OpenClipboard,
+            HotkeyAction::OpenTodo,
+            HotkeyAction::Snip,
+        ] {
             assert_eq!(HotkeyAction::from_id(action.id()), Some(action));
         }
         assert_eq!(HotkeyAction::from_id(99), None);

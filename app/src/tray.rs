@@ -21,6 +21,9 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             &MenuItem::with_id(app, "flyout-todo", "任务清单", true, None::<&str>)?,
             &MenuItem::with_id(app, "flyout-clipboard", "剪贴板历史", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(app, "snip", "截图", true, None::<&str>)?,
+            &MenuItem::with_id(app, "close-pins", "关闭全部贴图", true, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "reload", "重新载入配置", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "quit", "退出 WinBeautify", true, None::<&str>)?,
@@ -45,13 +48,15 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
 
 fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     match event.id().as_ref() {
-        "settings" => {
-            if let Err(e) = win::open_settings(app) {
-                tracing::error!("could not open settings: {e}");
-            }
-        }
+        "settings" => crate::settings::open(app),
         "flyout-todo" => show(beautify_core::model::FlyoutTab::Todo, app),
         "flyout-clipboard" => show(beautify_core::model::FlyoutTab::Clipboard, app),
+        "snip" => {
+            if let Err(e) = crate::snip::start(app) {
+                tracing::warn!("could not start a capture: {e}");
+            }
+        }
+        "close-pins" => crate::snip::close_pins(),
         "reload" => reload(app),
         "quit" => crate::shutdown(app),
         _ => {}
@@ -71,10 +76,7 @@ fn on_tray_event(tray: &tauri::tray::TrayIcon, event: TrayIconEvent) {
         ..
     } = event
     {
-        let app = tray.app_handle();
-        if let Err(e) = win::open_settings(app) {
-            tracing::error!("could not open settings: {e}");
-        }
+        crate::settings::open(tray.app_handle());
     }
 }
 
@@ -87,6 +89,9 @@ fn reload(app: &AppHandle) {
         Ok(config) => {
             state.apply_config(&config);
             crate::sync_side_effects(app, &config);
+            // The settings window holds its own copy of the config; without
+            // this it would keep showing the file as it was when it opened.
+            crate::settings::refresh(app);
             let _ = app.emit("config-changed", &config);
             tracing::info!("configuration reloaded from disk");
         }

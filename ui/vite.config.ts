@@ -1,8 +1,11 @@
 import { defineConfig } from "vite";
 
-// Three separate windows, three separate HTML entries. Keeping them as real
-// pages (rather than one SPA with routing) is what lets the widget bar stay a
-// ~400x44 transparent window with no router, no framework and almost no JS.
+// Two separate windows, two separate HTML entries. Keeping them as real pages
+// (rather than one SPA with routing) is what lets the widget bar stay a ~400x44
+// transparent window with no router, no framework and almost no JS.
+//
+// The settings centre used to be a third entry. It is a native Direct2D window
+// now, drawn by `beautify-settings`, so there is no page to build for it.
 //
 // Vite is run from this directory, so `root` is the default and the entry
 // paths are relative to it.
@@ -17,7 +20,6 @@ export default defineConfig({
     sourcemap: false,
     rollupOptions: {
       input: {
-        index: "index.html",
         widget: "widget.html",
         flyout: "flyout.html",
       },

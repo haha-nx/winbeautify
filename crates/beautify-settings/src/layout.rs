@@ -17,6 +17,13 @@ use beautify_core::config::Config;
 use crate::geom::{clamp, Rect};
 use crate::schema::{Card as CardSpec, Field, Kind, Section, SECTIONS};
 
+/// Font size to line height, for every wrapped run of text on the page.
+///
+/// Shared with the painter: the layout reserves `lines * size * LINE_SPACING`
+/// and the painter draws the lines at that pitch, so the two cannot drift into
+/// a box that is a line too short.
+pub const LINE_SPACING: f32 = 1.35;
+
 /// Design constants, in 96-DPI units. Scaled once, here.
 #[derive(Debug, Clone, Copy)]
 pub struct Metrics {
@@ -220,6 +227,9 @@ pub struct Content {
     pub cards: Vec<Card>,
     /// Height of the whole page, used to size the scrollbar.
     pub height: f32,
+    /// Where the section's own explanation goes, between the heading and the
+    /// first card. Empty when the section has none.
+    pub description: Rect,
 }
 
 /// One sidebar entry.
@@ -243,6 +253,12 @@ pub struct Layout {
     pub content: Content,
     pub scrollbar: Rect,
     pub scroll_max: f32,
+    /// The scroll offset this layout was built with, **after** clamping.
+    ///
+    /// Reported rather than assumed: a wheel event can ask for an offset past
+    /// the end, and the caller needs to know what it actually got before it
+    /// draws a scrollbar thumb that disagrees with the page.
+    pub scroll: f32,
 }
 
 impl Layout {
@@ -325,6 +341,7 @@ pub fn layout(
         content,
         scrollbar,
         scroll_max,
+        scroll,
     }
 }
 
@@ -406,10 +423,13 @@ fn layout_content(
     let title_rect = Rect::new(left, cursor, right, cursor + metrics.section_title_size());
     cursor = title_rect.bottom + metrics.section_title_gap();
 
+    let mut description_rect = Rect::EMPTY;
     if !section.description.is_empty() {
+        // Measured with the same wrap the painter draws with, so the reserved
+        // height is the height the text actually takes.
         let height = measure_hint(section.description, text_width);
-        let description = Rect::new(left, cursor, right, cursor + height);
-        cursor = description.bottom;
+        description_rect = Rect::new(left, cursor, right, cursor + height);
+        cursor = description_rect.bottom;
     }
     cursor += metrics.description_gap();
 
@@ -459,6 +479,7 @@ fn layout_content(
 
     // Shift everything by the scroll offset now that the page height is known.
     let shift = |rect: Rect| rect.shifted(-scroll);
+    description_rect = shift(description_rect);
     for card in &mut cards {
         card.rect = shift(card.rect);
         card.title = shift(card.title);
@@ -470,7 +491,11 @@ fn layout_content(
         }
     }
 
-    Content { cards, height }
+    Content {
+        cards,
+        height,
+        description: description_rect,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -488,8 +513,12 @@ fn layout_row(
     let padding_h = metrics.row_padding_h();
     let padding_v = metrics.row_padding_v();
     let label_size = metrics.label_size();
+    // The text is drawn centred in its rectangle, so the rectangle has to be one
+    // *line* tall: handing it the whole row would centre the label against a
+    // box several lines high and drop it onto the hint below.
+    let label_line = label_size * LINE_SPACING;
 
-    let mut text_height = label_size;
+    let mut text_height = label_line;
     let mut hint_height = 0.0;
     if let Some(hint) = field.hint {
         hint_height = measure_hint(hint, label_width) + metrics.hint_gap();
@@ -506,7 +535,12 @@ fn layout_row(
         Kind::Status(_) => (Rect::EMPTY, Rect::new(left + padding_h, rect.top + padding_v, right - padding_h, rect.bottom - padding_v)),
         Kind::Action(_) => (Rect::EMPTY, Rect::new(left + padding_h, rect.top + padding_v, right - padding_h, rect.bottom - padding_v)),
         _ => {
-            let label = Rect::new(left + padding_h, rect.top + padding_v, left + padding_h + label_width, rect.bottom - padding_v);
+            let label = Rect::new(
+                left + padding_h,
+                rect.top + padding_v,
+                left + padding_h + label_width,
+                rect.top + padding_v + label_line,
+            );
             let control = Rect::new(
                 right - padding_h - control_width,
                 rect.top + padding_v,
@@ -517,10 +551,15 @@ fn layout_row(
         }
     };
 
-    // A single-line hint sits directly under the label; the label box is the
-    // first line of the text column.
+    // A hint sits directly under the label: the label occupies the first line
+    // of the text column, the hint the ones after it.
     let hint = if hint_height > 0.0 {
-        Rect::new(label.left, label.top + label_size + metrics.hint_gap(), label.right, label.top + label_size + hint_height)
+        Rect::new(
+            label.left,
+            label.top + label_line + metrics.hint_gap(),
+            label.right,
+            label.top + label_line + hint_height,
+        )
     } else {
         Rect::EMPTY
     };
@@ -669,12 +708,37 @@ mod tests {
         let with_hint = rows.iter().find(|r| !r.hint.is_empty()).expect("a hinted row");
         let without = rows.iter().find(|r| r.hint.is_empty()).expect("an unhinted row");
         assert!(with_hint.rect.height() > without.rect.height());
-        assert!(with_hint.hint.top >= with_hint.label.top + FakeLabel::SIZE - 0.01);
     }
 
-    struct FakeLabel;
-    impl FakeLabel {
-        const SIZE: f32 = 12.5;
+    /// The label's box has to be exactly one line tall.
+    ///
+    /// Text is drawn centred in its rectangle, so a label handed the whole row
+    /// gets centred against a box several lines high — which puts it on top of
+    /// its own hint. This is the assertion that catches that.
+    #[test]
+    fn a_label_gets_one_line_and_its_hint_the_next() {
+        let metrics = Metrics::new(96);
+        let layout = build("appearance", &Config::default(), 0.0);
+        let line = metrics.label_size() * LINE_SPACING;
+        let rows: Vec<&Row> = layout
+            .content
+            .cards
+            .iter()
+            .flat_map(|c| c.rows.iter())
+            .collect();
+        for row in rows.iter().filter(|row| !row.hint.is_empty()) {
+            assert!(
+                (row.label.height() - line).abs() < 0.01,
+                "{:?} label box is {} tall, not one line ({line})",
+                row.field.label,
+                row.label.height()
+            );
+            assert!(
+                (row.hint.top - row.label.bottom - metrics.hint_gap()).abs() < 0.01,
+                "{:?} hint is not one gap below the label",
+                row.field.label
+            );
+        }
     }
 
     #[test]
@@ -708,6 +772,7 @@ mod tests {
             scrolled.content.height, top.content.height,
             "the page height does not depend on the scroll offset"
         );
+        assert_eq!(scrolled.scroll, 60.0, "an offset inside the range is kept");
 
         // Past the end it clamps, so the scrollbar cannot be dragged off.
         let over = build("media", &config, 100_000.0);
@@ -715,6 +780,10 @@ mod tests {
         assert!(
             last.rect.bottom <= over.viewport.bottom + 0.01,
             "clamped scrolling should stop at the end of the page"
+        );
+        assert_eq!(
+            over.scroll, over.scroll_max,
+            "the layout has to report the offset it clamped to, or the thumb lies"
         );
     }
 

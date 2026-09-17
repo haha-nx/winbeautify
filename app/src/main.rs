@@ -20,6 +20,8 @@
 mod autostart;
 mod commands;
 mod hotkeys;
+mod settings;
+mod snip;
 mod state;
 mod tray;
 mod win;
@@ -93,6 +95,9 @@ fn main() {
             commands::open_settings,
             commands::minimize_settings,
             commands::close_settings,
+            commands::start_snip,
+            commands::close_pins,
+            commands::clipboard_text,
             commands::quit_app,
             commands::open_path,
         ])
@@ -119,9 +124,7 @@ fn main() {
             }
 
             if manager.read(|c| !c.general.start_minimized) {
-                if let Err(e) = win::open_settings(&handle) {
-                    tracing::error!("could not open the settings window: {e}");
-                }
+                settings::open(&handle);
             }
             Ok(())
         })

@@ -153,6 +153,37 @@ impl Shot {
         dib.extend_from_slice(&self.bgra);
         beautify_clipboard::dib::dib_to_bmp(&dib).map(|(bmp, _, _)| bmp)
     }
+
+    /// Encode as a `CF_DIB` payload ready for the clipboard.
+    ///
+    /// Bottom-up (positive `biHeight`), unlike [`Self::to_bmp`]: `CF_DIB` is a
+    /// Win32 interchange format and plenty of consumers still assume the
+    /// original bottom-up layout. The rows are written in reverse rather than
+    /// flipping the buffer, so the stored shot is untouched.
+    pub fn to_dib(&self) -> Vec<u8> {
+        let header = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: self.width,
+            biHeight: self.height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: self.bgra.len() as u32,
+            ..Default::default()
+        };
+        let mut dib = Vec::with_capacity(40 + self.bgra.len());
+        dib.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(
+                &header as *const BITMAPINFOHEADER as *const u8,
+                std::mem::size_of::<BITMAPINFOHEADER>(),
+            )
+        });
+        let stride = self.stride();
+        for row in (0..self.height as usize).rev() {
+            dib.extend_from_slice(&self.bgra[row * stride..(row + 1) * stride]);
+        }
+        dib
+    }
 }
 
 /// Grab a rectangle of the screen.
@@ -366,6 +397,27 @@ mod tests {
         assert_eq!(height, -2, "negative height means top-down");
         let width = i32::from_le_bytes(bmp[14 + 4..14 + 8].try_into().unwrap());
         assert_eq!(width, 3);
+    }
+
+    #[test]
+    fn the_clipboard_dib_is_bottom_up() {
+        let mut source = shot(2, 2, 0);
+        let stride = source.stride();
+        // Mark the top row and the bottom row differently.
+        for byte in &mut source.bgra[0..stride] {
+            *byte = 0x11;
+        }
+        for byte in &mut source.bgra[stride..2 * stride] {
+            *byte = 0x22;
+        }
+
+        let dib = source.to_dib();
+        let height = i32::from_le_bytes(dib[8..12].try_into().unwrap());
+        assert_eq!(height, 2, "CF_DIB is stored bottom-up");
+        assert_eq!(dib[40], 0x22, "the first row in the file is the bottom one");
+        assert_eq!(dib[40 + stride], 0x11);
+        // The header is the only thing in front of the pixels.
+        assert_eq!(dib.len(), 40 + source.bgra.len());
     }
 
     /// Touches the real desktop. Excluded from the default run only because it

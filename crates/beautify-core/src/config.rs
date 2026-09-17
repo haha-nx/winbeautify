@@ -21,6 +21,7 @@ pub struct Config {
     pub clipboard: ClipboardConfig,
     pub todo: TodoConfig,
     pub widget: WidgetConfig,
+    pub snip: SnipConfig,
     pub ui: UiConfig,
 }
 
@@ -34,6 +35,7 @@ impl Default for Config {
             clipboard: ClipboardConfig::default(),
             todo: TodoConfig::default(),
             widget: WidgetConfig::default(),
+            snip: SnipConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -441,6 +443,34 @@ impl Default for WidgetConfig {
     }
 }
 
+/// Screen capture and pin-to-desktop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SnipConfig {
+    pub enabled: bool,
+    /// Global hotkey that starts a region capture, e.g. `"Ctrl+Alt+A"`.
+    /// Empty disables the hotkey (the tray entry still works).
+    pub hotkey: String,
+    /// Put the finished capture on the clipboard as `CF_DIB`.
+    pub copy_to_clipboard: bool,
+    /// Pin the capture to the desktop as well, at the position it was taken.
+    pub auto_pin: bool,
+    /// How far the unselected area is darkened, 0.0 (untouched) .. 0.85.
+    pub dim: f32,
+}
+
+impl Default for SnipConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hotkey: "Ctrl+Alt+A".to_string(),
+            copy_to_clipboard: true,
+            auto_pin: false,
+            dim: 0.45,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Theme {
@@ -571,6 +601,10 @@ impl Config {
 
         self.clipboard.max_entries = self.clipboard.max_entries.clamp(10, 10_000);
         self.clipboard.max_image_bytes = self.clipboard.max_image_bytes.clamp(0, 64 * 1024 * 1024);
+
+        // Above about 0.85 the selection is hard to see against the dimmed
+        // background, which makes the tool feel broken rather than dark.
+        self.snip.dim = self.snip.dim.clamp(0.0, 0.85);
     }
 
     /// True when at least one module that owns a widget-bar surface is on.
@@ -685,6 +719,18 @@ mod tests {
         assert_eq!(cfg.widget.audio_min_width, 900);
         // max is pulled up to stay at least min
         assert!(cfg.widget.audio_max_width >= cfg.widget.audio_min_width);
+    }
+
+    #[test]
+    fn the_snip_defaults_are_usable_and_clamped() {
+        let cfg = Config::default();
+        assert!(cfg.snip.enabled);
+        assert!(cfg.snip.copy_to_clipboard, "a capture nobody can paste is a bug");
+        assert!(!cfg.snip.hotkey.is_empty(), "the feature would be unreachable");
+        assert!((0.0..0.9).contains(&cfg.snip.dim));
+
+        let cfg = Config::from_toml("[snip]\ndim = 3.0\n").unwrap();
+        assert_eq!(cfg.snip.dim, 0.85, "an extreme mask makes the selection invisible");
     }
 
     #[test]

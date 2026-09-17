@@ -47,6 +47,18 @@ pub struct AppState {
     pub taskbar_state: RwLock<TaskbarState>,
     /// Global hotkeys, rebuilt whenever the configured bindings change.
     pub hotkeys: Mutex<Option<HotkeyRegistry>>,
+    /// The native settings window, created on first use.
+    ///
+    /// Its `Host` implementation needs an `AppHandle`, which does not exist
+    /// until after this struct does, so the window is built lazily rather than
+    /// in [`AppState::new`].
+    pub settings_window: Mutex<Option<beautify_settings::SettingsWindow>>,
+    /// What the last settings action or capture did, for the 关于 page.
+    ///
+    /// The settings window asks the host for its values on every repaint, so
+    /// this is the channel a result reaches it through — there is no return path
+    /// from an action row to the page.
+    pub last_action: RwLock<String>,
     /// Set while `run()` is unwinding so background callbacks stop touching
     /// windows that are going away.
     pub shutting_down: AtomicBool,
@@ -89,6 +101,8 @@ impl AppState {
             taskbar_state: RwLock::new(TaskbarState::default()),
             flyout_visible: AtomicBool::new(false),
             hotkeys: Mutex::new(None),
+            settings_window: Mutex::new(None),
+            last_action: RwLock::new(String::new()),
             shutting_down: AtomicBool::new(false),
             started: AtomicBool::new(false),
             subscriptions: Mutex::new(Vec::new()),
@@ -116,6 +130,13 @@ impl AppState {
         self.shutting_down.store(true, Ordering::Release);
         if let Some(mut hotkeys) = self.hotkeys.lock().take() {
             hotkeys.stop();
+        }
+        // Pinned screenshots are topmost windows of ours; leaving them up after
+        // the process is gone is impossible, but closing them first means they
+        // disappear while the desktop is still ours to clean up.
+        beautify_snip::close_all_pins();
+        if let Some(window) = self.settings_window.lock().take() {
+            window.close();
         }
         self.registry.stop_all();
     }

@@ -184,7 +184,7 @@ mod tests {
                 Kind::Select(_) | Kind::Color | Kind::Text { .. } => {
                     matches!(value, Value::Text(_))
                 }
-                Kind::Status(_) | Kind::Action(_) => false,
+                Kind::Status(_) | Kind::Info(_) | Kind::Action(_) => false,
             };
             assert!(matches, "{path} read back as {value:?}, which its control cannot use");
         }
@@ -256,7 +256,7 @@ mod tests {
                         );
                     }
                 }
-                Kind::Status(_) | Kind::Action(_) => unreachable!("filtered out"),
+                Kind::Status(_) | Kind::Info(_) | Kind::Action(_) => unreachable!("filtered out"),
             }
         }
     }

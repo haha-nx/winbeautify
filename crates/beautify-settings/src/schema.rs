@@ -89,7 +89,29 @@ pub enum ActionId {
     ClearClipboardAll,
     ExportTodosMarkdown,
     ExportTodosJson,
+    /// Start a region capture.
+    StartSnip,
+    /// Dismiss every pinned image.
+    CloseAllPins,
     Quit,
+}
+
+/// A live value the 关于 page reports but cannot change.
+///
+/// Only the *key* is static; the value comes from the host at paint time, which
+/// is what keeps the about page inside the same tables-plus-live-values scheme
+/// as every other read-only row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfoKey {
+    Version,
+    Renderer,
+    Build,
+    ConfigPath,
+    DataDir,
+    LogsDir,
+    /// What the last action row did, so a button that reports a result has
+    /// somewhere to report it.
+    LastAction,
 }
 
 /// A button under an action row.
@@ -130,16 +152,31 @@ pub enum Kind {
     },
     /// A live read-out; not editable.
     Status(StatusKind),
+    /// A read-only key/value line whose value the host supplies. The label comes
+    /// from the table; the value does not exist until something is running.
+    Info(InfoKey),
     Action(&'static [Button]),
 }
 
 impl Kind {
     /// Does this control bind to a config value?
     ///
-    /// Status rows only report, and action rows only run something, so neither
-    /// has a path — which is what the schema tests rely on.
+    /// Status and info rows only report, and action rows only run something, so
+    /// none of them has a path — which is what the schema tests rely on.
     pub fn holds_value(&self) -> bool {
-        !matches!(self, Kind::Status(_) | Kind::Action(_))
+        !matches!(
+            self,
+            Kind::Status(_) | Kind::Info(_) | Kind::Action(_)
+        )
+    }
+
+    /// Is this control something the pointer can act on?
+    ///
+    /// A read-only row still occupies a rectangle, but there is nothing to click
+    /// and nothing to type, so the hit tester must not offer a hover state for
+    /// it.
+    pub fn is_interactive(&self) -> bool {
+        !matches!(self, Kind::Info(_))
     }
 }
 
@@ -345,6 +382,9 @@ fn clipboard_images(c: &Config) -> bool {
 fn todo_on(c: &Config) -> bool {
     c.todo.enabled
 }
+fn snip_on(c: &Config) -> bool {
+    c.snip.enabled
+}
 fn file_logging(c: &Config) -> bool {
     c.ui.file_logging
 }
@@ -430,6 +470,17 @@ const fn color(path: &'static str, label: &'static str) -> Field {
         label,
         hint: None,
         kind: Kind::Color,
+        when: None,
+    }
+}
+
+/// Shorthand for a read-only key/value row.
+const fn info(key: InfoKey, label: &'static str) -> Field {
+    Field {
+        path: "",
+        label,
+        hint: None,
+        kind: Kind::Info(key),
         when: None,
     }
 }
@@ -955,7 +1006,129 @@ const SYSTEM: &[Card] = &[
     },
 ];
 
-const ABOUT: &[Card] = &[];
+const SNIP: &[Card] = &[
+    Card {
+        title: None,
+        fields: &[
+            switch("snip.enabled", "启用截图"),
+            when(
+                hint(
+                    Field {
+                        path: "snip.hotkey",
+                        label: "截图快捷键",
+                        hint: None,
+                        kind: Kind::Text {
+                            placeholder: "Ctrl+Alt+A",
+                        },
+                        when: None,
+                    },
+                    "按下后在整块桌面上拖出要截取的区域。Esc 或右键取消；留空则不注册快捷键。",
+                ),
+                snip_on,
+            ),
+            when(
+                Field {
+                    path: "",
+                    label: "立即截图",
+                    hint: Some("等同于按下上面的快捷键。"),
+                    kind: Kind::Action(&[Button {
+                        label: "开始截图",
+                        action: ActionId::StartSnip,
+                        danger: false,
+                    }]),
+                    when: None,
+                },
+                snip_on,
+            ),
+        ],
+    },
+    Card {
+        title: Some("结果"),
+        fields: &[
+            when(
+                switch_hint(
+                    "snip.copy_to_clipboard",
+                    "复制到剪贴板",
+                    "以标准 CF_DIB 写入，可直接粘贴到聊天窗口或画图。",
+                ),
+                snip_on,
+            ),
+            when(
+                switch_hint(
+                    "snip.auto_pin",
+                    "同时贴到屏幕上",
+                    "在截取的原位置生成一张贴图：拖动移动，滚轮缩放，方向键微调，Esc 或双击关闭。",
+                ),
+                snip_on,
+            ),
+            when(
+                hint(
+                    slider("snip.dim", "选区外遮罩", None, 0.0, 0.85, 0.05, Format::Percent),
+                    "遮罩越深，选区越突出；过深会看不清背景。",
+                ),
+                snip_on,
+            ),
+        ],
+    },
+    Card {
+        title: Some("贴图"),
+        fields: &[Field {
+            path: "",
+            label: "屏幕上可能有之前留下的贴图",
+            hint: Some("贴图是独立窗口，会一直留在桌面上直到手动关闭。"),
+            kind: Kind::Action(&[Button {
+                label: "关闭全部贴图",
+                action: ActionId::CloseAllPins,
+                danger: true,
+            }]),
+            when: None,
+        }],
+    },
+];
+
+const ABOUT: &[Card] = &[
+    Card {
+        title: Some("运行信息"),
+        fields: &[
+            info(InfoKey::Version, "版本"),
+            info(InfoKey::Renderer, "小组件渲染"),
+            info(InfoKey::Build, "系统版本"),
+        ],
+    },
+    Card {
+        title: Some("位置"),
+        fields: &[
+            hint(info(InfoKey::ConfigPath, "配置文件"), "可以直接用文本编辑器修改。"),
+            info(InfoKey::DataDir, "数据目录"),
+            info(InfoKey::LogsDir, "日志目录"),
+            Field {
+                path: "",
+                label: "打开位置",
+                hint: None,
+                kind: Kind::Action(&[
+                    Button {
+                        label: "打开数据目录",
+                        action: ActionId::OpenDataDir,
+                        danger: false,
+                    },
+                    Button {
+                        label: "打开日志目录",
+                        action: ActionId::OpenLogsDir,
+                        danger: false,
+                    },
+                ]),
+                when: None,
+            },
+        ],
+    },
+    Card {
+        title: Some("最近操作"),
+        fields: &[hint(
+            info(InfoKey::LastAction, "结果"),
+            "任务栏效果通过 DWM 与合成 API 实现，不修改任何系统文件，退出时自动还原；全部模块按需加载，空闲时不轮询。",
+        )],
+    },
+];
 
 /// Every section, in sidebar order.
 pub const SECTIONS: &[Section] = &[
@@ -999,6 +1172,13 @@ pub const SECTIONS: &[Section] = &[
         title: "任务清单",
         description: "轻量的待办列表，可从小组件栏的 Flyout 直接查看与勾选。",
         cards: TODO,
+        is_about: false,
+    },
+    Section {
+        id: "snip",
+        title: "截图",
+        description: "拖动选择区域后把截图放进剪贴板，或贴回屏幕上继续对照。全程在本进程内完成，不写临时文件。",
+        cards: SNIP,
         is_about: false,
     },
     Section {
@@ -1193,6 +1373,57 @@ mod tests {
         assert!(!shows(&config));
         config.taskbar.dynamic_mode = true;
         assert!(shows(&config));
+    }
+
+    #[test]
+    fn the_snip_section_collapses_to_its_switch() {
+        let mut config = Config::default();
+        config.snip.enabled = true;
+        let section = section("snip").unwrap();
+        let expanded: Vec<&str> = section.visible_fields(&config).map(|(_, f)| f.label).collect();
+        assert!(expanded.len() >= 5, "the feature's rows should be visible");
+
+        config.snip.enabled = false;
+        let collapsed: Vec<&str> = section.visible_fields(&config).map(|(_, f)| f.label).collect();
+        assert!(
+            collapsed.contains(&"启用截图"),
+            "the switch that turns it back on must never hide itself"
+        );
+        assert!(
+            !collapsed.contains(&"立即截图"),
+            "a trigger for a disabled feature is a dead control"
+        );
+        // The one row that stays is the pin housekeeping: pins left over from a
+        // previous session still have to be dismissible.
+        assert!(collapsed.contains(&"屏幕上可能有之前留下的贴图"));
+    }
+
+    #[test]
+    fn the_about_page_has_something_to_show() {
+        let about = section("about").unwrap();
+        assert!(about.is_about, "the sidebar pins this entry to the bottom");
+        assert!(
+            !about.cards.is_empty(),
+            "an empty 关于 page is a blank screen, not a page"
+        );
+        // Its rows are read-only, so none of them may claim a config path.
+        for card in about.cards {
+            for field in card.fields {
+                assert!(
+                    !field.kind.holds_value() || !field.path.is_empty(),
+                    "关于 field {:?} binds a value but names no path",
+                    field.label
+                );
+            }
+        }
+        assert!(
+            about
+                .cards
+                .iter()
+                .flat_map(|card| card.fields.iter())
+                .any(|field| matches!(field.kind, Kind::Info(_))),
+            "the about page is where the live values go"
+        );
     }
 
     #[test]

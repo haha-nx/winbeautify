@@ -27,6 +27,8 @@ beautify-media = { path = "crates/beautify-media" }
 beautify-clipboard = { path = "crates/beautify-clipboard" }
 beautify-todo = { path = "crates/beautify-todo" }
 beautify-widget = { path = "crates/beautify-widget" }
+beautify-settings = { path = "crates/beautify-settings" }
+beautify-snip = { path = "crates/beautify-snip" }
 
 windows = "0.62"
 # Direct2D takes windows_numerics::Vector2 / Matrix3x2 for points and

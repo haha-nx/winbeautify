@@ -187,6 +187,27 @@ pub fn put(hwnd: HWND, kind: ClipKind, text: &str, image_bmp_path: &str) -> Resu
     Ok(())
 }
 
+/// Put a finished `CF_DIB` payload on the clipboard, replacing its contents.
+///
+/// Used by the snipper, which has the pixels in memory and no reason to write
+/// them to a file first. The payload has to be a complete `CF_DIB` — a
+/// `BITMAPINFOHEADER` followed by the pixel data — because that is what goes on
+/// the clipboard verbatim.
+pub fn put_dib(hwnd: HWND, dib: &[u8]) -> Result<(), WriteError> {
+    if dib.is_empty() {
+        return Err(WriteError::Win32("empty DIB"));
+    }
+    let _guard = ClipboardGuard::open(hwnd)?;
+    if unsafe { EmptyClipboard() }.is_err() {
+        return Err(WriteError::Win32("EmptyClipboard"));
+    }
+    let handle = unsafe { alloc_and_fill(dib)? };
+    // From here the clipboard owns `handle`; do not free it.
+    unsafe { SetClipboardData(CF_DIB.0 as u32, Some(handle)) }
+        .map_err(|_| WriteError::Win32("SetClipboardData(CF_DIB)"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

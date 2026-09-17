@@ -7,12 +7,23 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+# The border colour an `Options` carries is the workspace's colour type, so a
+# capture is tinted from the same accent as everything else.
+beautify-core.workspace = true
+# Putting a capture on the clipboard is the same `HGLOBAL` handoff the clipboard
+# module already performs; it owns that code.
 beautify-clipboard.workspace = true
+tracing.workspace = true
 
 [dependencies.windows]
 workspace = true
 features = [
     "Win32_Foundation",
+    # GDI does the drawing here: the overlay and the pins blit DIBs rather than
+    # going through Direct2D, which needs no device objects per frame.
     "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ]

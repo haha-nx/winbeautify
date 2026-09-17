@@ -1,15 +1,17 @@
 //! Window creation and placement.
 //!
-//! Three windows exist, all created from Rust rather than `tauri.conf.json` so
-//! their styles can depend on the live configuration:
+//! Two windows off the webview renderer, both created from Rust rather than
+//! `tauri.conf.json` so their styles can depend on the live configuration:
 //!
 //! * `widget` — the launcher + adaptive audio component, floating over the
 //!   taskbar. Created at startup, lives for the whole session.
 //! * `flyout` — the task list / clipboard panel, anchored to the widget bar.
 //!   Created on first use, then hidden and reused: recreating a webview costs
 //!   a few hundred milliseconds, which is very noticeable on a click.
-//! * `settings` — destroyed on close, because an idle settings webview is
-//!   ~40 MB of memory and the user may never reopen it.
+//!
+//! The settings window is *not* here: it is drawn natively by
+//! [`beautify_settings`], which owns its own window, and is reached through
+//! [`crate::settings`]. The webview settings page it replaced is gone.
 
 use beautify_core::config::{Config, WidgetAnchor, WidgetRenderer};
 use beautify_core::geometry::Rect;
@@ -24,7 +26,6 @@ use crate::state::AppState;
 
 pub const WIDGET: &str = "widget";
 pub const FLYOUT: &str = "flyout";
-pub const SETTINGS: &str = "settings";
 
 /// Vertical inset of the widget bar inside the taskbar rect, in physical px.
 const WIDGET_VERTICAL_INSET: i32 = 3;
@@ -488,26 +489,6 @@ fn publish_flyout_visibility(app: &AppHandle, visible: bool) {
         .flyout_visible
         .store(visible, std::sync::atomic::Ordering::Release);
     state.widget.set_flyout_open(visible);
-}
-
-/// Open (or focus) the settings window.
-pub fn open_settings(app: &AppHandle) -> tauri::Result<()> {
-    if let Some(existing) = app.get_webview_window(SETTINGS) {
-        let _ = existing.show();
-        let _ = existing.unminimize();
-        let _ = existing.set_focus();
-        return Ok(());
-    }
-    let window = WebviewWindowBuilder::new(app, SETTINGS, WebviewUrl::App("index.html".into()))
-        .title("WinBeautify 设置")
-        .inner_size(880.0, 620.0)
-        .min_inner_size(720.0, 480.0)
-        .decorations(false)
-        .center()
-        .visible(true)
-        .build()?;
-    let _ = window.set_focus();
-    Ok(())
 }
 
 pub fn current_widget_width(app: &AppHandle) -> i32 {
