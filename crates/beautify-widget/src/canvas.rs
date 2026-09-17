@@ -689,7 +689,7 @@ mod tests {
         // each size, the ink ends up in the middle of the box it was drawn in.
         for size in UI_SIZES {
             let (top, bottom, centre) = ink_centre(PROBE, size, 80, (size * 4.0) as u32);
-            let box_centre = (size * 4.0) as f32 * 0.5;
+            let box_centre = (size * 4.0) * 0.5;
             assert!(
                 (centre - box_centre).abs() <= 1.0,
                 "at {size}px the ink spans {top}..{bottom}, centre {centre}, box centre {box_centre}"
