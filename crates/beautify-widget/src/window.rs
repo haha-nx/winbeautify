@@ -520,10 +520,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
                 TIMER_SAFETY => {
-                    let moved = with_pump(|pump| pump.sync_geometry()).unwrap_or(false);
-                    if moved {
-                        with_pump(|pump| pump.draw());
-                    }
+                    // Redraw unconditionally, not only when the geometry moved.
+                    //
+                    // A layered window is composited from the surface this
+                    // process last pushed, and if that surface is lost — a
+                    // full-screen topmost overlay has been and gone over it, a
+                    // fullscreen app took the screen, the driver hiccuped —
+                    // nothing else would ever push it again: the geometry has not
+                    // changed, so the old code drew nothing and the bar stayed
+                    // invisible until the process restarted. One small
+                    // `UpdateLayeredWindow` every tick is the price of a bar that
+                    // repairs itself.
+                    with_pump(|pump| pump.sync_geometry());
+                    with_pump(|pump| pump.draw());
                 }
                 _ => {}
             }

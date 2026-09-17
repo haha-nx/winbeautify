@@ -21,6 +21,8 @@ features = [
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Dwm",
+    # `DwmExtendFrameIntoClientArea` takes a `MARGINS` from this module.
+    "Win32_UI_Controls",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
     "Win32_System_Com",

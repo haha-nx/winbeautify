@@ -21,8 +21,10 @@ use std::sync::Arc;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMSBT_TRANSIENTWINDOW, DWMWCP_ROUND,
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -191,12 +193,9 @@ impl Panel {
             hwnd,
             painter: None,
             metrics: Metrics::new(unsafe { GetDpiForWindow(hwnd) }),
-            palette: Palette::resolve(
-                beautify_core::geometry::Color::rgb(0x14, 0x16, 0x1C),
-                0.92,
-                beautify_core::geometry::Color::rgb(0x6C, 0x8C, 0xFF),
-                false,
-            ),
+            // Replaced from the host on the first frame; this is only what the
+            // window shows for the few milliseconds before that.
+            palette: Palette::resolve(beautify_core::geometry::Color::rgb(0x6C, 0x8C, 0xFF), false),
             tab,
             field_text: String::new(),
             field_focused: false,
@@ -224,6 +223,10 @@ impl Panel {
 
     /// Re-read the rows and draw a frame.
     fn refresh(&mut self) {
+        // The colours are read every frame, so changing the theme or the accent
+        // shows up the moment the panel is redrawn — which the app asks for when
+        // the configuration changes.
+        self.palette = self.host.palette();
         let (width, height) = self.client_size();
         let query = match self.tab {
             Tab::Clipboard => self.field_text.trim().to_string(),
@@ -806,6 +809,24 @@ fn run(
             &preference as *const i32 as *const core::ffi::c_void,
             std::mem::size_of::<i32>() as u32,
         );
+        // A translucent panel with the desktop blurred behind it, which is what
+        // the webview version had: a system backdrop plus the client area
+        // extended into the frame, so what the panel draws with an alpha
+        // composites over the blur instead of over black.
+        let backdrop: i32 = DWMSBT_TRANSIENTWINDOW.0;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &backdrop as *const i32 as *const core::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
         let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, width, height, SWP_SHOWWINDOW);
         let _ = ShowWindow(hwnd, SW_SHOW);
     }

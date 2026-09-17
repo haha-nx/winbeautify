@@ -358,6 +358,21 @@ impl Host for FlyoutHost {
         };
     }
 
+    /// The colours the panel draws with: the UI theme decides the surface, and
+    /// the accent is the configured one.
+    ///
+    /// This is what "the panel follows the settings" means — read on every
+    /// frame, so a change shows up as soon as the app asks for a redraw.
+    fn palette(&self) -> beautify_flyout::Palette {
+        let config = self.state().config.get();
+        let light = match config.ui.theme {
+            beautify_core::config::Theme::Light => true,
+            beautify_core::config::Theme::Dark => false,
+            beautify_core::config::Theme::Auto => crate::settings::system_is_light(),
+        };
+        beautify_flyout::Palette::resolve(config.ui.accent, light)
+    }
+
     /// The panel lost the foreground. That is the "clicked outside" that closes
     /// a popup, and it has to move both pieces of state the launcher reads.
     fn dismissed(&self) {

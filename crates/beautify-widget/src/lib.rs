@@ -183,6 +183,17 @@ impl WidgetModule {
     }
 
     /// True once the pump thread has a window and is rendering.
+    /// Ask the bar to redraw.
+    ///
+    /// Needed after something on another thread has covered it: a layered window
+    /// is composited from the surface the process last pushed, so a full-screen
+    /// overlay that was taken down over it leaves the shell to put the pixels
+    /// back — and a window that is *not* repainted keeps whatever the compositor
+    /// last had, which after a topmost overlay has been and gone is nothing.
+    pub fn refresh(&self) {
+        self.shared.invalidate();
+    }
+
     pub fn is_running(&self) -> bool {
         self.shared.hwnd.load(Ordering::Acquire) != 0
     }

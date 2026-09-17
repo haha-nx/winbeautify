@@ -971,30 +971,42 @@ fn badge_plate(session: &Session, selection: Area) -> (Area, String) {
 }
 
 /// The four bands of a selection's frame.
+///
+/// Drawn *outside* the selection, so the bright area in the overlay is exactly
+/// the region that will be captured. Drawn inside — as this first did — the part
+/// that looks selected is smaller than the part that is taken by the width of the
+/// frame, which is a discrepancy the user cannot see and therefore cannot
+/// explain: "what is shown is not what I get".
 fn border_bands(selection: Area, thickness: i32) -> [Area; 4] {
+    let outer = Area {
+        left: selection.left - thickness,
+        top: selection.top - thickness,
+        right: selection.right + thickness,
+        bottom: selection.bottom + thickness,
+    };
     [
         Area {
-            left: selection.left,
-            top: selection.top,
-            right: selection.right,
-            bottom: selection.top + thickness,
+            left: outer.left,
+            top: outer.top,
+            right: outer.right,
+            bottom: selection.top,
         },
         Area {
-            left: selection.left,
-            top: selection.bottom - thickness,
-            right: selection.right,
+            left: outer.left,
+            top: selection.bottom,
+            right: outer.right,
+            bottom: outer.bottom,
+        },
+        Area {
+            left: outer.left,
+            top: selection.top,
+            right: selection.left,
             bottom: selection.bottom,
         },
         Area {
-            left: selection.left,
+            left: selection.right,
             top: selection.top,
-            right: selection.left + thickness,
-            bottom: selection.bottom,
-        },
-        Area {
-            left: selection.right - thickness,
-            top: selection.top,
-            right: selection.right,
+            right: outer.right,
             bottom: selection.bottom,
         },
     ]
@@ -1343,12 +1355,21 @@ mod tests {
         // The middle of the selection is in none of them, so the captured
         // pixels there are never overdrawn by our own chrome.
         assert!(bands.iter().all(|band| !band.contains(60, 50)));
-        // …but every edge is.
-        assert!(bands.iter().any(|band| band.contains(10, 50)));
-        assert!(bands.iter().any(|band| band.contains(109, 50)));
-        assert!(bands.iter().any(|band| band.contains(60, 20)));
-        assert!(bands.iter().any(|band| band.contains(60, 89)));
-        assert_eq!(bands[0].width(), selection.width());
+        // …but every edge is: the frame is drawn outside the selection, so the
+        // bright area equals what will be captured.
+        assert!(bands.iter().any(|band| band.contains(8, 50)), "left band");
+        assert!(bands.iter().any(|band| band.contains(111, 50)), "right band");
+        assert!(bands.iter().any(|band| band.contains(60, 18)), "top band");
+        assert!(bands.iter().any(|band| band.contains(60, 91)), "bottom band");
+        assert!(
+            bands.iter().all(|band| {
+                band.right <= selection.left
+                    || band.left >= selection.right
+                    || band.bottom <= selection.top
+                    || band.top >= selection.bottom
+            }),
+            "no band may cover a pixel of the selection"
+        );
     }
 
     #[test]

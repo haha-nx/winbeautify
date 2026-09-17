@@ -27,7 +27,7 @@ pub mod window;
 use std::sync::Arc;
 
 pub use layout::{Hit, Metrics, Row, Scene};
-pub use paint::Interaction;
+pub use paint::{Interaction, Palette};
 pub use window::{scaled_size, FlyoutWindow};
 
 /// Which page is showing.
@@ -128,6 +128,11 @@ pub trait Host: Send + Sync {
     /// The tab the panel should open on, remembered between openings.
     fn remembered_tab(&self) -> Tab;
     fn remember_tab(&self, tab: Tab);
+
+    /// The colours to draw with: the theme, the accent and the widget
+    /// background, taken from the configuration. The panel is part of the
+    /// desktop furniture, so it follows the same settings the widget bar does.
+    fn palette(&self) -> Palette;
 
     /// The panel lost the foreground, which is how "click outside closes it"
     /// works for a popup. The host decides what to do about it.

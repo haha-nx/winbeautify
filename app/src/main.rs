@@ -275,6 +275,9 @@ fn bridge_events(app: &AppHandle) {
                 let _ = handle.emit("todo-changed", ());
             }
             Event::ThemeChanged | Event::ConfigChanged => {
+                // The panel's colours come from the configuration, and a theme
+                // change does not touch its data — so it has to be told.
+                flyout::refresh(&handle);
                 let _ = handle.emit("config-changed", handle.state::<Arc<AppState>>().config.get());
             }
         }

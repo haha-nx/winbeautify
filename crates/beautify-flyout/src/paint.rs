@@ -92,17 +92,19 @@ const fn rgba(r: u8, g: u8, b: u8, a: f32) -> Rgba {
 }
 
 impl Palette {
-    pub fn resolve(
-        background: beautify_core::geometry::Color,
-        opacity: f32,
-        accent: beautify_core::geometry::Color,
-        light: bool,
-    ) -> Self {
-        let panel = Rgba::from_color(background, opacity.clamp(0.0, 1.0));
+    /// Resolve for the configured theme.
+    ///
+    /// The panel's own colour comes from the theme, not from the widget
+    /// background: it is a panel over the desktop, and the webview version this
+    /// replaces had exactly these two values baked into its stylesheet. The
+    /// accent is the configured one, so a recoloured app looks recoloured.
+    pub fn resolve(accent: beautify_core::geometry::Color, light: bool) -> Self {
         let accent = Rgba::from_color(accent, 1.0);
         if light {
             Self {
-                panel,
+                // The window is translucent (DWM backdrop), so the panel colour
+                // carries an alpha and the blur shows through it.
+                panel: rgba(0xFF, 0xFF, 0xFF, 0.78),
                 header: rgba(0x00, 0x00, 0x00, 0.04),
                 text: rgba(0x1B, 0x1F, 0x2A, 1.0),
                 text_dim: rgba(0x5A, 0x63, 0x76, 1.0),
@@ -119,7 +121,7 @@ impl Palette {
             }
         } else {
             Self {
-                panel,
+                panel: rgba(0x14, 0x16, 0x1C, 0.72),
                 header: rgba(0xFF, 0xFF, 0xFF, 0.05),
                 text: rgba(0xE9, 0xEB, 0xF2, 1.0),
                 text_dim: rgba(0x9B, 0xA3, 0xB7, 1.0),
@@ -603,7 +605,14 @@ impl Painter {
                 metrics.px(5.0),
                 palette.danger.with_alpha(if lit { 0.22 } else { 0.12 }),
             );
-            self.text_in(canvas, button, "清空未收藏", &format, palette.danger);
+            // Centred in its button: text in a drawn box belongs in the middle.
+            if let Ok(centred) = self.text.format_aligned(
+                metrics.small_size(),
+                LABEL_WEIGHT,
+                DWRITE_TEXT_ALIGNMENT_CENTER,
+            ) {
+                self.text_in(canvas, button, "清空未收藏", &centred, palette.danger);
+            }
         }
     }
 

@@ -104,5 +104,9 @@ impl Host for SnipHost {
         // host, so recording the note is all that is needed to surface it.
         let state = self.app.state::<Arc<AppState>>();
         *state.last_action.write() = message;
+        // The selector covered the whole desktop, including the widget bar. Its
+        // pixels are a layered surface this process pushes, so nothing the shell
+        // does will bring them back — it has to be told.
+        state.widget.refresh();
     }
 }
