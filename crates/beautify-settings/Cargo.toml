@@ -8,5 +8,17 @@ license.workspace = true
 
 [dependencies]
 beautify-core.workspace = true
+# The Direct2D/DirectWrite primitives and the text engine are already written
+# and tested there; duplicating them here would mean two text caches and two
+# sets of font fallbacks to keep in step.
+beautify-widget.workspace = true
 serde.workspace = true
 toml.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_DirectWrite",
+]

@@ -30,7 +30,7 @@ impl Metrics {
         }
     }
 
-    fn px(&self, logical: f32) -> f32 {
+    pub(crate) fn px(&self, logical: f32) -> f32 {
         logical * self.scale
     }
 
@@ -152,6 +152,31 @@ impl Metrics {
 
     pub fn scrollbar_width(&self) -> f32 {
         self.px(8.0)
+    }
+
+    /// Room reserved for a slider's numeric read-out.
+    pub fn slider_readout_width(&self) -> f32 {
+        self.px(56.0)
+    }
+
+    /// Width of a colour swatch.
+    pub fn color_swatch_width(&self) -> f32 {
+        self.px(46.0)
+    }
+
+    /// Width of an action button.
+    pub fn button_width(&self) -> f32 {
+        self.px(112.0)
+    }
+
+    /// Height of one entry in an open dropdown.
+    pub fn dropdown_row_height(&self) -> f32 {
+        self.px(26.0)
+    }
+
+    /// Room taken by the minimize and close buttons.
+    pub fn window_buttons_width(&self) -> f32 {
+        self.px(58.0)
     }
 }
 

@@ -92,8 +92,63 @@ impl Rect {
     }
 
     /// True when `(x, y)` — in the same coordinate space — is inside.
+    ///
+    /// Half-open on the right and bottom edges, so two adjacent rectangles never
+    /// both claim the pixel between them.
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+
+    /// An empty rectangle, for "no such element".
+    pub const EMPTY: Rect = Rect {
+        left: 0.0,
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+    };
+
+    pub fn is_empty(&self) -> bool {
+        self.width() <= 0.0 || self.height() <= 0.0
+    }
+
+    /// Shrink on every side, never turning inside out.
+    pub fn inset_by(&self, dx: f32, dy: f32) -> Rect {
+        Rect::new(
+            self.left + dx,
+            self.top + dy,
+            (self.right - dx).max(self.left + dx),
+            (self.bottom - dy).max(self.top + dy),
+        )
+    }
+
+    /// Move vertically; negative moves up.
+    pub fn shifted(&self, dy: f32) -> Rect {
+        Rect::new(self.left, self.top + dy, self.right, self.bottom + dy)
+    }
+
+    /// Take `width` off the left edge, returning that strip.
+    pub fn take_left(&self, width: f32) -> Rect {
+        Rect::new(self.left, self.top, (self.left + width).min(self.right), self.bottom)
+    }
+
+    /// The right-hand `width` of this rectangle.
+    pub fn right_part(&self, width: f32) -> Rect {
+        Rect::new((self.right - width).max(self.left), self.top, self.right, self.bottom)
+    }
+
+    /// A horizontal slice of `height` from the top.
+    pub fn take_top(&self, height: f32) -> Rect {
+        Rect::new(self.left, self.top, self.right, (self.top + height).min(self.bottom))
+    }
+
+    /// The part of this rectangle that is inside `other`.
+    pub fn clipped_to(&self, other: Rect) -> Rect {
+        Rect::new(
+            self.left.max(other.left),
+            self.top.max(other.top),
+            self.right.min(other.right),
+            self.bottom.min(other.bottom),
+        )
     }
 }
 
@@ -535,6 +590,28 @@ mod tests {
         // the defect this layout exists to avoid.
         let slack = l.pill.right - BAR_PAD - audio.spectrum.right;
         assert!(slack.abs() < 0.51, "unexpected slack of {slack}");
+    }
+
+    #[test]
+    fn rectangle_slicing_cannot_invert() {
+        let rect = Rect::new(0.0, 0.0, 100.0, 50.0);
+        assert_eq!(rect.take_left(30.0).right, 30.0);
+        assert_eq!(rect.right_part(40.0).left, 60.0);
+        assert_eq!(rect.take_top(10.0).bottom, 10.0);
+        // Asking for more than there is clamps rather than inverting.
+        assert_eq!(rect.take_left(500.0).right, 100.0);
+        assert_eq!(rect.right_part(500.0).left, 0.0);
+        assert_eq!(rect.take_top(500.0).bottom, 50.0);
+        assert_eq!(rect.inset_by(200.0, 200.0).width(), 0.0);
+    }
+
+    #[test]
+    fn clipping_bounds_a_rectangle_to_a_window() {
+        let window = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let partly = Rect::new(-20.0, -10.0, 30.0, 40.0).clipped_to(window);
+        assert_eq!((partly.left, partly.top, partly.right, partly.bottom), (0.0, 0.0, 30.0, 40.0));
+        assert!(Rect::new(0.0, 200.0, 10.0, 300.0).clipped_to(window).is_empty());
+        assert!(Rect::EMPTY.is_empty());
     }
 
     #[test]

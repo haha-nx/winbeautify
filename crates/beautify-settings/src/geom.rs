@@ -1,106 +1,13 @@
-//! Float rectangles for UI layout.
+//! Geometry for the settings UI.
 //!
-//! [`beautify_core::geometry::Rect`] is integer and screen-oriented — it models
-//! monitor and taskbar bounds, where a half pixel is meaningless. A UI layout
-//! scaled by DPI does have half pixels, and rounding at every step accumulates
-//! into visibly misaligned text, so this is a separate type on purpose.
+//! The rectangle itself lives in `beautify_widget::layout`, because the widget
+//! bar's drawing primitives take it and having two float rectangles in one
+//! process means converting at every call site — and getting that wrong in one
+//! of them. What is specific to this crate is [`clamp`].
 
-/// A rectangle in logical device-independent units, already scaled to pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Rect {
-    pub left: f32,
-    pub top: f32,
-    pub right: f32,
-    pub bottom: f32,
-}
+pub use beautify_widget::layout::Rect;
 
-impl Rect {
-    pub const fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
-        Self {
-            left,
-            top,
-            right,
-            bottom,
-        }
-    }
-
-    /// An empty rectangle at the origin, used for "no such element".
-    pub const EMPTY: Rect = Rect {
-        left: 0.0,
-        top: 0.0,
-        right: 0.0,
-        bottom: 0.0,
-    };
-
-    pub fn width(&self) -> f32 {
-        self.right - self.left
-    }
-
-    pub fn height(&self) -> f32 {
-        self.bottom - self.top
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.width() <= 0.0 || self.height() <= 0.0
-    }
-
-    pub fn center_y(&self) -> f32 {
-        (self.top + self.bottom) * 0.5
-    }
-
-    /// Is `(x, y)` inside? Half-open on the right and bottom edges, so two
-    /// adjacent rectangles never both claim the pixel between them.
-    pub fn contains(&self, x: f32, y: f32) -> bool {
-        !self.is_empty() && x >= self.left && x < self.right && y >= self.top && y < self.bottom
-    }
-
-    /// Shrink on every side.
-    pub fn inset(&self, dx: f32, dy: f32) -> Rect {
-        Rect::new(
-            self.left + dx,
-            self.top + dy,
-            (self.right - dx).max(self.left + dx),
-            (self.bottom - dy).max(self.top + dy),
-        )
-    }
-
-    /// Move down by `dy` (negative moves up).
-    pub fn shifted(&self, dy: f32) -> Rect {
-        Rect::new(self.left, self.top + dy, self.right, self.bottom + dy)
-    }
-
-    /// Take `width` off the left edge, returning that strip.
-    pub fn take_left(&self, width: f32) -> Rect {
-        Rect::new(self.left, self.top, (self.left + width).min(self.right), self.bottom)
-    }
-
-    /// The right-hand `width` of this rectangle.
-    pub fn right_part(&self, width: f32) -> Rect {
-        Rect::new(
-            (self.right - width).max(self.left),
-            self.top,
-            self.right,
-            self.bottom,
-        )
-    }
-
-    /// A horizontal slice of height `height` from the top.
-    pub fn take_top(&self, height: f32) -> Rect {
-        Rect::new(self.left, self.top, self.right, (self.top + height).min(self.bottom))
-    }
-
-    /// Clamp to `other`, for deciding what is on screen.
-    pub fn clipped_to(&self, other: Rect) -> Rect {
-        Rect::new(
-            self.left.max(other.left),
-            self.top.max(other.top),
-            self.right.min(other.right),
-            self.bottom.min(other.bottom),
-        )
-    }
-}
-
-/// Clip a value into a range.
+/// Clip `value` into `min..=max`.
 pub fn clamp(value: f32, min: f32, max: f32) -> f32 {
     if max < min {
         return min;
@@ -132,7 +39,7 @@ mod tests {
     #[test]
     fn insetting_cannot_turn_a_rectangle_inside_out() {
         let rect = Rect::new(0.0, 0.0, 4.0, 4.0);
-        let squashed = rect.inset(10.0, 10.0);
+        let squashed = rect.inset_by(10.0, 10.0);
         assert_eq!(squashed.width(), 0.0);
         assert!(squashed.height() >= 0.0);
     }

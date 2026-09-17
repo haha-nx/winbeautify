@@ -18,9 +18,13 @@
 //! remaining work: see the module list above for what is done.
 
 pub mod access;
+pub mod controls;
 pub mod geom;
 pub mod layout;
+pub mod paint;
+pub mod palette;
 pub mod schema;
 
 pub use access::{read, toggle, write, Value};
+pub use controls::{Part, Parts};
 pub use schema::{ActionId, Button, Choice, Field, Format, Kind, Section, StatusKind, SECTIONS};
