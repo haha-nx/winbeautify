@@ -127,36 +127,49 @@ impl Host for FlyoutHost {
         entries
             .into_iter()
             .map(|entry| {
+                use beautify_clipboard::store::ClipKind as Kind;
                 let kind = match entry.kind {
-                    beautify_clipboard::store::ClipKind::Text => ClipKind::Text,
-                    beautify_clipboard::store::ClipKind::Link => ClipKind::Link,
-                    beautify_clipboard::store::ClipKind::Files => ClipKind::Files,
-                    beautify_clipboard::store::ClipKind::Image => ClipKind::Image,
+                    Kind::Text => ClipKind::Text,
+                    Kind::Link => ClipKind::Link,
+                    Kind::Files => ClipKind::Files,
+                    Kind::Image => ClipKind::Image,
                 };
-                let title = if entry.kind == beautify_clipboard::store::ClipKind::Image {
-                    // An image has no text of its own; the OCR result is the only
-                    // thing that can tell two screenshots apart at a glance.
-                    if entry.ocr_text.is_empty() {
-                        if entry.width > 0 {
-                            format!("图片 {}×{}", entry.width, entry.height)
-                        } else {
-                            "图片".to_string()
-                        }
-                    } else {
-                        entry.ocr_text.lines().next().unwrap_or("图片").to_string()
+                let when = relative_time(now - entry.created_at);
+                // What the row leads with. An image has no text of its own, so
+                // its size is the closest thing to a name it has.
+                let title = match entry.kind {
+                    Kind::Image if entry.width > 0 => {
+                        format!("{} × {}", entry.width, entry.height)
                     }
+                    Kind::Image => "图片".to_string(),
+                    _ => {
+                        let first = entry.preview.lines().next().unwrap_or("").trim();
+                        if first.is_empty() {
+                            "(空)".to_string()
+                        } else {
+                            first.to_string()
+                        }
+                    }
+                };
+                // Recognised text is the only way a screenshot is findable by a
+                // word that is inside it rather than in its label.
+                let ocr = if entry.kind == Kind::Image {
+                    entry.ocr_text.chars().take(400).collect()
                 } else {
-                    entry.preview.lines().next().unwrap_or("").to_string()
+                    String::new()
                 };
-                let subtitle = match entry.kind {
-                    beautify_clipboard::store::ClipKind::Image if entry.width > 0 => format!(
-                        "{} · {}",
-                        relative_time(now - entry.created_at),
-                        human_bytes(entry.bytes)
+                // The detail after the time is whatever a reader would use to
+                // tell two entries of this kind apart.
+                let meta = match entry.kind {
+                    Kind::Image => format!("{when} · {}", human_bytes(entry.bytes)),
+                    Kind::Files => format!(
+                        "{when} · {} 个文件",
+                        entry.text.lines().filter(|line| !line.trim().is_empty()).count()
                     ),
-                    _ => relative_time(now - entry.created_at),
+                    Kind::Link => format!("{when} · {}", link_host(&entry.text)),
+                    Kind::Text => format!("{when} · {} 字符", entry.text.chars().count()),
                 };
-                let pinned_to_screen = entry.kind == beautify_clipboard::store::ClipKind::Image
+                let pinned_to_screen = entry.kind == Kind::Image
                     && self
                         .fingerprint(entry.id, &entry.image_path)
                         .is_some_and(beautify_snip::is_pinned);
@@ -164,8 +177,11 @@ impl Host for FlyoutHost {
                     id: entry.id,
                     kind,
                     title,
-                    subtitle,
+                    ocr,
+                    meta,
                     image_path: entry.image_path,
+                    image_width: entry.width,
+                    image_height: entry.height,
                     favourite: entry.pinned,
                     pinned_to_screen,
                 }
@@ -405,6 +421,25 @@ fn relative_time(age_ms: i64) -> String {
         3600..=86_399 => format!("{} 小时前", seconds / 3600),
         86_400..=2_591_999 => format!("{} 天前", seconds / 86_400),
         _ => format!("{} 个月前", seconds / 2_592_000),
+    }
+}
+
+/// The host of a link, which is what a reader actually scans for.
+///
+/// No URL parser: what is wanted is the part between the scheme and the first
+/// path separator, and every hand-rolled parser is a source of disagreement
+/// about what a URL is.
+fn link_host(text: &str) -> String {
+    let trimmed = text.trim();
+    let rest = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if host.is_empty() {
+        trimmed.to_string()
+    } else {
+        host.to_string()
     }
 }
 

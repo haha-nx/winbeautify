@@ -46,7 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SETCURSOR, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::layout::{self, Hit, Metrics, Scene};
+use crate::layout::{self, Hit, Metrics, RowTarget, Scene};
 use crate::paint::{Icon, Interaction, Painter, Palette};
 use crate::{ClipRow, Host, Tab, TodoRow};
 
@@ -155,7 +155,7 @@ impl FlyoutWindow {
 
     fn handle(&self) -> Option<HWND> {
         let raw = self.hwnd.load(Ordering::Acquire);
-        (raw != 0).then(|| HWND(raw as *mut core::ffi::c_void))
+        (raw != 0).then_some(HWND(raw as *mut core::ffi::c_void))
     }
 }
 
@@ -245,17 +245,34 @@ impl Panel {
         let scene = layout::layout(
             beautify_widget::layout::Rect::new(0.0, 0.0, width as f32, height as f32),
             &self.metrics,
-            self.tab,
-            &self.clips,
-            &self.todos,
+            &layout::Rows::new(
+                self.tab,
+                &self.clips,
+                &self.todos,
+                self.stats,
+                &|text, width, px, max_lines| self.text_height(text, width, px, max_lines),
+            ),
             self.scroll,
-            self.stats,
         );
         // The clamp inside the layout is authoritative, so the offset cannot
         // drift past the end of the list.
         self.scroll = scene.scroll;
         self.draw(&scene);
         self.scene = Some(scene);
+    }
+
+    /// The height of a wrapped text block, measured with the font it is drawn in.
+    ///
+    /// Only two answers are ever needed, because every block is clamped: either
+    /// it fits on one line, or it takes the maximum the row allows. That makes
+    /// this one measurement per block instead of a line-by-line wrap, which
+    /// matters because the whole list is measured to size the scrollbar.
+    fn text_height(&self, text: &str, width: f32, px: f32, max_lines: usize) -> f32 {
+        let line = px * layout::LINE_SPACING;
+        let Some(painter) = self.painter.as_ref() else {
+            return line;
+        };
+        painter.text_height(text, width, px, max_lines).max(line)
     }
 
     fn draw(&mut self, scene: &Scene) {
@@ -316,20 +333,27 @@ impl Panel {
         }
         match scene.row_at(x, y) {
             Some(row) => {
+                let target = row.target;
                 if let Some(checkbox) = row.checkbox {
                     if checkbox.contains(x, y) {
-                        return Hit::Checkbox(row.index);
+                        if let RowTarget::Todo(index) = target {
+                            return Hit::Checkbox(index);
+                        }
                     }
                 }
                 for button in &row.buttons {
                     if button.rect.contains(x, y) {
                         return Hit::RowButton {
-                            row: row.index,
+                            target,
                             icon: button.icon,
                         };
                     }
                 }
-                Hit::Row(row.index)
+                // A section title is a label: clicking it does nothing.
+                if matches!(target, RowTarget::Heading(_)) {
+                    return Hit::Nothing;
+                }
+                Hit::Row(target)
             }
             None => Hit::Nothing,
         }
@@ -363,8 +387,8 @@ impl Panel {
                 }
                 self.refresh();
             }
-            Hit::RowButton { row, icon } => self.click_button(row, icon),
-            Hit::Row(index) => self.click_row(index),
+            Hit::RowButton { target, icon } => self.click_button(target, icon),
+            Hit::Row(target) => self.click_row(target),
             Hit::Nothing => {
                 self.commit_edit();
                 self.repaint();
@@ -372,21 +396,13 @@ impl Panel {
         }
     }
 
-    fn click_button(&mut self, row: usize, icon: Icon) {
-        match (self.tab, icon) {
-            (Tab::Clipboard, _) => {
-                let Some(entry) = self.clips.get(row).cloned() else {
+    fn click_button(&mut self, target: RowTarget, icon: Icon) {
+        match (target, icon) {
+            (RowTarget::Clip(index), _) => {
+                let Some(entry) = self.clips.get(index).cloned() else {
                     return;
                 };
                 match icon {
-                    Icon::Copy => {
-                        self.host.copy_clip(entry.id);
-                        // Copying is the point of the panel; staying open would
-                        // make the user close it every single time.
-                        self.commit_edit();
-                        self.hide();
-                        return;
-                    }
                     Icon::Star => self.host.set_favourite(entry.id, !entry.favourite),
                     Icon::Pin => {
                         let _ = self
@@ -394,42 +410,46 @@ impl Panel {
                             .toggle_pinned_to_screen(entry.id, &entry.image_path);
                     }
                     Icon::Delete => self.host.delete_clip(entry.id),
+                    Icon::Kind(_) => return,
                 }
             }
-            (Tab::Todo, Icon::Delete) => {
-                if let Some(task) = self.todos.get(row) {
+            (RowTarget::Todo(index), Icon::Delete) => {
+                if let Some(task) = self.todos.get(index) {
                     self.host.delete_todo(task.id);
                 }
             }
-            (Tab::Todo, _) => {}
+            _ => return,
         }
         self.refresh();
     }
 
-    fn click_row(&mut self, index: usize) {
-        match self.tab {
-            Tab::Clipboard => {
+    fn click_row(&mut self, target: RowTarget) {
+        match target {
+            RowTarget::Clip(index) => {
                 let Some(entry) = self.clips.get(index).cloned() else {
                     return;
                 };
+                // Copying is the point of the panel; staying open would make the
+                // user close it every single time.
                 self.host.copy_clip(entry.id);
                 self.commit_edit();
                 self.hide();
             }
             // Clicking a task's title puts the caret in it. Done/not-done is the
             // check box, which is a deliberate target rather than the whole row.
-            Tab::Todo => {
+            RowTarget::Todo(index) => {
                 let Some(task) = self.todos.get(index).cloned() else {
                     return;
                 };
                 self.commit_edit();
                 self.field_focused = false;
                 self.interaction.editing = false;
-                self.interaction.editing_row = Some(index);
+                self.interaction.editing_row = Some(target);
                 self.interaction.editing_text = task.title.clone();
                 self.editing_todo = Some((task.id, task.title));
                 self.repaint();
             }
+            RowTarget::Heading(_) => {}
         }
     }
 
@@ -499,12 +519,12 @@ impl Panel {
             Hit::Nothing
         };
         self.interaction.hover_row = match hit {
-            Hit::Row(index) | Hit::Checkbox(index) => Some(index),
-            Hit::RowButton { row, .. } => Some(row),
+            Hit::Row(target) | Hit::RowButton { target, .. } => Some(target),
+            Hit::Checkbox(index) => Some(RowTarget::Todo(index)),
             _ => None,
         };
         self.interaction.hover_button = match hit {
-            Hit::RowButton { row, icon } => Some((row, icon)),
+            Hit::RowButton { target, icon } => Some((target, icon)),
             _ => None,
         };
         self.interaction.hover_checkbox = match hit {
@@ -538,10 +558,13 @@ impl Panel {
             return;
         }
         let max = scene.scroll_max;
-        let step = match self.tab {
-            Tab::Clipboard => self.metrics.clip_row_height(),
-            Tab::Todo => self.metrics.todo_row_height(),
-        };
+        // Rows are as tall as their content, so the step comes from a row that
+        // is on screen rather than from a constant.
+        let step = scene
+            .rows
+            .first()
+            .map(|row| row.rect.height())
+            .unwrap_or_else(|| self.metrics.nominal_row());
         // Two rows a notch: one is too slow to be worth a wheel.
         self.scroll = (self.scroll - notches * step * 2.0).clamp(0.0, max);
         self.refresh();

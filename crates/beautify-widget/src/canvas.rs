@@ -255,6 +255,8 @@ struct CachedFormat {
     pixels: u32,
     weight: u32,
     alignment: i32,
+    wrapping: i32,
+    paragraph: i32,
     format: IDWriteTextFormat,
     /// How far the glyph ink sits above the centre of its line box.
     correction: f32,
@@ -286,13 +288,54 @@ impl TextEngine {
         weight: DWRITE_FONT_WEIGHT,
         alignment: DWRITE_TEXT_ALIGNMENT,
     ) -> Result<IDWriteTextFormat> {
-        let key = (px.max(1.0).to_bits(), weight.0 as u32, alignment.0);
-        if let Some(entry) = self
-            .cache
-            .borrow()
-            .iter()
-            .find(|e| e.pixels == key.0 && e.weight == key.1 && e.alignment == key.2)
-        {
+        self.cached(
+            px,
+            weight,
+            alignment,
+            DWRITE_WORD_WRAPPING_NO_WRAP,
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+        )
+    }
+
+    /// A format for a block of text that may take several lines: it wraps, and
+    /// it starts at the top of its box.
+    ///
+    /// Both differences matter. [`Self::format`] does not wrap, which is right
+    /// for a label that must not silently become two lines, and it centres the
+    /// paragraph, which for a block one line too tall would clip the first line
+    /// and the last one instead of just the last.
+    pub fn block_format(&self, px: f32, weight: DWRITE_FONT_WEIGHT) -> Result<IDWriteTextFormat> {
+        self.cached(
+            px,
+            weight,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+            DWRITE_WORD_WRAPPING_WRAP,
+            DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+        )
+    }
+
+    fn cached(
+        &self,
+        px: f32,
+        weight: DWRITE_FONT_WEIGHT,
+        alignment: DWRITE_TEXT_ALIGNMENT,
+        wrapping: DWRITE_WORD_WRAPPING,
+        paragraph: DWRITE_PARAGRAPH_ALIGNMENT,
+    ) -> Result<IDWriteTextFormat> {
+        let key = (
+            px.max(1.0).to_bits(),
+            weight.0 as u32,
+            alignment.0,
+            wrapping.0,
+            paragraph.0,
+        );
+        if let Some(entry) = self.cache.borrow().iter().find(|e| {
+            e.pixels == key.0
+                && e.weight == key.1
+                && e.alignment == key.2
+                && e.wrapping == key.3
+                && e.paragraph == key.4
+        }) {
             return Ok(entry.format.clone());
         }
 
@@ -309,15 +352,17 @@ impl TextEngine {
         };
         let format = build(w!("Segoe UI Variable Text")).or_else(|_| build(w!("Segoe UI")))?;
         unsafe {
-            format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+            format.SetWordWrapping(wrapping)?;
             format.SetTextAlignment(alignment)?;
-            format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            format.SetParagraphAlignment(paragraph)?;
         }
         let correction = self.measure_correction(&format, px.max(1.0));
         self.cache.borrow_mut().push(CachedFormat {
             pixels: key.0,
             weight: key.1,
             alignment: key.2,
+            wrapping: key.3,
+            paragraph: key.4,
             format: format.clone(),
             correction,
         });

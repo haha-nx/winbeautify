@@ -22,9 +22,8 @@ use beautify_widget::canvas::{Canvas, TextEngine};
 use beautify_widget::layout::Rect;
 use beautify_widget::theme::Rgba;
 
-use crate::layout::{Metrics, Scene};
-use crate::{ClipRow, TodoRow};
-use crate::Tab;
+use crate::layout::{Heading, Metrics, Row, RowTarget, Scene, LINE_SPACING};
+use crate::{ClipKind, ClipRow, Tab, TodoRow};
 
 const LABEL_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_NORMAL;
 const TITLE_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_SEMI_BOLD;
@@ -38,19 +37,24 @@ const THUMBNAIL_CACHE: usize = 24;
 /// An icon drawn as geometry, so no icon font is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
-    Copy,
     Star,
     Pin,
     Delete,
+    /// What a clipboard entry is, drawn on its badge.
+    ///
+    /// Drawn rather than lettered: three letters in a 20-pixel square do not fit
+    /// ("FILE" was wider than its own badge), and what a reader recognises here
+    /// is the shape, not the word.
+    Kind(ClipKind),
 }
 
 /// What the pointer and keyboard are doing.
 #[derive(Debug, Clone, Default)]
 pub struct Interaction {
     /// The row under the pointer.
-    pub hover_row: Option<usize>,
+    pub hover_row: Option<RowTarget>,
     /// The icon under the pointer, with the row it belongs to.
-    pub hover_button: Option<(usize, Icon)>,
+    pub hover_button: Option<(RowTarget, Icon)>,
     pub hover_tab: Option<Tab>,
     pub hover_close: bool,
     pub hover_footer: bool,
@@ -60,7 +64,7 @@ pub struct Interaction {
     pub editing: bool,
     pub editing_text: String,
     /// A row's title is being edited in place.
-    pub editing_row: Option<usize>,
+    pub editing_row: Option<RowTarget>,
 }
 
 /// The colours, resolved from the app's theme.
@@ -278,7 +282,6 @@ impl Painter {
                     metrics,
                     palette,
                     interaction,
-                    placeholder,
                 );
             }
             if scene.rows.is_empty() {
@@ -296,7 +299,7 @@ impl Painter {
         })?;
 
         self.draw_footer(canvas, scene, metrics, palette, interaction, stats);
-        self.draw_scrollbar(canvas, scene, metrics, palette);
+        self.draw_scrollbar(canvas, scene, palette);
         Ok(())
     }
 
@@ -395,6 +398,56 @@ impl Painter {
         }
     }
 
+    /// A section title: a quiet label over the rows it introduces.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_heading(
+        &self,
+        canvas: &Canvas<'_>,
+        scene: &Scene,
+        row: &Row,
+        heading: Heading,
+        todos: &[TodoRow],
+        metrics: &Metrics,
+        palette: &Palette,
+    ) {
+        self.divider(canvas, scene, row, metrics, palette);
+        let Ok(format) = self.text.format(metrics.meta_size(), TITLE_WEIGHT) else {
+            return;
+        };
+        // Counted from the tasks rather than from the visible rows: the number
+        // is the section's size, not how much of it fits on screen.
+        let count = todos
+            .iter()
+            .filter(|task| task.done == (heading == Heading::Done))
+            .count();
+        let label = format!("{} · {count}", heading.label());
+        self.text_in(canvas, row.title, &label, &format, palette.text_faint);
+    }
+
+    /// The hairline between two rows, inset so the list reads as a list rather
+    /// than as a table.
+    fn divider(
+        &self,
+        canvas: &Canvas<'_>,
+        scene: &Scene,
+        row: &Row,
+        metrics: &Metrics,
+        palette: &Palette,
+    ) {
+        if row.rect.top <= scene.list.top + 1.0 {
+            return;
+        }
+        canvas.fill_rect(
+            Rect::new(
+                row.rect.left + metrics.padding(),
+                row.rect.top,
+                row.rect.right - metrics.padding(),
+                row.rect.top + 1.0,
+            ),
+            palette.divider,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn draw_row(
         &mut self,
@@ -402,171 +455,264 @@ impl Painter {
         scene: &Scene,
         clips: &[ClipRow],
         todos: &[TodoRow],
-        row: &crate::layout::Row,
+        row: &Row,
         metrics: &Metrics,
         palette: &Palette,
         interaction: &Interaction,
-        placeholder: &str,
     ) {
-        let hovered = interaction.hover_row == Some(row.index);
-        if hovered {
+        if let RowTarget::Heading(heading) = row.target {
+            self.draw_heading(canvas, scene, row, heading, todos, metrics, palette);
+            return;
+        }
+        if interaction.hover_row == Some(row.target) {
             canvas.fill_rect(row.rect, palette.hover);
         }
-        // A hairline between rows, inset so it reads as a list rather than a
-        // table.
-        if row.index > 0 {
-            canvas.fill_rect(
-                Rect::new(
-                    row.rect.left + metrics.padding(),
-                    row.rect.top,
-                    row.rect.right - metrics.padding(),
-                    row.rect.top + 1.0,
-                ),
-                palette.divider,
-            );
+        self.divider(canvas, scene, row, metrics, palette);
+
+        match row.target {
+            RowTarget::Todo(index) => {
+                self.draw_checkbox(canvas, row, todos.get(index), metrics, palette)
+            }
+            RowTarget::Clip(index) => {
+                if let Some(badge) = row.badge {
+                    let kind = clips.get(index).map(|entry| entry.kind);
+                    if let Some(kind) = kind {
+                        self.draw_badge(canvas, badge, kind, metrics, palette);
+                    }
+                }
+                if let Some(entry) = clips.get(index) {
+                    self.draw_thumbnail(canvas, row, entry, metrics, palette);
+                }
+            }
+            RowTarget::Heading(_) => {}
         }
 
-        if let Some(box_rect) = row.checkbox {
-            let done = todos.get(row.index).is_some_and(|task| task.done);
-            if done {
-                canvas.fill_rounded(box_rect, metrics.px(4.0), palette.accent);
-                // A tick, not just a filled box: "done" has to be readable at a
-                // glance down a list.
-                let tick = [
-                    (box_rect.left + box_rect.width() * 0.24, box_rect.center_y()),
-                    (box_rect.left + box_rect.width() * 0.44, box_rect.bottom - box_rect.height() * 0.28),
-                    (box_rect.right - box_rect.width() * 0.22, box_rect.top + box_rect.height() * 0.3),
-                ];
-                let _ = canvas.stroke_polyline(
-                    &self.factory,
-                    &tick,
-                    (0.0, 0.0),
-                    palette.on_accent,
-                    metrics.px(1.8),
-                );
-            } else {
-                canvas.fill_rounded(box_rect, metrics.px(4.0), palette.control);
-                canvas.stroke_rounded(box_rect, metrics.px(4.0), palette.control_border, 1.0);
-            }
-        }
-        if let Err(e) =
-            self.draw_row_text(canvas, scene, clips, todos, row, metrics, palette, interaction, placeholder)
+        if let Err(e) = self.draw_row_text(canvas, clips, todos, row, metrics, palette, interaction)
         {
             tracing::debug!("a row could not be drawn: {e}");
         }
 
         for button in &row.buttons {
-            let lit = interaction.hover_button == Some((row.index, button.icon));
+            let lit = interaction.hover_button == Some((row.target, button.icon));
             if lit {
                 canvas.fill_rounded(button.rect, metrics.px(5.0), palette.hover);
             }
             let colour = match (button.icon, button.active) {
+                (Icon::Kind(_), _) => palette.text_dim,
                 (Icon::Star, true) => palette.favourite,
                 (Icon::Pin, true) => palette.accent,
-                (Icon::Delete, true) => palette.danger,
                 (_, _) if lit => palette.text,
-                _ => palette.text_dim,
+                // Always visible, always quiet: these were hover-only in the
+                // webview panel, which made them something to find rather than
+                // something to use.
+                _ => palette.text_faint,
             };
             let _ = self.draw_icon(canvas, button.icon, button.rect, colour, metrics, button.active);
         }
     }
 
-    /// The title and subtitle, or the in-place editor when the title is being
-    /// edited.
+    /// The tick box of a task row.
+    fn draw_checkbox(
+        &self,
+        canvas: &Canvas<'_>,
+        row: &Row,
+        task: Option<&TodoRow>,
+        metrics: &Metrics,
+        palette: &Palette,
+    ) {
+        let Some(box_rect) = row.checkbox else {
+            return;
+        };
+        let done = task.is_some_and(|task| task.done);
+        if done {
+            canvas.fill_rounded(box_rect, metrics.px(4.0), palette.accent);
+            // A tick, not just a filled box: "done" has to be readable at a
+            // glance down a list.
+            let tick = [
+                (
+                    box_rect.left + box_rect.width() * 0.24,
+                    box_rect.center_y(),
+                ),
+                (
+                    box_rect.left + box_rect.width() * 0.44,
+                    box_rect.bottom - box_rect.height() * 0.28,
+                ),
+                (
+                    box_rect.right - box_rect.width() * 0.22,
+                    box_rect.top + box_rect.height() * 0.3,
+                ),
+            ];
+            let _ = canvas.stroke_polyline(
+                &self.factory,
+                &tick,
+                (0.0, 0.0),
+                palette.on_accent,
+                metrics.px(1.8),
+            );
+        } else {
+            canvas.fill_rounded(box_rect, metrics.px(4.0), palette.control);
+            canvas.stroke_rounded(box_rect, metrics.px(4.0), palette.control_border, 1.0);
+        }
+    }
+
+    /// An image's thumbnail, inside the box the layout made for it.
+    fn draw_thumbnail(
+        &mut self,
+        canvas: &Canvas<'_>,
+        row: &Row,
+        entry: &ClipRow,
+        metrics: &Metrics,
+        palette: &Palette,
+    ) {
+        let Some(bounds) = row.thumbnail else {
+            return;
+        };
+        let radius = metrics.px(5.0);
+        canvas.fill_rounded(bounds, radius, palette.control);
+        if let Some(bitmap) = self.thumbnail(&entry.image_path) {
+            let size = unsafe { bitmap.GetSize() };
+            let fitted = fit_into((size.width, size.height), bounds);
+            // The image is letterboxed inside the box and clipped to it, so a
+            // portrait screenshot reads as a picture rather than a smear.
+            let _ = canvas.clipped(bounds, || self.draw_bitmap(canvas, &bitmap, fitted, bounds, radius));
+        }
+        canvas.stroke_rounded(bounds, radius, palette.control_border, 1.0);
+    }
+
+    /// The title, the recognised text and the meta line — or the in-place editor
+    /// when a task is being renamed.
     #[allow(clippy::too_many_arguments)]
     fn draw_row_text(
         &mut self,
         canvas: &Canvas<'_>,
-        scene: &Scene,
         clips: &[ClipRow],
         todos: &[TodoRow],
-        row: &crate::layout::Row,
+        row: &Row,
         metrics: &Metrics,
         palette: &Palette,
         interaction: &Interaction,
-        placeholder: &str,
     ) -> Result<()> {
-        let title_format = self.text.format(metrics.title_size(), LABEL_WEIGHT)?;
-        let small_format = self.text.format(metrics.small_size(), LABEL_WEIGHT)?;
-
-        // The thumbnail, or the kind badge when there is no image to show.
-        let kind = clips
-            .get(row.index)
-            .map(|entry| entry.kind)
-            .unwrap_or(crate::ClipKind::Text);
-
-        // The thumbnail, or the kind badge when there is no image to show. A
-        // task row has neither: its left-hand column is its check box, which the
-        // badge would otherwise be drawn straight over.
-        let shown = (scene.tab == Tab::Clipboard)
-            .then_some(())
-            .and_then(|_| row.thumbnail)
-            .and_then(|thumb| clips.get(row.index).map(|entry| (thumb, entry)))
-            .and_then(|(thumb, entry)| {
-                let bitmap = self.thumbnail(&entry.image_path)?;
-                let size = unsafe { bitmap.GetSize() };
-                let fitted = fit_into((size.width, size.height), thumb);
-                let radius = metrics.px(4.0);
-                Some((bitmap, fitted, thumb, radius))
-            });
-        match shown {
-            Some((bitmap, fitted, bounds, radius)) => {
-                // The image is letterboxed inside the square and clipped to it,
-                // so a wide screenshot reads as a picture rather than a smear.
-                canvas.clipped(bounds, || {
-                    self.draw_bitmap(canvas, &bitmap, fitted, bounds, radius)
-                })?;
+        let editing = interaction.editing_row == Some(row.target);
+        match row.target {
+            RowTarget::Heading(_) => Ok(()),
+            RowTarget::Todo(index) => {
+                let task = todos.get(index);
+                let done = task.is_some_and(|task| task.done);
+                let (text, colour) = if editing {
+                    (interaction.editing_text.as_str(), palette.accent)
+                } else {
+                    (
+                        task.map(|task| task.title.as_str()).unwrap_or_default(),
+                        if done { palette.text_faint } else { palette.text },
+                    )
+                };
+                self.text_block(
+                    canvas,
+                    row.title,
+                    text,
+                    metrics.todo_size(),
+                    LABEL_WEIGHT,
+                    colour,
+                );
+                Ok(())
             }
-            None if scene.tab == Tab::Clipboard => {
-                self.draw_badge(canvas, row.badge, kind, metrics, palette)
-            }
-            None => {}
-        }
-
-        let done = scene.tab == Tab::Todo
-            && todos.get(row.index).is_some_and(|task| task.done);
-        let (title, colour) = if interaction.editing_row == Some(row.index) {
-            (interaction.editing_text.as_str(), palette.accent)
-        } else {
-            (
-                match scene.tab {
-                    Tab::Clipboard => clips.get(row.index).map(|entry| entry.title.as_str()),
-                    Tab::Todo => todos.get(row.index).map(|task| task.title.as_str()),
+            RowTarget::Clip(index) => {
+                let Some(entry) = clips.get(index) else {
+                    return Ok(());
+                };
+                self.text_block(
+                    canvas,
+                    row.title,
+                    &entry.title,
+                    metrics.title_size(),
+                    LABEL_WEIGHT,
+                    palette.text,
+                );
+                if let Some(rect) = row.ocr {
+                    self.text_block(
+                        canvas,
+                        rect,
+                        &entry.ocr,
+                        metrics.ocr_size(),
+                        LABEL_WEIGHT,
+                        palette.text_dim,
+                    );
                 }
-                .unwrap_or(placeholder),
-                if done { palette.text_faint } else { palette.text },
-            )
-        };
-        self.text_in(canvas, row.title, title, &title_format, colour);
-        let subtitle = clips
-            .get(row.index)
-            .map(|entry| entry.subtitle.as_str())
-            .unwrap_or("");
-        self.text_in(canvas, row.subtitle, subtitle, &small_format, palette.text_faint);
-        Ok(())
+                if let Some(rect) = row.meta {
+                    let format = self.text.format(metrics.meta_size(), LABEL_WEIGHT)?;
+                    self.text_in(canvas, rect, &entry.meta, &format, palette.text_faint);
+                }
+                Ok(())
+            }
+        }
     }
 
-    /// The small `TXT`/`IMG` badge that stands in for a thumbnail.
+    /// The height a wrapped block of `text` needs, clamped to `max_lines`.
+    ///
+    /// The counterpart of [`Self::text_block`], and the reason the two cannot
+    /// disagree: a block is either one line or every line the row allows, so the
+    /// measurement is a single width comparison rather than a line-by-line wrap.
+    /// That matters because the whole list is measured to size the scrollbar,
+    /// and only the rows on screen are ever drawn.
+    pub fn text_height(&self, text: &str, width: f32, px: f32, max_lines: usize) -> f32 {
+        if text.is_empty() || width <= 0.0 {
+            return 0.0;
+        }
+        let max = max_lines.max(1);
+        // A hard line break is a line whatever the width says.
+        let hard = text.matches('\n').count() + 1;
+        let lines = if hard > 1 {
+            hard
+        } else {
+            match self.text.format(px, DWRITE_FONT_WEIGHT_NORMAL) {
+                Ok(format) if self.text.measure(text, &format, 4096.0) <= width => 1,
+                _ => max,
+            }
+        };
+        lines.min(max).max(1) as f32 * px * LINE_SPACING
+    }
+
+    /// A block of text that may take more than one line.
+    ///
+    /// Drawn with a wrapping format of its own rather than joined with newlines:
+    /// word wrapping is the only thing that breaks Chinese text, which has no
+    /// spaces to break at, and the block is top-aligned so a line too many is
+    /// clipped cleanly at the bottom instead of at both ends.
+    ///
+    /// No trimming: the rectangle is exactly as tall as the lines the layout
+    /// paid for, so anything past `max_lines` falls outside it and is dropped by
+    /// the clip rather than drawn half a glyph high.
+    #[allow(clippy::too_many_arguments)]
+    fn text_block(
+        &self,
+        canvas: &Canvas<'_>,
+        rect: Rect,
+        text: &str,
+        size: f32,
+        weight: DWRITE_FONT_WEIGHT,
+        colour: Rgba,
+    ) {
+        if text.is_empty() || rect.is_empty() {
+            return;
+        }
+        let Ok(format) = self.text.block_format(size, weight) else {
+            return;
+        };
+        canvas.text(text, &format, rect, colour, 0.0);
+    }
+
+    /// The small badge that says what kind of entry a row is.
     fn draw_badge(
         &self,
         canvas: &Canvas<'_>,
         rect: Rect,
-        kind: crate::ClipKind,
+        kind: ClipKind,
         metrics: &Metrics,
         palette: &Palette,
     ) {
         canvas.fill_rounded(rect, metrics.px(5.0), palette.control);
         canvas.stroke_rounded(rect, metrics.px(5.0), palette.control_border, 1.0);
-        let Ok(format) = self.text.format_aligned(
-            metrics.small_size(),
-            TITLE_WEIGHT,
-            DWRITE_TEXT_ALIGNMENT_CENTER,
-        ) else {
-            return;
-        };
-        // The picture is the row's own; the kind is only worth a word when there
-        // is nothing to show instead.
-        self.text_in(canvas, rect, kind.badge(), &format, palette.text_dim);
+        let _ = self.draw_icon(canvas, Icon::Kind(kind), rect, palette.text_dim, metrics, false);
     }
 
     fn draw_footer(
@@ -578,7 +724,7 @@ impl Painter {
         interaction: &Interaction,
         stats: (i64, i64),
     ) {
-        let Ok(format) = self.text.format(metrics.small_size(), LABEL_WEIGHT) else {
+        let Ok(format) = self.text.format(metrics.meta_size(), LABEL_WEIGHT) else {
             return;
         };
         let text = match scene.tab {
@@ -607,7 +753,7 @@ impl Painter {
             );
             // Centred in its button: text in a drawn box belongs in the middle.
             if let Ok(centred) = self.text.format_aligned(
-                metrics.small_size(),
+                metrics.meta_size(),
                 LABEL_WEIGHT,
                 DWRITE_TEXT_ALIGNMENT_CENTER,
             ) {
@@ -616,17 +762,10 @@ impl Painter {
         }
     }
 
-    fn draw_scrollbar(
-        &self,
-        canvas: &Canvas<'_>,
-        scene: &Scene,
-        metrics: &Metrics,
-        palette: &Palette,
-    ) {
+    fn draw_scrollbar(&self, canvas: &Canvas<'_>, scene: &Scene, palette: &Palette) {
         if scene.scroll_max <= 0.0 {
             return;
         }
-        let _ = metrics;
         canvas.fill_rounded(
             scene.scrollbar,
             scene.scrollbar.width() * 0.5,
@@ -645,29 +784,10 @@ impl Painter {
         filled: bool,
     ) -> Result<()> {
         let centre = ((rect.left + rect.right) * 0.5, rect.center_y());
-        let arm = metrics.px(7.0);
+        let arm = metrics.px(6.0);
         let thin = metrics.px(1.5);
         match icon {
-            Icon::Delete => self.draw_cross(canvas, rect, colour, arm, thin)?,
-            Icon::Copy => {
-                // Two sheets, the front one offset.
-                let offset = metrics.px(3.0);
-                let size = arm * 1.6;
-                let back = Rect::new(
-                    centre.0 - size * 0.5 - offset,
-                    centre.1 - size * 0.5 - offset,
-                    centre.0 + size * 0.5 - offset,
-                    centre.1 + size * 0.5 - offset,
-                );
-                let front = Rect::new(
-                    centre.0 - size * 0.5 + offset,
-                    centre.1 - size * 0.5 + offset,
-                    centre.0 + size * 0.5 + offset,
-                    centre.1 + size * 0.5 + offset,
-                );
-                canvas.stroke_rounded(front, metrics.px(2.0), colour, thin);
-                canvas.stroke_rounded(back, metrics.px(2.0), colour.with_alpha(0.5), thin);
-            }
+            Icon::Delete => self.draw_cross(canvas, rect, colour, metrics.px(5.0), thin)?,
             Icon::Star => {
                 let points = star_points(centre, arm, arm * 0.42);
                 if filled {
@@ -695,6 +815,112 @@ impl Painter {
                     ),
                     colour,
                 );
+            }
+            Icon::Kind(kind) => self.draw_kind(canvas, kind, rect, colour, metrics)?,
+        }
+        Ok(())
+    }
+
+    /// The kind glyph, inside the badge it is drawn on.
+    fn draw_kind(
+        &self,
+        canvas: &Canvas<'_>,
+        kind: ClipKind,
+        rect: Rect,
+        colour: Rgba,
+        metrics: &Metrics,
+    ) -> Result<()> {
+        let inner = rect.inset_by(metrics.px(5.5), metrics.px(5.5));
+        let bar = (inner.height() * 0.16).max(1.0);
+        match kind {
+            // Three lines of text.
+            ClipKind::Text => {
+                for (index, width) in [1.0f32, 1.0, 0.6].into_iter().enumerate() {
+                    let top = inner.top + inner.height() * (0.08 + 0.42 * index as f32);
+                    canvas.fill_rect(
+                        Rect::new(
+                            inner.left,
+                            top,
+                            inner.left + inner.width() * width,
+                            top + bar,
+                        ),
+                        colour,
+                    );
+                }
+            }
+            // A diagonal arrow leaving the corner: what a link does.
+            ClipKind::Link => {
+                let thickness = bar * 1.5;
+                canvas.fill_polygon(
+                    &self.factory,
+                    &bar_points(
+                        ((inner.left + inner.right) * 0.5, inner.center_y()),
+                        inner.width() * 0.44,
+                        thickness,
+                        -1.0,
+                    ),
+                    (0.0, 0.0),
+                    colour,
+                )?;
+                canvas.fill_polygon(
+                    &self.factory,
+                    &[
+                        (inner.right, inner.top),
+                        (inner.right - inner.width() * 0.60, inner.top),
+                        (inner.right, inner.top + inner.height() * 0.60),
+                    ],
+                    (0.0, 0.0),
+                    colour,
+                )?;
+            }
+            // A folder: a tab on the left, an outlined body under it.
+            ClipKind::Files => {
+                canvas.fill_rounded(
+                    Rect::new(
+                        inner.left,
+                        inner.top + inner.height() * 0.08,
+                        inner.left + inner.width() * 0.46,
+                        inner.top + inner.height() * 0.36,
+                    ),
+                    metrics.px(1.5),
+                    colour,
+                );
+                canvas.stroke_rounded(
+                    Rect::new(
+                        inner.left,
+                        inner.top + inner.height() * 0.28,
+                        inner.right,
+                        inner.bottom,
+                    ),
+                    metrics.px(1.5),
+                    colour,
+                    bar * 0.7,
+                );
+            }
+            // A picture: a frame, a sun and a hill.
+            ClipKind::Image => {
+                canvas.stroke_rounded(inner, metrics.px(1.5), colour, bar * 0.8);
+                let sun = bar * 1.6;
+                canvas.fill_rounded(
+                    Rect::new(
+                        inner.left + inner.width() * 0.16,
+                        inner.top + inner.height() * 0.16,
+                        inner.left + inner.width() * 0.16 + sun,
+                        inner.top + inner.height() * 0.16 + sun,
+                    ),
+                    sun * 0.5,
+                    colour,
+                );
+                canvas.fill_polygon(
+                    &self.factory,
+                    &[
+                        (inner.left + bar, inner.bottom - bar),
+                        (inner.left + inner.width() * 0.44, inner.top + inner.height() * 0.46),
+                        (inner.right - bar, inner.bottom - bar),
+                    ],
+                    (0.0, 0.0),
+                    colour,
+                )?;
             }
         }
         Ok(())

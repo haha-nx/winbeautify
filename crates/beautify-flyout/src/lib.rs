@@ -26,7 +26,7 @@ pub mod window;
 
 use std::sync::Arc;
 
-pub use layout::{Hit, Metrics, Row, Scene};
+pub use layout::{Heading, Hit, Metrics, Row, RowTarget, Rows, Scene, DEFAULT_SIZE};
 pub use paint::{Interaction, Palette};
 pub use window::{scaled_size, FlyoutWindow};
 
@@ -59,32 +59,36 @@ pub enum ClipKind {
 }
 
 impl ClipKind {
-    /// The three letters shown when there is no thumbnail to show instead.
-    pub const fn badge(self) -> &'static str {
-        match self {
-            ClipKind::Text => "TXT",
-            ClipKind::Link => "URL",
-            ClipKind::Files => "FILE",
-            ClipKind::Image => "IMG",
-        }
-    }
-
     pub const fn is_image(self) -> bool {
         matches!(self, ClipKind::Image)
     }
 }
 
 /// One row of the clipboard list, as the host presents it.
+///
+/// Three pieces of text rather than one, because a row shows them differently:
+/// the preview is the entry, the recognised text is a hint about it, and the
+/// meta line is what the reader scans when looking for "the one from ten
+/// minutes ago". Folding them into one string is how the time came to be the
+/// only thing under a forty-character sentence.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClipRow {
     pub id: i64,
     pub kind: ClipKind,
-    /// The line the row shows.
+    /// The line the row leads with: the entry's first line, or an image's
+    /// pixel size.
     pub title: String,
-    /// Time and size, under the title.
-    pub subtitle: String,
+    /// Text recognised inside an image, shown dimmer under the preview. Empty
+    /// when there is none.
+    pub ocr: String,
+    /// Time and the per-kind detail: "3 分钟前 · 2.1 MB", "12 分钟前 · 40 字符".
+    pub meta: String,
     /// Absolute path to the stored `.bmp`, for images.
     pub image_path: String,
+    /// The image's own size, for working out how tall its thumbnail is. Zero
+    /// when the entry is not an image or the size was never recorded.
+    pub image_width: i32,
+    pub image_height: i32,
     /// Favourite, which also protects it from being cleared.
     pub favourite: bool,
     /// On screen as a pinned image right now.
