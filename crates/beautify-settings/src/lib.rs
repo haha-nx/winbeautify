@@ -9,10 +9,17 @@
 //!   with its label, hint, control kind and visibility rule. Nothing here knows
 //!   how it will be drawn.
 //! * [`access`] — reading and writing a field by its config path.
+//! * [`geom`] — the float rectangle the layout works in.
+//! * [`layout`] — turning the schema into rectangles. Pure arithmetic, tested
+//!   on its own; the painter and the hit tester both read its output so they
+//!   cannot disagree.
 //!
-//! The window itself (layout, painting, input) is built on top of those.
+//! The window itself (painting, input) is built on top of those, and is the
+//! remaining work: see the module list above for what is done.
 
 pub mod access;
+pub mod geom;
+pub mod layout;
 pub mod schema;
 
 pub use access::{read, toggle, write, Value};
