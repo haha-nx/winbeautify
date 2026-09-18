@@ -12,3 +12,6 @@
 *.log
 
 /docs
+# Local test deployment (app + TAP DLL + debug log/flag) and crash dumps.
+/dist
+/dumps

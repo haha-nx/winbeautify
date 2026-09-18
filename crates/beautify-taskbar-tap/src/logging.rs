@@ -35,6 +35,9 @@ const SLOTS: usize = 256;
 /// Bytes kept per line. Longer messages are truncated rather than allocating.
 const TEXT_MAX: usize = 256;
 
+/// Room for a whole log line: timestamp, separator, text, newline.
+const LINE_MAX: usize = TEXT_MAX + 32;
+
 /// Flag file, next to the DLL, that turns logging on.
 pub const FLAG_FILE: &str = "wb_tap_debug.flag";
 
@@ -93,6 +96,9 @@ static READ_TICKET: AtomicU64 = AtomicU64::new(0);
 /// Set once, by [`start`], when the flag file is present.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Where [`start`] decided to write, for the panic hook.
+static LOG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 /// Log a fixed message. Allocation-free and lock-free.
 pub fn debug_log(message: &str) {
     if !ENABLED.load(Ordering::Relaxed) {
@@ -107,11 +113,43 @@ pub fn debug_log_fmt(args: core::fmt::Arguments) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    let mut buffer = StackBuffer::new();
+    let mut buffer = StackBuffer::<TEXT_MAX>::new();
     // Running out of room in a fixed buffer is not worth reporting: saying so
     // would need a second buffer.
     let _ = core::fmt::Write::write_fmt(&mut buffer, args);
     push(buffer.filled());
+}
+
+/// Write a line straight to the log, without going through the ring.
+///
+/// For the handful of places where the process may die immediately afterwards
+/// (the panic hook, the one-off vtable dump before the framework is called): a
+/// line that waits for the logger thread to wake up is a line that never gets
+/// written. Allocates and takes a file handle, so it is not for COM entry
+/// points — the caller passes an already-formatted string for the same reason.
+pub fn debug_log_sync(message: &str) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(path) = LOG_PATH.get() {
+        write_line_now(path, message);
+    }
+}
+
+/// [`debug_log_sync`] with the message formatted into a stack buffer, so the
+/// caller allocates nothing. Used by the `QueryInterface` trace, which has to
+/// survive a crash that may follow within microseconds.
+pub fn debug_log_fmt_sync(args: core::fmt::Arguments) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut buffer = StackBuffer::<TEXT_MAX>::new();
+    let _ = core::fmt::Write::write_fmt(&mut buffer, args);
+    if let Ok(text) = core::str::from_utf8(buffer.filled()) {
+        if let Some(path) = LOG_PATH.get() {
+            write_line_now(path, text);
+        }
+    }
 }
 
 /// Resolve where the log goes and, if the flag file is present, start the logger
@@ -127,10 +165,64 @@ pub fn start() {
         return;
     }
     let path = dir.join(LOG_FILE);
+    let _ = LOG_PATH.set(path.clone());
+    // A panic has to be visible even when it ends the process a moment later:
+    // the default hook writes to stderr, and explorer has no stderr.
+    install_panic_hook();
     ENABLED.store(true, Ordering::Release);
+    // Names the writer: after an explorer restart the previous process's logger
+    // and this one both append to the same file for a moment.
+    debug_log_fmt(format_args!(
+        "logger started: pid {} dir {}",
+        std::process::id(),
+        dir.display()
+    ));
     let _ = std::thread::Builder::new()
         .name("wb-tap-log".into())
         .spawn(move || logger_loop(path));
+}
+
+/// Report a panic synchronously, without going through the ring: the panic is
+/// about to abort the process (it unwinds out of an `extern "system"` boundary,
+/// and that process is explorer), so the logger thread may never run again.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let text = payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "opaque panic".into());
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "unknown location".into());
+        let line = format!("PANIC at {location}: {text}");
+        if let Some(path) = LOG_PATH.get() {
+            write_line_now(path, &line);
+        }
+    }));
+}
+
+/// Append one line to the log and mirror it to the debugger, immediately.
+fn write_line_now(path: &Path, text: &str) {
+    unsafe {
+        use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
+        let wide: Vec<u16> = format!("wb-tap: {text}").encode_utf16().chain([0]).collect();
+        OutputDebugStringW(windows::core::PCWSTR(wide.as_ptr()));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{stamp} {text}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +318,7 @@ fn report_drops(dropped: &mut u64, path: &Path) {
     if *dropped == 0 {
         return;
     }
-    let mut buffer = StackBuffer::new();
+    let mut buffer = StackBuffer::<TEXT_MAX>::new();
     let _ = core::fmt::Write::write_fmt(
         &mut buffer,
         format_args!("<{} log lines dropped: logger fell behind>", *dropped),
@@ -261,13 +353,21 @@ fn emit(text: &[u8], path: &Path) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    // One `write_all` per line: explorer restarts can leave two loggers
+    // appending to the same file, and a line torn across two writes would be
+    // unreadable exactly when the log matters most.
+    let mut line = StackBuffer::<LINE_MAX>::new();
+    let _ = core::fmt::Write::write_fmt(
+        &mut line,
+        format_args!("{stamp} {}\n", String::from_utf8_lossy(text)),
+    );
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
         use std::io::Write;
-        let _ = writeln!(file, "{stamp} {}", String::from_utf8_lossy(text));
+        let _ = file.write_all(line.filled());
     }
 }
 
@@ -297,15 +397,15 @@ fn module_dir() -> Option<PathBuf> {
 }
 
 /// A `core::fmt::Write` sink over a fixed stack array.
-struct StackBuffer {
-    bytes: [u8; TEXT_MAX],
+struct StackBuffer<const N: usize> {
+    bytes: [u8; N],
     len: usize,
 }
 
-impl StackBuffer {
+impl<const N: usize> StackBuffer<N> {
     fn new() -> Self {
         Self {
-            bytes: [0; TEXT_MAX],
+            bytes: [0; N],
             len: 0,
         }
     }
@@ -315,9 +415,9 @@ impl StackBuffer {
     }
 }
 
-impl core::fmt::Write for StackBuffer {
+impl<const N: usize> core::fmt::Write for StackBuffer<N> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let take = s.len().min(TEXT_MAX - self.len);
+        let take = s.len().min(N - self.len);
         self.bytes[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
         self.len += take;
         Ok(())
@@ -369,9 +469,25 @@ mod tests {
 
     #[test]
     fn formatting_stops_at_the_end_of_the_stack_buffer() {
-        let mut buffer = StackBuffer::new();
+        let mut buffer = StackBuffer::<TEXT_MAX>::new();
         let long = "x".repeat(TEXT_MAX * 2);
         let _ = core::fmt::Write::write_fmt(&mut buffer, format_args!("{long}"));
         assert_eq!(buffer.filled().len(), TEXT_MAX);
+    }
+
+    /// `create_instance` logs a `GUID` with `{:?}`. If that formatter wrote
+    /// nothing — or panicked, which aborts explorer because the panic would
+    /// unwind out of an `extern "system"` entry point — the log shows an empty
+    /// line right after `create_instance: qi ok`.
+    #[test]
+    fn guid_debug_formats_into_the_stack_buffer() {
+        let iid = windows::core::GUID::from_u128(0x0000_0001_0000_0000_c000_0000_0000_0046);
+        let mut buffer = StackBuffer::<TEXT_MAX>::new();
+        core::fmt::Write::write_fmt(&mut buffer, format_args!("create_instance: iid {iid:?}"))
+            .expect("formatting a GUID must not fail");
+        assert_eq!(
+            core::str::from_utf8(buffer.filled()).unwrap(),
+            "create_instance: iid 00000001-0000-0000-C000-000000000046"
+        );
     }
 }

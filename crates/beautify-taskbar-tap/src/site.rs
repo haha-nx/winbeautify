@@ -24,6 +24,7 @@ static INSTALL_STARTED: AtomicBool = AtomicBool::new(false);
 /// site wins, later ones are refused.
 static SITE_TAKEN: AtomicBool = AtomicBool::new(false);
 
+#[repr(C)]
 pub struct TapSite {
     /// COM object header: see the comment on `Watcher`.
     #[allow(dead_code)] // read by the framework through the raw pointer
@@ -63,6 +64,7 @@ pub static FACTORY_VTABLE: com::FactoryVtbl = com::FactoryVtbl {
     lock_server: ClassFactory::lock_server,
 };
 
+#[repr(C)]
 pub struct ClassFactory {
     /// COM object header: see the comment on `Watcher`.
     #[allow(dead_code)] // read by the framework through the raw pointer
@@ -95,33 +97,35 @@ impl ClassFactory {
         iid: *const windows::core::GUID,
         out: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        if !outer.is_null() {
-            // No aggregation support; the framework does not aggregate TAPs.
-            return windows::Win32::Foundation::CLASS_E_NOAGGREGATION;
-        }
-        crate::service::debug_log("class factory create_instance");
-        // The framework probes with `CreateInstance(IID_IMarshal)` and falls
-        // back to the real interface; every call must be able to hand out a
-        // fresh object. Single-connection semantics live in
-        // `TapSite::set_site`, and agility is answered per object through
-        // `ComObj::AGILE_CALLBACK`.
-        let tap = com::new_com_object(TapSite {
-            vtable: com::VtblPtr(&SITE_VTABLE as *const com::SiteVtbl as *const core::ffi::c_void),
-            site: AtomicIsize::new(0),
-            ref_count: AtomicU32::new(1),
-        });
-        let ok = com::com_query_interface::<TapSite>(tap as *mut core::ffi::c_void, iid, out);
-        crate::service::debug_log_fmt(format_args!("create_instance: qi ok {}", ok.is_ok()));
-        if !iid.is_null() {
-            // No `format!` here: this runs on a thread the framework owns, and
-            // a heap allocation on that thread is what wedged explorer before.
-            let iid = unsafe { *iid };
-            crate::service::debug_log_fmt(format_args!("create_instance: iid {iid:?}"));
-        }
-        if ok.is_err() {
-            com::release_raw(tap as *mut core::ffi::c_void);
-        }
-        ok
+        com::guard(|| {
+            if !outer.is_null() {
+                // No aggregation support; the framework does not aggregate TAPs.
+                return windows::Win32::Foundation::CLASS_E_NOAGGREGATION;
+            }
+            crate::service::debug_log("class factory create_instance");
+            // The framework probes with `CreateInstance(IID_IMarshal)` and falls
+            // back to the real interface; every call must be able to hand out a
+            // fresh object. Single-connection semantics live in
+            // `TapSite::set_site`, and agility is answered per object through
+            // `ComObj::AGILE_CALLBACK`.
+            let tap = com::new_com_object(TapSite {
+                vtable: com::VtblPtr(&SITE_VTABLE as *const com::SiteVtbl as *const core::ffi::c_void),
+                site: AtomicIsize::new(0),
+                ref_count: AtomicU32::new(1),
+            });
+            let ok = com::com_query_interface::<TapSite>(tap as *mut core::ffi::c_void, iid, out);
+            crate::service::debug_log_fmt(format_args!("create_instance: qi ok {}", ok.is_ok()));
+            if !iid.is_null() {
+                // No `format!` here: this runs on a thread the framework owns, and
+                // a heap allocation on that thread is what wedged explorer before.
+                let iid = unsafe { *iid };
+                crate::service::debug_log_fmt(format_args!("create_instance: iid {iid:?}"));
+            }
+            if ok.is_err() {
+                com::release_raw(tap as *mut core::ffi::c_void);
+            }
+            ok
+        })
     }
 
     unsafe extern "system" fn lock_server(
@@ -137,7 +141,7 @@ impl TapSite {
         this: *mut core::ffi::c_void,
         site: *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        com::guard(|| {
             let tap = &*(this as *const TapSite);
             crate::service::debug_log("set_site entered");
             if site.is_null() {
@@ -192,11 +196,17 @@ impl TapSite {
             crate::service::debug_log_fmt(format_args!(
                 "set_site accepted, ready event handle {event}"
             ));
+            // Advise on this thread: it is the XAML UI thread, and the
+            // framework's `AdviseVisualTreeChange` needs the XAML context the
+            // UI thread has. Called from a thread of our own it reaches a null
+            // function pointer inside XAML and the shell dies with a
+            // control-flow-guard fail-fast. (The reference TAP advises from its
+            // own thread, but its DLL is built by MSVC with different defaults,
+            // and on this build that is what breaks.)
             Watcher::create(unknown, event);
             crate::service::debug_log("site set, watcher advising");
             windows::core::HRESULT(0)
-        }));
-        ran.unwrap_or(windows::core::HRESULT(1))
+        })
     }
 
     unsafe extern "system" fn get_site(
@@ -204,14 +214,16 @@ impl TapSite {
         iid: *const windows::core::GUID,
         out: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        let tap = &*(this as *const TapSite);
-        let raw = tap.site.load(Ordering::Acquire);
-        if raw == 0 || iid.is_null() || out.is_null() {
-            return windows::Win32::Foundation::E_FAIL;
-        }
-        // QI the stored site directly for the requested interface.
-        let vtbl = *(raw as *mut *mut windows::core::IUnknown_Vtbl);
-        ((*vtbl).QueryInterface)(raw as *mut core::ffi::c_void, iid as *mut _, out)
+        com::guard(|| {
+            let tap = &*(this as *const TapSite);
+            let raw = tap.site.load(Ordering::Acquire);
+            if raw == 0 || iid.is_null() || out.is_null() {
+                return windows::Win32::Foundation::E_FAIL;
+            }
+            // QI the stored site directly for the requested interface.
+            let vtbl = *(raw as *mut *mut windows::core::IUnknown_Vtbl);
+            ((*vtbl).QueryInterface)(raw as *mut core::ffi::c_void, iid as *mut _, out)
+        })
     }
 }
 
@@ -265,6 +277,7 @@ fn install_thread(module: isize) {
     // logger is safe. Every later entry point is reached from threads the
     // framework owns, where that work can deadlock explorer.
     crate::logging::start();
+    pin_module();
     let ok = std::panic::catch_unwind(|| install_inner(module)).unwrap_or_else(|_| {
         crate::service::debug_log("install panicked");
         false
@@ -272,6 +285,31 @@ fn install_thread(module: isize) {
     if !ok {
         // Signal the host so it does not wait out its whole timeout.
         signal_ready();
+    }
+}
+
+/// Take a reference on this module that is never released.
+///
+/// Windows hands this DLL to explorer for the hook, and when the connection
+/// does not complete either the framework or the hook going away calls
+/// `FreeLibrary` on it — while the install and logger threads are still running
+/// inside it. Windows reports the result as
+/// `beautify_taskbar_tap.dll_unloaded`: an access violation, or a control-flow
+/// guard fail-fast, in code that is no longer mapped. This is the same
+/// situation TranslucentTB ends up in (its DLL is pinned by the framework once
+/// it connects); pinning here covers the case where it never connects. The
+/// reference is deliberately leaked: it lasts until explorer exits, which is
+/// exactly as long as the TAP can be needed, and a TAP cannot be unloaded
+/// safely anyway.
+fn pin_module() {
+    let mut handle = windows::Win32::Foundation::HMODULE::default();
+    // No `UNCHANGED_REFCOUNT` here: adding the reference is the whole point.
+    unsafe {
+        let _ = windows::Win32::System::LibraryLoader::GetModuleHandleExW(
+            windows::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            windows::core::PCWSTR(pin_module as *const u16),
+            &mut handle,
+        );
     }
 }
 
@@ -299,6 +337,9 @@ fn install_inner(module: isize) -> bool {
         let connection = format!("VisualDiagConnection{attempt}");
         let connection: Vec<u16> = connection.encode_utf16().chain([0]).collect();
         let path = std::sync::Arc::clone(&path);
+        crate::service::debug_log_fmt(format_args!(
+            "attempt {attempt}: calling InitializeXamlDiagnosticsEx"
+        ));
         let spawned = std::thread::Builder::new()
             .name("wb-tap-ixde".into())
             .spawn(move || unsafe {
@@ -315,6 +356,7 @@ fn install_inner(module: isize) -> bool {
             Ok(handle) => handle.join().unwrap_or(windows::core::HRESULT(1)),
             Err(_) => windows::core::HRESULT(1),
         };
+        crate::service::debug_log_fmt(format_args!("attempt {attempt}: ixde returned {hr:?}"));
         if hr.is_ok() {
             crate::service::debug_log("XAML diagnostics connected");
             return true;
@@ -371,27 +413,31 @@ pub unsafe extern "system" fn tap_hook_proc(
     w_param: windows::Win32::Foundation::WPARAM,
     l_param: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    if n_code >= 0 && !INSTALL_STARTED.swap(true, Ordering::SeqCst) && is_explorer() {
-        let mut module = windows::Win32::Foundation::HMODULE::default();
-        let ok = windows::Win32::System::LibraryLoader::GetModuleHandleExW(
-            windows::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                | windows::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            windows::core::PCWSTR(tap_hook_proc as *const u16),
-            &mut module,
-        );
-        if ok.is_ok() {
-            let module_raw = module.0 as isize;
-            let spawned = std::thread::Builder::new()
-                .name("wb-tap-install".into())
-                .spawn(move || install_thread(module_raw));
-            if spawned.is_err() {
+    // Windows calls this from a win32k callback: it must not unwind, and it
+    // must not swallow the hook result either.
+    com::guard_value(windows::Win32::Foundation::LRESULT(0), || {
+        if n_code >= 0 && !INSTALL_STARTED.swap(true, Ordering::SeqCst) && is_explorer() {
+            let mut module = windows::Win32::Foundation::HMODULE::default();
+            let ok = windows::Win32::System::LibraryLoader::GetModuleHandleExW(
+                windows::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | windows::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                windows::core::PCWSTR(tap_hook_proc as *const u16),
+                &mut module,
+            );
+            if ok.is_ok() {
+                let module_raw = module.0 as isize;
+                let spawned = std::thread::Builder::new()
+                    .name("wb-tap-install".into())
+                    .spawn(move || install_thread(module_raw));
+                if spawned.is_err() {
+                    INSTALL_STARTED.store(false, Ordering::SeqCst);
+                }
+            } else {
                 INSTALL_STARTED.store(false, Ordering::SeqCst);
             }
-        } else {
-            INSTALL_STARTED.store(false, Ordering::SeqCst);
         }
-    }
-    windows::Win32::UI::WindowsAndMessaging::CallNextHookEx(None, n_code, w_param, l_param)
+        windows::Win32::UI::WindowsAndMessaging::CallNextHookEx(None, n_code, w_param, l_param)
+    })
 }
 
 /// Are we loaded into explorer.exe? The hook vehicle can drag the DLL into
@@ -431,24 +477,26 @@ pub unsafe extern "system" fn DllGetClassObject(
     iid: *const windows::core::GUID,
     out: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    crate::service::debug_log_fmt(format_args!(
-        "DllGetClassObject: clsid matches {}",
-        !clsid.is_null() && *clsid == TAP_CLSID
-    ));
-    if !iid.is_null() {
-        // Still no `format!`: the framework calls this while it holds the loader
-        // lock, and taking the heap from here is what wedged explorer.
-        let iid = unsafe { *iid };
-        crate::service::debug_log_fmt(format_args!("DllGetClassObject: iid {iid:?}"));
-    }
-    if clsid.is_null() || *clsid != TAP_CLSID {
-        return windows::Win32::Foundation::CLASS_E_CLASSNOTAVAILABLE;
-    }
-    com::com_query_interface::<ClassFactory>(
-        factory() as *const ClassFactory as *mut ClassFactory as *mut core::ffi::c_void,
-        iid,
-        out,
-    )
+    com::guard(|| {
+        crate::service::debug_log_fmt(format_args!(
+            "DllGetClassObject: clsid matches {}",
+            !clsid.is_null() && *clsid == TAP_CLSID
+        ));
+        if !iid.is_null() {
+            // Still no `format!`: the framework calls this while it holds the loader
+            // lock, and taking the heap from here is what wedged explorer.
+            let iid = unsafe { *iid };
+            crate::service::debug_log_fmt(format_args!("DllGetClassObject: iid {iid:?}"));
+        }
+        if clsid.is_null() || *clsid != TAP_CLSID {
+            return windows::Win32::Foundation::CLASS_E_CLASSNOTAVAILABLE;
+        }
+        com::com_query_interface::<ClassFactory>(
+            factory() as *const ClassFactory as *mut ClassFactory as *mut core::ffi::c_void,
+            iid,
+            out,
+        )
+    })
 }
 
 /// `DllCanUnloadNow` — the framework pins us while the connection is live;
@@ -462,3 +510,8 @@ pub unsafe extern "system" fn DllCanUnloadNow() -> windows::core::HRESULT {
 const _: () = {
     let _ = &WATCHER_VTABLE as *const com::CallbackVtbl;
 };
+
+// See the note in `watcher.rs`: the vtable pointer has to be the object's first
+// field, and only `#[repr(C)]` guarantees that.
+const _: () = assert!(core::mem::offset_of!(TapSite, vtable) == 0);
+const _: () = assert!(core::mem::offset_of!(ClassFactory, vtable) == 0);

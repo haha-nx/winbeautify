@@ -29,8 +29,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetClientRect, GetWindowThreadProcessId, RegisterClassExW, CreateWindowExW,
-    PostMessageW, GA_PARENT, HMENU, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    DefWindowProcW,
+    GetClientRect, GetWindowThreadProcessId, RegisterClassExW, CreateWindowExW,
+    PostMessageW, HMENU, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
     WM_COPYDATA, WM_NCDESTROY, WM_PAINT, WNDCLASSEXW,
 };
 use windows_numerics::Vector2;
@@ -78,7 +79,10 @@ impl Drop for ControlInfo {
 }
 
 struct Bar {
-    source_hwnd: isize,
+    /// The `Shell_TrayWnd`/`Shell_SecondaryTrayWnd` this island belongs to.
+    /// Commands address a taskbar by that window, so the mapping is kept ready
+    /// rather than derived from the island's host window on every command.
+    taskbar: isize,
     background: ControlInfo,
     border: ControlInfo,
     blur_attached: bool,
@@ -111,18 +115,24 @@ fn with_service<R>(body: impl FnOnce(&mut Service) -> R) -> R {
 // Registration — called from OnVisualTreeChange on the UI thread.
 // ---------------------------------------------------------------------------
 
-/// Remember a `Taskbar.TaskbarFrame` and the island window hosting it.
-pub fn register_taskbar(frame_handle: u64, source_hwnd: isize) {
+/// Remember a `Taskbar.TaskbarFrame` and the taskbar window hosting it.
+pub fn register_taskbar(frame_handle: u64, taskbar: isize) {
     ensure_window();
     with_service(|svc| {
         svc.bars.entry(frame_handle).or_insert_with(|| Bar {
-            source_hwnd,
+            taskbar,
             background: ControlInfo::default(),
             border: ControlInfo::default(),
             blur_attached: false,
         });
     });
     debug_log("registered taskbar frame");
+}
+
+/// Are any taskbars registered yet? The tree callback retries discovery while
+/// this is false, and stops once a frame has been claimed.
+pub fn has_bars() -> bool {
+    with_service(|svc| !svc.bars.is_empty())
 }
 
 /// Remember one of the taskbar's background rectangles.
@@ -132,6 +142,7 @@ pub fn register_taskbar_background(frame_handle: u64, shape: IUnknown) {
             bar.background.shape = Some(own(shape));
         }
     });
+    debug_log("registered background rectangle");
 }
 
 /// Remember the taskbar's border rectangle (kept for restore only).
@@ -146,10 +157,74 @@ pub fn register_taskbar_border(frame_handle: u64, shape: IUnknown) {
 /// Drop a taskbar (its XAML island was torn down).
 pub fn unregister_taskbar(frame_handle: u64) {
     with_service(|svc| {
-        if let Some(bar) = svc.bars.remove(&frame_handle) {
-            svc.subclassed.remove(&bar.source_hwnd);
-        }
+        svc.bars.remove(&frame_handle);
     });
+}
+
+/// One level of a window's children. A taskbar's XAML islands are child windows
+/// of it, and their sizes say which island is which.
+pub fn child_windows(parent: isize) -> Vec<isize> {
+    let mut children = Vec::new();
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::EnumChildWindows(
+            Some(HWND(parent as *mut core::ffi::c_void)),
+            Some(collect_child),
+            LPARAM(&mut children as *mut Vec<isize> as isize),
+        );
+    }
+    children
+}
+
+unsafe extern "system" fn collect_child(window: HWND, param: LPARAM) -> windows::core::BOOL {
+    let children = &mut *(param.0 as *mut Vec<isize>);
+    children.push(window.0 as isize);
+    true.into()
+}
+
+/// Screen rectangle of a window, in physical pixels.
+pub fn window_rect(window: isize) -> Option<windows::Win32::Foundation::RECT> {
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowRect(
+            HWND(window as *mut core::ffi::c_void),
+            &mut rect,
+        )
+        .ok()?;
+    }
+    Some(rect)
+}
+
+/// The taskbar windows of this session: the primary `Shell_TrayWnd` first, then
+/// one `Shell_SecondaryTrayWnd` per extra monitor.
+pub fn taskbar_windows() -> Vec<isize> {
+    let mut bars = Vec::new();
+    unsafe {
+        if let Ok(primary) = windows::Win32::UI::WindowsAndMessaging::FindWindowW(
+            windows::core::w!("Shell_TrayWnd"),
+            PCWSTR::null(),
+        ) {
+            if !primary.is_invalid() {
+                bars.push(primary.0 as isize);
+            }
+        }
+        let mut previous = HWND::default();
+        loop {
+            let Ok(next) = windows::Win32::UI::WindowsAndMessaging::FindWindowExW(
+                None,
+                Some(previous),
+                windows::core::w!("Shell_SecondaryTrayWnd"),
+                PCWSTR::null(),
+            ) else {
+                break;
+            };
+            if next.is_invalid() {
+                break;
+            }
+            bars.push(next.0 as isize);
+            previous = next;
+        }
+    }
+    bars
 }
 
 // ---------------------------------------------------------------------------
@@ -181,15 +256,29 @@ fn find_bar(taskbar: isize) -> Option<u64> {
     with_service(|svc| {
         svc.bars
             .iter()
-            .find(|(_, bar)| unsafe {
-                GetAncestor(HWND(bar.source_hwnd as *mut _), GA_PARENT).0 as isize == taskbar
-            })
+            .find(|(_, bar)| bar.taskbar == taskbar)
             .map(|(handle, _)| *handle)
+    })
+}
+
+/// Diagnostic: what the registry holds, for a command that did not match.
+fn describe_bars() -> String {
+    with_service(|svc| {
+        svc.bars
+            .iter()
+            .map(|(frame, bar)| format!("frame {frame:x} -> taskbar {:#x}", bar.taskbar))
+            .collect::<Vec<_>>()
+            .join(", ")
     })
 }
 
 fn set_appearance(cmd: &TapCommand) -> bool {
     let Some(handle) = find_bar(cmd.taskbar as isize) else {
+        debug_log_fmt(format_args!(
+            "appearance: no taskbar registered for {:#x}; have [{}]",
+            cmd.taskbar,
+            describe_bars()
+        ));
         return false;
     };
     let brush = match cmd.brush {
@@ -208,12 +297,14 @@ fn set_appearance(cmd: &TapCommand) -> bool {
             return false;
         };
         if bar.background.shape.is_none() {
+            debug_log("appearance: the background rectangle is not registered yet");
             return false;
         }
         if bar.background.original.is_none() {
             let shape_raw = bar.background.shape.as_ref().map(|s| s.0);
             let fill = shape_raw.and_then(|raw| unsafe { xaml::fill_of(raw) });
             let Some(fill) = fill else {
+                debug_log("appearance: the shell.s fill is still null");
                 return false;
             };
             bar.background.original = Some(SendPtr(fill));
@@ -358,12 +449,14 @@ fn restore_taskbar(taskbar: isize) -> bool {
 
 /// Restore every registered island.
 fn restore_all() -> bool {
-    with_service(|svc| {
+    let restored = with_service(|svc| {
         for bar in svc.bars.values_mut() {
             restore_bar(bar);
         }
-        true
-    })
+        svc.bars.len()
+    });
+    debug_log_fmt(format_args!("restore_all: {restored} taskbars"));
+    true
 }
 
 fn restore_bar(bar: &mut Bar) {
@@ -417,6 +510,7 @@ fn watch_worker(pid: u32) {
                 return;
             }
             WaitForSingleObject(HANDLE(process.0), INFINITE);
+            debug_log("worker process died, asking for a restore");
             let _ = PostMessageW(
                 Some(HWND(window as *mut _)),
                 WM_APP_RESTORE_ALL,
@@ -429,6 +523,15 @@ fn watch_worker(pid: u32) {
 // ---------------------------------------------------------------------------
 // Hidden message-only window — lives on the XAML UI thread.
 // ---------------------------------------------------------------------------
+
+/// Create the command window if it does not exist yet, on the calling thread.
+///
+/// Called as soon as the framework is connected, before any taskbar has been
+/// claimed: the host looks for this window right after injecting, and gives up
+/// on the injection if it is not there.
+pub fn ensure_command_window() {
+    ensure_window();
+}
 
 /// Create the message-only command window on the calling thread. The XAML UI
 /// thread pumps Win32 messages, so no dedicated loop is needed.
@@ -449,8 +552,8 @@ fn ensure_window() {
             ..Default::default()
         };
         // Re-registration after an explorer restart is harmless.
-        let _ = RegisterClassExW(&class);
-        if let Ok(hwnd) = CreateWindowExW(
+        let class_result = RegisterClassExW(&class);
+        match CreateWindowExW(
             WINDOW_EX_STYLE(0),
             PCWSTR(class_name.as_ptr()),
             PCWSTR(class_name.as_ptr()),
@@ -464,11 +567,19 @@ fn ensure_window() {
             Some(instance.into()),
             None,
         ) {
-            let raw = hwnd.0 as isize;
-            with_service(|svc| svc.window = raw);
+            Ok(hwnd) if !hwnd.is_invalid() => {
+                let raw = hwnd.0 as isize;
+                with_service(|svc| svc.window = raw);
+                debug_log_fmt(format_args!("tap window ready: {raw:#x}"));
+            }
+            other => {
+                let error = windows::Win32::Foundation::GetLastError();
+                debug_log_fmt(format_args!(
+                    "tap window creation failed: {other:?} (class register: {class_result:?}, last error {error:?})"
+                ));
+            }
         }
     }
-    debug_log("tap window ready");
 }
 
 unsafe extern "system" fn tap_wndproc(
@@ -489,7 +600,12 @@ unsafe extern "system" fn tap_wndproc(
             if msg == WM_NCDESTROY {
                 with_service(|svc| svc.window = 0);
             }
-            DefSubclassProc(hwnd, msg, wparam, lparam)
+            // `DefWindowProcW`, not `DefSubclassProc`: this is the window class's
+            // own procedure. `DefSubclassProc` looks up a subclass chain that does
+            // not exist here and returns without handling the creation messages,
+            // which makes `CreateWindowExW` fail — the command window then never
+            // exists, and the host gives up on the TAP.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         Err(_) => {
             debug_log("window proc panicked");

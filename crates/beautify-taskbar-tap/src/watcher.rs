@@ -6,7 +6,7 @@ use crate::com::{self, ComObj, ParentChildRelation, VisualElement, VISUAL_MUTATI
 use crate::service;
 use crate::xaml;
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use windows::core::{IUnknown, Interface};
 
@@ -16,11 +16,15 @@ use windows::core::{IUnknown, Interface};
 const XAML_SOURCE_TYPE: &str = "Windows.UI.Xaml.Hosting.DesktopWindowXamlSource";
 const TASKBAR_FRAME_TYPE: &str = "Taskbar.TaskbarFrame";
 const RECTANGLE_TYPE: &str = "Windows.UI.Xaml.Shapes.Rectangle";
-const FRAME_ELEMENT_NAME: &str = "TaskbarFrame";
 
 const SUPPORTED: &[windows::core::GUID] = &[
     com::IID_IVISUAL_TREE_SERVICE_CALLBACK,
-    com::IID_IVISUAL_TREE_SERVICE_CALLBACK2,
+    // `IVisualTreeServiceCallback2` is deliberately *not* answered. Answering it
+    // switches the framework into its "multiple window support" path, which on
+    // this build calls a null function pointer inside Windows.UI.Xaml and the
+    // shell dies with FAST_FAIL_GUARD_ICALL_CHECK_FAILURE. The only thing
+    // Callback2 adds is `OnElementStateChanged`, which the reference TAP
+    // implements as a no-op, so nothing is lost by staying on the v1 callback.
 ];
 
 /// Keep the raw Win32 event handle alive without a wrapper type.
@@ -38,9 +42,14 @@ impl Drop for ReadyEvent {
     }
 }
 
+#[repr(C)]
 pub struct Watcher {
-    /// COM object header: every hand-rolled object starts with its vtable so
-    /// the framework's `QueryInterface`/`Release` land on our shims.
+    /// COM object header. `#[repr(C)]` is not optional here: without it Rust
+    /// may reorder the fields, and the framework reaches every COM object by
+    /// reading the vtable out of the object's first word. With the fields
+    /// reordered it read a heap pointer, called what it found there, and the
+    /// shell died with `FAST_FAIL_GUARD_ICALL_CHECK_FAILURE` before ever
+    /// reaching our code.
     #[allow(dead_code)] // read by the framework through the raw pointer
     vtable: com::VtblPtr,
     xaml_diagnostics: IUnknown,
@@ -49,122 +58,155 @@ pub struct Watcher {
     /// arrives: a new island is created empty and only later gains a
     /// `TaskbarFrame`, so the two are matched up from this set.
     pending_sources: Mutex<HashSet<u64>>,
+    /// How often we went looking for taskbars that predate us (see
+    /// `claim_taskbars`): the walk is expensive and only the first few tree
+    /// events are worth trying it on.
+    claim_attempts: AtomicU32,
     ref_count: AtomicU32,
 }
 
 impl ComObj for Watcher {
     const SUPPORTED: &'static [windows::core::GUID] = SUPPORTED;
-    // Non-agile, like the reference TAP: the framework then marshals every
-    // callback onto the XAML UI thread, which is the thread the tree walking
-    // and the repaints below are required to run on.
-    const AGILE_CALLBACK: bool = false;
+    // Agile. The reference TAP is `non_agile`, but the framework's advise path
+    // then has to marshal the callback to the XAML UI thread, and with no
+    // registered proxy for `IVisualTreeServiceCallback2` that path leaves XAML
+    // calling a null interface pointer — which the shell reports as a
+    // control-flow-guard fail-fast inside explorer. Answering `IAgileObject`
+    // keeps the callback usable from any apartment, so the framework dispatches
+    // to the UI thread and calls us there without a proxy.
+    const AGILE_CALLBACK: bool = true;
     fn ref_count(&self) -> &AtomicU32 {
         &self.ref_count
     }
 }
 
+/// The callback entry points, as exports.
+///
+/// explorer's XAML side is control-flow-guard enabled and calls these through
+/// the callback's vtable. A target that is neither exported nor listed in this
+/// module's guard table fails that check, and the kernel ends the process with
+/// `FAST_FAIL_GUARD_ICALL_CHECK_FAILURE` — which is how a non-exported callback
+/// shows up: the shell dies the moment the framework first touches us. Export
+/// addresses are always valid call targets, so the slots go through these.
+#[no_mangle]
+pub unsafe extern "system" fn wbtap_callback_query_interface(
+    this: *mut core::ffi::c_void,
+    iid: *const windows::core::GUID,
+    out: *mut *mut core::ffi::c_void,
+) -> windows::core::HRESULT {
+    unsafe { com::com_query_interface::<Watcher>(this, iid, out) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn wbtap_callback_add_ref(this: *mut core::ffi::c_void) -> u32 {
+    crate::logging::debug_log_sync("callback: AddRef");
+    unsafe { com::com_add_ref::<Watcher>(this) }
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn wbtap_callback_release(this: *mut core::ffi::c_void) -> u32 {
+    crate::logging::debug_log_sync("callback: Release");
+    unsafe { com::com_release::<Watcher>(this) }
+}
+
+/// Target for the slots beyond the declared interface (see
+/// [`com::CallbackVtbl::reserved`]).
+#[no_mangle]
+pub unsafe extern "system" fn wbtap_callback_reserved(
+    _this: *mut core::ffi::c_void,
+    _a: usize,
+    _b: usize,
+    _c: usize,
+) -> windows::core::HRESULT {
+    crate::logging::debug_log_sync("callback: reserved slot called");
+    windows::Win32::Foundation::E_NOTIMPL
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn wbtap_callback_on_visual_tree_change(
+    this: *mut core::ffi::c_void,
+    relation: *const ParentChildRelation,
+    element: *const VisualElement,
+    mutation: i32,
+) -> windows::core::HRESULT {
+    // Never unwind into the framework: an explorer-side panic would take the
+    // whole shell down.
+    com::guard(|| {
+        crate::logging::debug_log_sync("visual tree callback entered");
+        unsafe {
+            Watcher::handle_tree_change(&*(this as *const Watcher), &*relation, &*element, mutation)
+        };
+        windows::core::HRESULT(0)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn wbtap_callback_on_element_state_changed(
+    _this: *mut core::ffi::c_void,
+    _handle: u64,
+    _state: i32,
+    _context: *const u16,
+) -> windows::core::HRESULT {
+    windows::core::HRESULT(0)
+}
+
 /// The single vtable instance for every `Watcher`.
 pub static WATCHER_VTABLE: com::CallbackVtbl = com::CallbackVtbl {
-    query_interface: com::com_query_interface::<Watcher>,
-    add_ref: com::com_add_ref::<Watcher>,
-    release: com::com_release::<Watcher>,
-    on_visual_tree_change: Watcher::on_visual_tree_change,
-    on_element_state_changed: Watcher::on_element_state_changed,
+    query_interface: wbtap_callback_query_interface,
+    add_ref: wbtap_callback_add_ref,
+    release: wbtap_callback_release,
+    on_visual_tree_change: wbtap_callback_on_visual_tree_change,
+    on_element_state_changed: wbtap_callback_on_element_state_changed,
+    reserved: [wbtap_callback_reserved; 7],
 };
 
 impl Watcher {
     /// Build the watcher and start advising. The framework calls `SetSite`
     /// with an `IXamlDiagnostics`; from then on our callback receives every
     /// visual tree mutation for the process.
+    ///
+    /// The advise call happens on the calling thread, which is the XAML UI
+    /// thread the framework called `SetSite` on. Advising from a thread of our
+    /// own reaches a null function pointer inside XAML's implementation and the
+    /// shell dies with a control-flow-guard fail-fast; the reference TAP does
+    /// advise from its own thread, but on this build that is what breaks.
     pub fn create(site: IUnknown, ready_event: isize) -> *mut Watcher {
         let watcher = com::new_com_object(Self {
             vtable: com::VtblPtr(&WATCHER_VTABLE as *const com::CallbackVtbl as *const core::ffi::c_void),
             xaml_diagnostics: site,
             ready_event: ReadyEvent(ready_event),
             pending_sources: Mutex::new(HashSet::new()),
+            claim_attempts: AtomicU32::new(0),
             ref_count: AtomicU32::new(1),
         });
-        // Advise from a dedicated thread: the framework moves the callback
-        // registration onto the UI thread, and advising synchronously from
-        // inside `SetSite` can deadlock during framework init.
-        //
-        // Only `isize`s cross the thread boundary; the raw `IUnknown`
-        // reference is handed over with `std::mem::forget` and re-adopted on
-        // the other side, keeping the refcount balanced.
-        let this = watcher as isize;
-        let diagnostics_raw = unsafe {
-            let cloned = (*watcher).xaml_diagnostics.clone();
-            let raw = cloned.as_raw();
-            std::mem::forget(cloned);
-            raw as isize
-        };
-        let event = unsafe { (*watcher).ready_event.0 };
-        let _ = std::thread::Builder::new()
-            .name("wb-tap-advise".into())
-            .spawn(move || {
-                // Never unwind into the framework's thread pool.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                    use windows::core::Type;
-                    crate::service::debug_log("advise thread started");
-                    crate::service::debug_log("advise: adopting diagnostics");
-                    let diagnostics: IUnknown = match IUnknown::from_abi(diagnostics_raw as *mut _) {
-                        Ok(diagnostics) => diagnostics,
-                        Err(_) => {
-                            crate::service::debug_log("advise: diagnostics adopt failed");
-                            return;
-                        }
-                    };
-                    crate::service::debug_log("advise: diagnostics adopted");
-                    let advised = advise_visual_tree_change(&diagnostics, this as *mut _);
-                    crate::service::debug_log_fmt(format_args!(
-                        "advise_visual_tree_change -> {advised}"
-                    ));
-                    if advised && event != 0 {
-                        let _ = windows::Win32::System::Threading::SetEvent(
-                            windows::Win32::Foundation::HANDLE(event as *mut core::ffi::c_void),
-                        );
-                    }
-                    // The re-adopted reference is released here; the watcher
-                    // still holds its own.
-                    drop(diagnostics);
-                }));
-                if let Err(payload) = result {
-                    let text = payload
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "opaque panic".into());
-                    crate::service::debug_log_fmt(format_args!("advise panicked: {text}"));
-                }
+        // The caller (`TapSite::set_site`) runs inside `com::guard`, so a panic
+        // here is caught and logged instead of killing explorer.
+        unsafe {
+            let diagnostics = &(*watcher).xaml_diagnostics;
+            crate::logging::debug_log_sync("advise: entering AdviseVisualTreeChange");
+            let advised = advise_visual_tree_change(diagnostics, watcher as *mut _);
+            crate::logging::debug_log_sync(if advised {
+                "advise: AdviseVisualTreeChange returned true"
+            } else {
+                "advise: AdviseVisualTreeChange returned false"
             });
+            if advised {
+                // The command window goes up now rather than when the first
+                // taskbar is claimed: the host looks for it right after
+                // injecting and treats its absence as a failed injection. This
+                // runs on the XAML UI thread, which is the thread the window's
+                // messages are then delivered on.
+                service::ensure_command_window();
+                if ready_event != 0 {
+                    let _ = windows::Win32::System::Threading::SetEvent(
+                        windows::Win32::Foundation::HANDLE(ready_event as *mut core::ffi::c_void),
+                    );
+                }
+            }
+        }
         watcher
     }
 
-    unsafe extern "system" fn on_visual_tree_change(
-        this: *mut core::ffi::c_void,
-        relation: *const ParentChildRelation,
-        element: *const VisualElement,
-        mutation: i32,
-    ) -> windows::core::HRESULT {
-        // Never unwind into the framework: an explorer-side panic would take
-        // the whole shell down.
-        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Self::handle_tree_change(&*(this as *const Watcher), &*relation, &*element, mutation)
-        }));
-        if ran.is_err() {
-            service::debug_log("visual tree callback panicked");
-        }
-        windows::core::HRESULT(0)
-    }
-
-    unsafe extern "system" fn on_element_state_changed(
-        _this: *mut core::ffi::c_void,
-        _handle: u64,
-        _state: i32,
-        _context: *const u16,
-    ) -> windows::core::HRESULT {
-        windows::core::HRESULT(0)
-    }
 
     fn handle_tree_change(
         &self,
@@ -172,12 +214,6 @@ impl Watcher {
         element: &VisualElement,
         mutation: i32,
     ) {
-        // Runs on the XAML UI thread for every mutation in the process, which is
-        // why the log call has to stay allocation-free.
-        crate::service::debug_log_fmt(format_args!(
-            "tree change: mutation={mutation} handle={:x}",
-            element.handle
-        ));
         // The framework hands the BSTRs to us; free them once read.
         let type_name = unsafe { com::borrow_bstr(element.type_name) }
             .map(utf16_lossy)
@@ -185,6 +221,11 @@ impl Watcher {
         let name = unsafe { com::borrow_bstr(element.name) }
             .map(utf16_lossy)
             .unwrap_or_default();
+        // Runs on the XAML UI thread for every mutation in the process, which is
+        // why the log call has to stay allocation-free.
+        crate::service::debug_log_fmt(format_args!(
+            "tree change: mutation={mutation} type={type_name} name={name}"
+        ));
         unsafe {
             com::free_bstr(element.type_name);
             com::free_bstr(element.name);
@@ -201,6 +242,59 @@ impl Watcher {
                 set.remove(&element.handle);
             }
         }
+        // A taskbar that predates us never announces its frame — it was added
+        // before we connected. Any element of its island is a way in, and the
+        // taskbar's own elements keep mutating (buttons, clock, hover), so walk
+        // up from each one until the frame turns up.
+        if !service::has_bars() && mutation == VISUAL_MUTATION_ADD {
+            let attempt = self.claim_attempts.fetch_add(1, Ordering::Relaxed);
+            self.claim_from(element.handle, attempt < 3);
+        }
+    }
+
+    /// Walk up from an element looking for the `TaskbarFrame` that contains it,
+    /// and claim the taskbar it belongs to. `verbose` reports the ancestry, for
+    /// the first few events only.
+    fn claim_from(&self, handle: u64, verbose: bool) {
+        let mut chain = String::new();
+        let Some(mut element) = self.inspectable_at(handle) else {
+            return;
+        };
+        for _ in 0..40 {
+            let class = unsafe { xaml::runtime_class_name(element.as_raw()) }.unwrap_or_default();
+            if verbose {
+                if !chain.is_empty() {
+                    chain.push_str(" <- ");
+                }
+                chain.push_str(if class.is_empty() { "?" } else { &class });
+            }
+            if class == TASKBAR_FRAME_TYPE {
+                if verbose {
+                    crate::service::debug_log_fmt(format_args!("claim: ancestry {chain}"));
+                }
+                let Some(frame_handle) = self.handle_of(&element) else {
+                    return;
+                };
+                match self.taskbar_for_frame(&element) {
+                    Some(taskbar) => {
+                        service::register_taskbar(frame_handle, taskbar);
+                        self.register_frame_children(frame_handle);
+                        crate::service::debug_log("claimed an existing taskbar");
+                    }
+                    None => crate::service::debug_log(
+                        "claim: found a frame, but no taskbar window matches its size",
+                    ),
+                }
+                return;
+            }
+            match unsafe { xaml::parent_of(element.as_raw()) } {
+                Some(parent) => element = parent,
+                None => break,
+            }
+        }
+        if verbose {
+            crate::service::debug_log_fmt(format_args!("claim: no frame above {chain}"));
+        }
     }
 
     fn on_added(&self, relation: &ParentChildRelation, handle: u64, type_name: &str, name: &str) {
@@ -212,9 +306,19 @@ impl Watcher {
             }
         } else if type_name == TASKBAR_FRAME_TYPE {
             // The frame's parent is the island's RootGrid; match it against
-            // the sources we have seen to find this island's window.
+            // the sources we have seen to find this island's window, and take
+            // the taskbar it hangs under from that window's parent.
             if let Some(source_hwnd) = self.find_source_for(relation.parent) {
-                service::register_taskbar(handle, source_hwnd);
+                let taskbar = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::GetAncestor(
+                        windows::Win32::Foundation::HWND(source_hwnd as *mut core::ffi::c_void),
+                        windows::Win32::UI::WindowsAndMessaging::GA_PARENT,
+                    )
+                    .0 as isize
+                };
+                if taskbar != 0 {
+                    service::register_taskbar(handle, taskbar);
+                }
             }
         } else if type_name == RECTANGLE_TYPE {
             let background = name == "BackgroundFill";
@@ -223,6 +327,67 @@ impl Watcher {
                 if let Some(frame) = self.find_frame_ancestor(relation.parent) {
                     self.register_rectangle(frame, handle, background);
                 }
+            }
+        }
+    }
+
+    fn taskbar_for_frame(&self, frame: &IUnknown) -> Option<isize> {
+        let (width_dip, height_dip) = unsafe { xaml::actual_size_of(frame.as_raw()) }?;
+        let mut best: Option<(isize, f64)> = None;
+        for taskbar in service::taskbar_windows() {
+            let dpi = unsafe {
+                windows::Win32::UI::HiDpi::GetDpiForWindow(windows::Win32::Foundation::HWND(
+                    taskbar as *mut core::ffi::c_void,
+                ))
+            };
+            let dpi = if dpi == 0 { 96 } else { dpi };
+            let width_px = width_dip * dpi as f64 / 96.0;
+            let height_px = height_dip * dpi as f64 / 96.0;
+            for child in service::child_windows(taskbar) {
+                let Some(rect) = service::window_rect(child) else {
+                    continue;
+                };
+                let width = (rect.right - rect.left) as f64;
+                let height = (rect.bottom - rect.top) as f64;
+                let delta = (width - width_px).abs() + (height - height_px).abs();
+                if delta <= 8.0 && best.map(|(_, best)| delta < best).unwrap_or(true) {
+                    best = Some((taskbar, delta));
+                }
+            }
+        }
+        best.map(|(taskbar, _)| taskbar)
+    }
+
+    /// Find the `BackgroundFill`/`BackgroundStroke` rectangles of a frame by
+    /// walking its children. Names are unique enough inside one taskbar island
+    /// — the tray's own background is called `BackgroundBorder`.
+    fn register_frame_children(&self, frame_handle: u64) {
+        let Some(frame) = self.inspectable_at(frame_handle) else {
+            return;
+        };
+        let mut queue = vec![frame];
+        let mut visited = 0usize;
+        while let Some(element) = queue.pop() {
+            visited += 1;
+            if visited > 400 {
+                crate::service::debug_log("stopped walking the frame: tree larger than expected");
+                return;
+            }
+            for child in unsafe { xaml::children_of(element.as_raw(), 64) } {
+                // A `Rectangle` with a fill is the background the shell paints;
+                // its sibling with only a stroke is the border. Matching by class
+                // rather than by the element's name property, which is not
+                // readable from here (see `find_frame`).
+                let class = unsafe { xaml::runtime_class_name(child.as_raw()) };
+                if class.as_deref() == Some(RECTANGLE_TYPE) {
+                    if unsafe { xaml::fill_of(child.as_raw()) }.is_some() {
+                        if let Some(handle) = self.handle_of(&child) {
+                            self.register_rectangle(frame_handle, handle, true);
+                        }
+                    }
+                    continue;
+                }
+                queue.push(child);
             }
         }
     }
@@ -271,8 +436,11 @@ impl Watcher {
 
     fn find_frame(&self, element: &IUnknown) -> Option<IUnknown> {
         let parent = unsafe { xaml::parent_of(element.as_raw()) }?;
-        let name = unsafe { xaml::name_of(parent.as_raw()) };
-        if name.as_deref() == Some(FRAME_ELEMENT_NAME) {
+        // Matched by ABI class name, not by `FrameworkElement.Name`: the name
+        // property does not come back as a string this code can read, and asking
+        // for it faults inside the shell.s string code.
+        let class = unsafe { xaml::runtime_class_name(parent.as_raw()) };
+        if class.as_deref() == Some(TASKBAR_FRAME_TYPE) {
             Some(parent)
         } else {
             self.find_frame(&parent)
@@ -332,6 +500,16 @@ unsafe fn advise_visual_tree_change(
         return false;
     };
     crate::service::debug_log("advise: calling AdviseVisualTreeChange");
+    // The one thing we cannot verify by reading our own code is the layout of
+    // this foreign vtable, and a slot that holds garbage or null only shows up
+    // as a control-flow-guard fail-fast inside explorer. Say what the first
+    // slots point at, so a wrong layout is a log line instead of a crash. This
+    // line is written synchronously: the crash it is meant to explain would
+    // otherwise take it down before the logger thread got to it.
+    crate::logging::debug_log_sync(&format!(
+        "advise: service3 vtable {}",
+        com::describe_vtable(service3, 6)
+    ));
     let advised = match com::vtbl_of::<com::IVisualTreeServiceVtbl>(service3) {
         Ok(vtbl) => (vtbl.advise_visual_tree_change)(service3, callback).is_ok(),
         Err(_) => false,
@@ -346,3 +524,10 @@ unsafe fn advise_visual_tree_change(
 fn utf16_lossy(chars: &[u16]) -> String {
     String::from_utf16_lossy(chars)
 }
+
+// A COM object is found by its vtable, so the vtable pointer has to be the first
+// field. Rust reorders fields unless the struct is `#[repr(C)]`, and a framework
+// that reads the wrong word calls whatever it finds there — which is how the
+// shell died with a control-flow-guard fail-fast the moment it touched this
+// object. The assertion is the regression guard for that.
+const _: () = assert!(core::mem::offset_of!(Watcher, vtable) == 0);

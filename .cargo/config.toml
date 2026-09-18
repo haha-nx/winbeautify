@@ -1,0 +1,9 @@
+# Control Flow Guard, which MSVC's project templates enable by default and rustc
+# does not. It is not what broke the taskbar TAP (that was Rust reordering the
+# fields of a COM object, see `crates/beautify-taskbar-tap/src/watcher.rs`), but
+# a DLL that the shell calls *back* into through function pointers is exactly the
+# kind of module that should have it: explorer's XAML side is CFG-instrumented,
+# and the guard checks it performs on our callback and vtable slots only mean
+# something if our module has a function table to check them against.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "control-flow-guard=on"]

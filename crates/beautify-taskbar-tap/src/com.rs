@@ -89,8 +89,11 @@ pub type WinRtSlots = [usize; 6];
 #[repr(C)]
 pub struct IXamlDiagnosticsVtbl {
     pub unknown: UnknownSlots, // 0-2
-    pub get_dispatcher: usize, // 3
-    pub get_ui_layer: usize,   // 4
+    /// `GetUiLayer` — the root of the XAML content, which is the only way into
+    /// an island whose "added" events happened before we connected.
+    pub get_ui_layer:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT, // 3
+    pub get_dispatcher: usize,  // 4
     pub get_application: usize, // 5
     pub get_iinspectable_from_handle:
         unsafe extern "system" fn(this: *mut core::ffi::c_void, handle: u64, out: *mut *mut core::ffi::c_void) -> HRESULT, // 6
@@ -172,12 +175,24 @@ pub struct IAcrylicBrushVtbl {
     pub put_tint_color: unsafe extern "system" fn(this: *mut core::ffi::c_void, color: Color) -> HRESULT, // 9
 }
 
-/// Slot 12 of `IVisualTreeHelperStatics` (`GetParent`); the preceding six
-/// methods are the `FindElementsInHostCoordinates`/`GetChild` family.
+/// `IVisualTreeHelperStatics`. Method order: four `FindElementsInHostCoordinates`
+/// overloads, `GetChild`, `GetChildrenCount`, `GetParent`,
+/// `DisconnectChildrenRecursive`.
 #[repr(C)]
 pub struct IVisualTreeHelperStaticsVtbl {
     pub winrt: WinRtSlots,             // 0-5
-    pub before_get_parent: [usize; 6], // 6-11 FindElementsInHostCoordinates ×4, GetChild, GetChildrenCount
+    pub before_child: [usize; 4],      // 6-9  FindElementsInHostCoordinates ×4
+    pub get_child: unsafe extern "system" fn(
+        this: *mut core::ffi::c_void,
+        element: *mut core::ffi::c_void,
+        index: i32,
+        out: *mut *mut core::ffi::c_void,
+    ) -> HRESULT, // 10
+    pub get_children_count: unsafe extern "system" fn(
+        this: *mut core::ffi::c_void,
+        element: *mut core::ffi::c_void,
+        out: *mut i32,
+    ) -> HRESULT, // 11
     pub get_parent: unsafe extern "system" fn(
         this: *mut core::ffi::c_void,
         object: *mut core::ffi::c_void,
@@ -236,6 +251,16 @@ pub struct CallbackVtbl {
         unsafe extern "system" fn(this: *mut core::ffi::c_void, relation: *const ParentChildRelation, element: *const VisualElement, mutation: i32) -> HRESULT,
     pub on_element_state_changed:
         unsafe extern "system" fn(this: *mut core::ffi::c_void, handle: u64, state: i32, context: *const u16) -> HRESULT,
+    /// Slots the interface does not declare, filled with a stub rather than
+    /// left as zero.
+    ///
+    /// explorer's XAML reads past the end of this table when it dispatches a
+    /// tree callback, and a slot holding zero is an indirect call to a null
+    /// target — which the kernel answers with
+    /// `FAST_FAIL_GUARD_ICALL_CHECK_FAILURE`, taking the shell down. What it
+    /// would do with those slots is not documented; pointed at a stub that
+    /// reports itself they are at worst a logged no-op.
+    pub reserved: [unsafe extern "system" fn(*mut core::ffi::c_void, usize, usize, usize) -> HRESULT; 7],
 }
 
 /// `IObjectWithSite` as we implement it.
@@ -380,6 +405,7 @@ pub unsafe extern "system" fn com_query_interface<T: ComObj>(
         let cell = com_cell::<T>(this);
         let shim = unsafe { weak_source_shim_for(cell) };
         unsafe { *out = shim };
+        trace_query(requested, "IWeakReferenceSource shim");
         return S_OK;
     }
     // The WinRT agility marker: an agile callback is stored as a raw pointer
@@ -389,16 +415,28 @@ pub unsafe extern "system" fn com_query_interface<T: ComObj>(
         let cell = com_cell::<T>(this);
         cell.ref_count().fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         unsafe { *out = this };
+        trace_query(requested, "agile object");
         return S_OK;
     }
 
     if !known {
+        trace_query(requested, "E_NOINTERFACE");
         return E_NOINTERFACE;
     }
     let cell = com_cell::<T>(this);
     cell.ref_count().fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     unsafe { *out = this };
+    trace_query(requested, "ok");
     S_OK
+}
+
+/// Record what the framework asked a hand-rolled object for and what it got.
+///
+/// Written synchronously and without allocating: the interesting case is the
+/// one where the answer is `E_NOINTERFACE` and the framework then calls a null
+/// pointer, and by the time the logger thread woke up, the process is gone.
+fn trace_query(requested: &GUID, answer: &str) {
+    crate::logging::debug_log_fmt_sync(format_args!("qi {requested:?} -> {answer}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +684,34 @@ pub unsafe fn release_raw(raw: *mut core::ffi::c_void) {
     }
 }
 
+/// Run a COM entry point body, turning a panic into a failed `HRESULT`.
+///
+/// A panic must never reach an `extern "system"` boundary: Rust aborts the
+/// process, and here that process is explorer — the user's desktop dies and
+/// restarts, the host notices a new taskbar and injects again, and the whole
+/// thing loops. So every entry point the framework, the OS or our own hooks can
+/// reach goes through this, and the panic text goes to the log instead.
+pub fn guard(body: impl FnOnce() -> HRESULT) -> HRESULT {
+    guard_value(E_FAIL, body)
+}
+
+/// [`guard`] for entry points whose return type is not an `HRESULT` (the hook
+/// proc returns an `LRESULT`).
+pub fn guard_value<R>(fallback: R, body: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(payload) => {
+            let text = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "opaque panic".into());
+            crate::logging::debug_log_fmt(format_args!("COM entry point panicked: {text}"));
+            fallback
+        }
+    }
+}
+
 /// Take a reference on a raw interface pointer, for the cases where a caller
 /// hands us a borrowed one (a COM `[in]` parameter) that has to outlive the
 /// call.
@@ -672,6 +738,57 @@ pub unsafe fn same_raw_identity(unknown: &IUnknown, raw: *mut core::ffi::c_void)
     release_raw(mine.unwrap_or(core::ptr::null_mut()));
     release_raw(theirs.unwrap_or(core::ptr::null_mut()));
     equal
+}
+
+/// Describe a code address as `module+0xoffset`.
+///
+/// Foreign vtables are the one thing in this crate that cannot be checked by
+/// reading our own code: a slot that holds garbage, or a null, only shows up as
+/// a crash inside the framework. Logging what the slots point at turns "it
+/// crashed in explorer" into a readable answer.
+pub fn describe_address(address: usize) -> String {
+    use windows::Win32::System::LibraryLoader::{
+        GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+    if address == 0 {
+        return "null".to_string();
+    }
+    let mut module = windows::Win32::Foundation::HMODULE::default();
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            windows::core::PCWSTR(address as *const u16),
+            &mut module,
+        )
+    };
+    if found.is_err() {
+        return format!("{address:#x} (in no loaded module)");
+    }
+    let mut buffer = [0u16; 260];
+    let len = unsafe { GetModuleFileNameW(Some(module), &mut buffer) };
+    let len = (len as usize).min(buffer.len());
+    let path = String::from_utf16_lossy(&buffer[..len]);
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
+    match address.checked_sub(module.0 as usize) {
+        Some(offset) => format!("{name}+{offset:#x}"),
+        None => format!("{name} {address:#x}"),
+    }
+}
+
+/// Read the first `count` pointers of a foreign vtable, as descriptions.
+pub unsafe fn describe_vtable(vtable_owner: *mut core::ffi::c_void, count: usize) -> String {
+    let slots = vtable_owner as *const usize;
+    let mut text = String::new();
+    for index in 0..count {
+        let address = unsafe { *slots.add(index) };
+        let described = describe_address(address);
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(&format!("{index}:{described}"));
+    }
+    text
 }
 
 /// Free a BSTR the XAML diagnostics framework handed to a callback.
@@ -714,7 +831,8 @@ mod tests {
     #[test]
     fn xaml_diagnostics_slots() {
         // xamlOM.idl: GetDispatcher, GetUiLayer, GetApplication,
-        // GetIInspectableFromHandle, GetHandleFromIInspectable, ...
+        // GetIInspectableFromHandle, GetHandleFromIInspectable, HitTest, ...
+        assert_eq!(at(3), offset_of!(IXamlDiagnosticsVtbl, get_ui_layer));
         assert_eq!(at(6), offset_of!(IXamlDiagnosticsVtbl, get_iinspectable_from_handle));
         assert_eq!(at(7), offset_of!(IXamlDiagnosticsVtbl, get_handle_from_iinspectable));
         // Only the prefix we call is modelled; HitTest, RegisterInstance and
@@ -791,6 +909,11 @@ mod tests {
     fn statics_slots() {
         // Media.IVisualTreeHelperStatics: four FindElementsInHostCoordinates
         // overloads, GetChild, GetChildrenCount, then GetParent.
+        assert_eq!(at(10), offset_of!(IVisualTreeHelperStaticsVtbl, get_child));
+        assert_eq!(
+            at(11),
+            offset_of!(IVisualTreeHelperStaticsVtbl, get_children_count)
+        );
         assert_eq!(at(12), offset_of!(IVisualTreeHelperStaticsVtbl, get_parent));
         assert_eq!(at(13), size_of::<IVisualTreeHelperStaticsVtbl>());
         // Hosting.IElementCompositionPreviewStatics: GetElementVisual,

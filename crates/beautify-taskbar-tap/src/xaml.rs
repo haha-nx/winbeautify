@@ -18,13 +18,29 @@ const ACRYLIC_BACKDROP: i32 = 0;
 /// Default-activate a runtime class and QI it to a flat interface from
 /// [`crate::com`]. The returned raw pointer carries one reference.
 unsafe fn activate_as(class: &str, iid: &GUID) -> WResult<*mut core::ffi::c_void> {
-    let factory: IActivationFactory = RoGetActivationFactory(&windows::core::HSTRING::from(class))?;
-    let instance = unsafe { factory.ActivateInstance()? };
+    let factory: IActivationFactory = match RoGetActivationFactory(&windows::core::HSTRING::from(class))
+    {
+        Ok(factory) => factory,
+        Err(error) => {
+            crate::logging::debug_log_fmt(format_args!("{class}: factory failed {error:?}"));
+            return Err(error);
+        }
+    };
+    let instance = match unsafe { factory.ActivateInstance() } {
+        Ok(instance) => instance,
+        Err(error) => {
+            crate::logging::debug_log_fmt(format_args!("{class}: activate failed {error:?}"));
+            return Err(error);
+        }
+    };
     match unsafe { com::qi_raw(&instance, iid) } {
         Some(raw) => Ok(raw),
-        None => Err(windows::core::Error::from_hresult(
-            windows::Win32::Foundation::E_NOINTERFACE,
-        )),
+        None => {
+            crate::logging::debug_log_fmt(format_args!("{class}: QI for {iid:?} failed"));
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_NOINTERFACE,
+            ))
+        }
     }
 }
 
@@ -55,16 +71,19 @@ pub type InitializeXamlDiagnosticsEx = unsafe extern "system" fn(
 /// hosting process has not already got it.
 pub fn get_xaml_diagnostics_entry() -> WResult<InitializeXamlDiagnosticsEx> {
     unsafe {
+        crate::service::debug_log("loading Windows.UI.Xaml.dll");
         let module = LoadLibraryExW(
             windows::core::w!("Windows.UI.Xaml.dll"),
             None,
             LOAD_LIBRARY_FLAGS(0x0000_0800), // LOAD_LIBRARY_SEARCH_SYSTEM32
         )?;
+        crate::service::debug_log_fmt(format_args!("Windows.UI.Xaml.dll at {:p}", module.0));
         let addr = GetProcAddress(
             module,
             windows::core::PCSTR(c"InitializeXamlDiagnosticsEx".as_ptr().cast()),
         )
         .ok_or_else(windows::core::Error::empty)?;
+        crate::service::debug_log("InitializeXamlDiagnosticsEx resolved");
         Ok(core::mem::transmute::<
             unsafe extern "system" fn() -> isize,
             InitializeXamlDiagnosticsEx,
@@ -103,14 +122,48 @@ pub unsafe fn parent_of(object: *mut core::ffi::c_void) -> Option<IUnknown> {
     parent.and_then(|raw| com::adopt(raw).ok())
 }
 
-/// `IFrameworkElement.Name`.
-pub unsafe fn name_of(object: *mut core::ffi::c_void) -> Option<String> {
-    let element = com::qi_from_raw(object, &com::IID_IFRAMEWORK_ELEMENT)?;
-    let name = element_name_raw(element);
-    com::release_raw(element);
-    name
+/// `VisualTreeHelper.GetChildrenCount` and `GetChild`, as owned children.
+///
+/// Used to find the taskbar's background rectangles by looking at the frame,
+/// which is the only way to reach them when the TAP connects after the shell
+/// built the tree: the framework only reports mutations from then on, so the
+/// rectangles' "added" events are in the past.
+pub unsafe fn children_of(object: *mut core::ffi::c_void, limit: usize) -> Vec<IUnknown> {
+    let mut children = Vec::new();
+    let Some(dependency_object) = com::qi_from_raw(object, &com::IID_IDEPENDENCY_OBJECT) else {
+        return children;
+    };
+    let factory = match get_statics(
+        "Windows.UI.Xaml.Media.VisualTreeHelper",
+        &com::IID_IVISUAL_TREE_HELPER_STATICS,
+    ) {
+        Ok(factory) => factory,
+        Err(_) => {
+            com::release_raw(dependency_object);
+            return children;
+        }
+    };
+    let Ok(vtbl) = com::vtbl_of::<com::IVisualTreeHelperStaticsVtbl>(factory) else {
+        com::release_raw(factory);
+        com::release_raw(dependency_object);
+        return children;
+    };
+    let mut count = 0i32;
+    if (vtbl.get_children_count)(factory, dependency_object, &mut count).is_ok() {
+        for index in 0..count.min(limit as i32) {
+            let mut out: *mut core::ffi::c_void = core::ptr::null_mut();
+            if (vtbl.get_child)(factory, dependency_object, index, &mut out).is_ok() && !out.is_null()
+            {
+                if let Ok(child) = com::adopt(out) {
+                    children.push(child);
+                }
+            }
+        }
+    }
+    com::release_raw(factory);
+    com::release_raw(dependency_object);
+    children
 }
-
 /// `IFrameworkElement.ActualWidth`/`ActualHeight`, in DIPs.
 pub unsafe fn actual_size_of(object: *mut core::ffi::c_void) -> Option<(f64, f64)> {
     let element = com::qi_from_raw(object, &com::IID_IFRAMEWORK_ELEMENT)?;
@@ -185,14 +238,26 @@ pub unsafe fn create_solid_brush(color: Color) -> Option<*mut core::ffi::c_void>
 /// `AcrylicBrush` with a backdrop source and the given tint, as an owned raw
 /// brush.
 pub unsafe fn create_acrylic_brush(color: Color) -> Option<*mut core::ffi::c_void> {
-    let brush =
-        activate_as("Windows.UI.Xaml.Media.AcrylicBrush", &com::IID_IACRYLIC_BRUSH).ok()?;
-    let vtbl: &com::IAcrylicBrushVtbl = com::vtbl_of(brush).ok()?;
-    let applied = (vtbl.put_background_source)(brush, ACRYLIC_BACKDROP).is_ok()
-        && (vtbl.put_tint_color)(brush, color).is_ok();
-    if applied {
+    let brush = match activate_as("Windows.UI.Xaml.Media.AcrylicBrush", &com::IID_IACRYLIC_BRUSH) {
+        Ok(brush) => brush,
+        Err(error) => {
+            crate::logging::debug_log_fmt(format_args!("acrylic: activation failed {error:?}"));
+            return None;
+        }
+    };
+    let Ok(vtbl) = com::vtbl_of::<com::IAcrylicBrushVtbl>(brush) else {
+        crate::logging::debug_log("acrylic: no IAcrylicBrush vtable");
+        com::release_raw(brush);
+        return None;
+    };
+    let source = (vtbl.put_background_source)(brush, ACRYLIC_BACKDROP);
+    let tint = (vtbl.put_tint_color)(brush, color);
+    if source.is_ok() && tint.is_ok() {
         Some(brush)
     } else {
+        crate::logging::debug_log_fmt(format_args!(
+            "acrylic: put_BackgroundSource {source:?}, put_TintColor {tint:?}"
+        ));
         com::release_raw(brush);
         None
     }
@@ -283,6 +348,26 @@ pub unsafe fn set_element_child_visual(
     ok
 }
 
+/// The runtime class name of a WinRT object, as the ABI reports it — the only
+/// way to tell what a handle points at when it did not arrive in an event.
+///
+/// Goes through the crate's `IInspectable` rather than a hand-rolled vtable
+/// slot: the ABI hands back an `HSTRING`, and freeing that as if it were a
+/// `BSTR` (which is what a hand-rolled version did) corrupts the heap.
+pub unsafe fn runtime_class_name(object: *mut core::ffi::c_void) -> Option<String> {
+    use windows::core::IInspectable;
+    if object.is_null() {
+        return None;
+    }
+    // Borrowed interface: take a reference of our own to wrap it. `IUnknown` and
+    // `IInspectable` are the same ABI pointer; the cast is the crate's own.
+    com::add_ref_raw(object);
+    let inspectable: IInspectable = com::adopt(object).ok()?.cast().ok()?;
+    let name = inspectable.GetRuntimeClassName().ok();
+    drop(inspectable);
+    name.map(|name| name.to_string_lossy())
+}
+
 /// QI probe for interfaces we only need to test for.
 pub unsafe fn supports(object: *mut core::ffi::c_void, iid: &GUID) -> bool {
     match com::qi_from_raw(object, iid) {
@@ -294,21 +379,6 @@ pub unsafe fn supports(object: *mut core::ffi::c_void, iid: &GUID) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Raw-level helpers used right after an explicit QI.
-// ---------------------------------------------------------------------------
-
-unsafe fn element_name_raw(framework_element: *mut core::ffi::c_void) -> Option<String> {
-    let vtbl: &com::IFrameworkElementVtbl = com::vtbl_of(framework_element).ok()?;
-    let mut raw: *mut u16 = core::ptr::null_mut();
-    if (vtbl.get_name)(framework_element, &mut raw).is_ok() && !raw.is_null() {
-        let text = com::borrow_bstr(raw).map(String::from_utf16_lossy);
-        com::free_bstr(raw);
-        text
-    } else {
-        None
-    }
-}
 
 unsafe fn actual_size_raw(framework_element: *mut core::ffi::c_void) -> Option<(f64, f64)> {
     let vtbl: &com::IFrameworkElementVtbl = com::vtbl_of(framework_element).ok()?;
