@@ -57,10 +57,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, CW_USEDEFAULT,
     HTCLIENT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
     HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, MINMAXINFO, MSG, NCCALCSIZE_PARAMS, SWP_NOZORDER,
-    SW_SHOW, SW_SHOWMINIMIZED, WM_APP, WM_CLOSE, WM_DPICHANGED, WM_DESTROY, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_CHAR, WNDCLASSEXW,
-    WINDOW_EX_STYLE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    SW_SHOW, SW_SHOWMINIMIZED, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DPICHANGED, WM_DESTROY,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_CHAR,
+    WNDCLASSEXW, WINDOW_EX_STYLE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
 use beautify_core::config::Config;
@@ -104,6 +104,15 @@ pub trait Host: Send + Sync {
     fn system_is_light(&self) -> bool;
     /// Store a change and return what was actually stored, after clamping.
     fn update(&self, config: Config) -> Config;
+    /// Store a change that is still in flux — a slider being dragged — and
+    /// return what was stored. Only the in-memory value has to move: the page
+    /// is redrawn from the returned config, and the real work (persisting,
+    /// applying to modules, re-registering hotkeys) happens once, in `update`,
+    /// when the drag ends. Without this split, every pixel of a slider drag
+    /// paid for all of it, and the drag trailed the pointer by the backlog.
+    fn update_preview(&self, config: Config) -> Config {
+        config
+    }
     /// Live values for the status and 关于 rows.
     fn status(&self) -> StatusText;
     /// Run an action row button.
@@ -394,6 +403,7 @@ impl Window {
             self.interaction.hover_part,
             self.interaction.hover_nav,
             self.interaction.hover_window,
+            self.interaction.dropdown_highlight,
         );
 
         // The title-bar buttons are above the page and belong to no row, so
@@ -441,11 +451,22 @@ impl Window {
         self.interaction.hover_nav = nav;
 
         // Highlight whichever entry of an open dropdown is under the pointer.
+        // This has to be part of the "did anything move" answer below, or the
+        // highlight index changes with no repaint to show it — the highlight
+        // then stays frozen on the entry it opened with, however far the
+        // pointer travels down the list.
         if let Some(row_index) = self.interaction.open_dropdown {
             if let Some(rect) = self.dropdown_rect(row_index) {
                 if rect.contains(x, y) {
-                    self.interaction.dropdown_highlight =
-                        ((y - rect.top) / self.metrics.dropdown_row_height()) as usize;
+                    let entries = self
+                        .row(row_index)
+                        .and_then(|row| match row.field.kind {
+                            Kind::Select(choices) => Some(choices.len()),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let index = ((y - rect.top) / self.metrics.dropdown_row_height()) as usize;
+                    self.interaction.dropdown_highlight = index.min(entries.saturating_sub(1));
                 }
             }
         }
@@ -456,6 +477,7 @@ impl Window {
                 self.interaction.hover_part,
                 self.interaction.hover_nav,
                 self.interaction.hover_window,
+                self.interaction.dropdown_highlight,
             )
     }
 
@@ -591,7 +613,9 @@ impl Window {
                     unsafe {
                         SetCapture(self.hwnd);
                     }
-                    self.write_value(row_index, Value::Float(value));
+                    // A preview: the drag itself keeps moving the value, and
+                    // `end_drag` persists it once, when the button goes up.
+                    self.preview_value(row_index, Value::Float(value));
                 }
             }
             (Kind::Select(choices), _) => {
@@ -644,7 +668,21 @@ impl Window {
         // Snap to the step, so the read-out shows the value that will be stored.
         let steps = ((raw - slider.min) / slider.step).round();
         let value = (slider.min + steps * slider.step).clamp(slider.min, slider.max);
-        self.write_value(row_index, Value::Float(value));
+        self.preview_value(row_index, Value::Float(value));
+    }
+
+    /// Persist what a slider drag left in the config.
+    ///
+    /// The drag itself only previewed: this runs the real `update` — the one
+    /// that saves, applies to the modules and re-registers the hotkeys — a
+    /// single time, no matter how far the pointer travelled.
+    fn end_drag(&mut self) {
+        if self.drag_row.take().is_none() {
+            return;
+        }
+        self.interaction.dragging_row = None;
+        let config = self.config.clone();
+        self.commit(config);
     }
 
     /// Switch the sidebar selection.
@@ -664,16 +702,29 @@ impl Window {
 
     /// Write a value and persist it.
     fn write_value(&mut self, row_index: usize, value: Value) {
-        let Some(path) = self.row(row_index).map(|row| row.field.path) else {
-            return;
-        };
-        if path.is_empty() {
-            return;
-        }
-        let mut config = self.config.clone();
-        if access::write(&mut config, path, value) {
+        if let Some(config) = self.value_written(row_index, value) {
             self.commit(config);
         }
+    }
+
+    /// Write a value that a drag is still moving, and redraw from it.
+    fn preview_value(&mut self, row_index: usize, value: Value) {
+        if let Some(config) = self.value_written(row_index, value) {
+            self.config = self.host.update_preview(config);
+            self.palette = Palette::resolve(&self.config, self.host.system_is_light());
+            self.repaint();
+        }
+    }
+
+    /// Apply `value` to a clone of the config, or `None` when the row cannot
+    /// take it.
+    fn value_written(&mut self, row_index: usize, value: Value) -> Option<Config> {
+        let path = self.row(row_index).map(|row| row.field.path)?;
+        if path.is_empty() {
+            return None;
+        }
+        let mut config = self.config.clone();
+        access::write(&mut config, path, value).then_some(config)
     }
 
     /// Hand a changed config to the host and take back what it stored.
@@ -1115,12 +1166,17 @@ impl Window {
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
-                if self.drag_row.take().is_some() {
-                    self.interaction.dragging_row = None;
-                    unsafe {
-                        let _ = ReleaseCapture();
-                    }
+                self.end_drag();
+                unsafe {
+                    let _ = ReleaseCapture();
                 }
+                Some(LRESULT(0))
+            }
+            // Capture can be lost mid-drag — a system menu, another window
+            // grabbing the mouse — and the button-up never arrives. The value
+            // the drag reached still has to be persisted.
+            WM_CAPTURECHANGED => {
+                self.end_drag();
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL => {

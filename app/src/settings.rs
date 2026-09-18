@@ -105,6 +105,15 @@ impl Host for SettingsHost {
         applied
     }
 
+    /// A slider drag's intermediate values. Only the in-memory snapshot moves —
+    /// no save, no module apply, no hotkey re-registration, no event — so the
+    /// page keeps up with the pointer. `update` runs once when the drag ends.
+    fn update_preview(&self, config: Config) -> Config {
+        let state = self.state();
+        state.config.set(config);
+        state.config.get()
+    }
+
     fn status(&self) -> StatusText {
         let state = self.state();
         let config = state.config.get();
