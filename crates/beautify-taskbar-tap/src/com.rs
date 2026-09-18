@@ -55,112 +55,163 @@ pub const IID_IVISUAL_TREE_HELPER_STATICS: GUID =
     GUID::from_u128(0xe75758c4_d25d_4b1d_971f_596f17f12baa);
 pub const IID_IELEMENT_COMPOSITION_PREVIEW_STATICS: GUID =
     GUID::from_u128(0x08c92b38_ec99_4c55_bc85_a1c180b27646);
+pub const IID_ICOMPOSITION_OBJECT: GUID =
+    GUID::from_u128(0xbcb4ad45_7609_4550_934f_16002a68fded);
 
 // ---------------------------------------------------------------------------
 // Foreign vtables
 // ---------------------------------------------------------------------------
+//
+// Each struct below mirrors a foreign vtable from slot 0, so a field's offset
+// *is* its slot index. Slots we never call still have to be present as
+// placeholders: leaving one out shifts every following field onto the wrong
+// method, which is how a `QueryInterface` ends up being called where a getter
+// was meant. `IUnknown` always occupies slots 0-2, and a WinRT interface adds
+// `IInspectable` at 3-5, so a WinRT interface's own methods only start at slot
+// 6. The `slots` tests at the bottom of this file pin every offset against
+// `xamlOM.idl`, the SDK's `desktopwindowxamlsource.idl`, and the WinRT
+// metadata (`Windows.UI.Xaml.winmd`).
+//
+// Every field is `pub`, including the placeholders: the layout is the contract,
+// and most of these structs are only ever read out of foreign memory.
 
-/// Slots 3 (`GetIInspectableFromHandle`) and 7 (`GetHandleFromIInspectable`)
-/// of `IXamlDiagnostics`; everything we do not call is a placeholder.
+/// `IUnknown`: `QueryInterface`, `AddRef`, `Release`.
+pub type UnknownSlots = [usize; 3];
+
+/// The `IUnknown` + `IInspectable` block every `Windows.*` WinRT interface
+/// starts with.
+pub type WinRtSlots = [usize; 6];
+
+/// `IXamlDiagnostics` (`xamlOM.h`). Method order: `GetDispatcher`,
+/// `GetUiLayer`, `GetApplication`, `GetIInspectableFromHandle`,
+/// `GetHandleFromIInspectable`, `HitTest`, `RegisterInstance`,
+/// `GetInitializationData`.
 #[repr(C)]
 pub struct IXamlDiagnosticsVtbl {
-    base: [usize; 3], // GetDispatcher, GetUiLayer, GetApplication
+    pub unknown: UnknownSlots, // 0-2
+    pub get_dispatcher: usize, // 3
+    pub get_ui_layer: usize,   // 4
+    pub get_application: usize, // 5
     pub get_iinspectable_from_handle:
-        unsafe extern "system" fn(this: *mut core::ffi::c_void, handle: u64, out: *mut *mut core::ffi::c_void) -> HRESULT,
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, handle: u64, out: *mut *mut core::ffi::c_void) -> HRESULT, // 6
     pub get_handle_from_iinspectable:
-        unsafe extern "system" fn(this: *mut core::ffi::c_void, instance: *mut core::ffi::c_void, out: *mut u64) -> HRESULT,
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, instance: *mut core::ffi::c_void, out: *mut u64) -> HRESULT, // 7
 }
 
-/// Slot 3 of `IVisualTreeService3` is the inherited
-/// `IVisualTreeService::AdviseVisualTreeChange`; classic COM concatenates
-/// inherited vtables.
+/// The vtable of `IVisualTreeService3`, which inherits `IVisualTreeService2` →
+/// `IVisualTreeService` → `IUnknown`. Classic COM concatenates inherited
+/// vtables, and `AdviseVisualTreeChange` is the *first* method of
+/// `IVisualTreeService`, so it sits at slot 3 — not slot 0.
 #[repr(C)]
 pub struct IVisualTreeServiceVtbl {
+    pub unknown: UnknownSlots, // 0-2
     pub advise_visual_tree_change:
-        unsafe extern "system" fn(this: *mut core::ffi::c_void, callback: *mut core::ffi::c_void) -> HRESULT,
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, callback: *mut core::ffi::c_void) -> HRESULT, // 3
 }
 
-/// Slot 4 of `IDesktopWindowXamlSourceNative` (`get_WindowHandle`).
+/// `IDesktopWindowXamlSourceNative`
+/// (`windows.ui.xaml.hosting.desktopwindowxamlsource.idl`), a classic COM
+/// interface: `AttachToWindow` at 3, `WindowHandle` at 4.
 #[repr(C)]
 pub struct IDesktopWindowXamlSourceNativeVtbl {
-    attach_to_window: usize,
+    pub unknown: UnknownSlots,     // 0-2
+    pub attach_to_window: usize,   // 3
     pub get_window_handle:
-        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut isize) -> HRESULT,
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut isize) -> HRESULT, // 4
 }
 
-/// Slot 3 of `IDesktopWindowXamlSource` (`get_Content`).
+/// `IDesktopWindowXamlSource`, whose `Content` property is its first method.
 #[repr(C)]
 pub struct IDesktopWindowXamlSourceVtbl {
+    pub winrt: WinRtSlots, // 0-5
     pub get_content:
-        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT,
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT, // 6
 }
 
-/// Slot 30 (`get_Name`), 10 (`get_ActualWidth`) and 11 (`get_ActualHeight`)
-/// of `IFrameworkElement`; the remaining slots are placeholders.
+/// `IFrameworkElement`. `Size` comes before `Name` in the interface, so the
+/// three methods we call are not adjacent: `ActualWidth`/`ActualHeight` at
+/// 13/14 and `Name` at 33.
 #[repr(C)]
 pub struct IFrameworkElementVtbl {
-    before_name: [usize; 27], // Triggers .. DataContext
-    pub get_name: unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut u16) -> HRESULT,
-    after_name: [usize; 7], // put_Name .. get_Parent
+    pub winrt: WinRtSlots,        // 0-5
+    pub before_size: [usize; 7],  // 6-12  Triggers .. put_Language
     pub get_actual_width:
-        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut f64) -> HRESULT,
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut f64) -> HRESULT, // 13
     pub get_actual_height:
-        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut f64) -> HRESULT,
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut f64) -> HRESULT, // 14
+    pub before_name: [usize; 18], // 15-32 get_Width .. put_Margin
+    pub get_name: unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut u16) -> HRESULT, // 33
 }
 
-/// Slots 3/4 of `IShape` (`get_Fill`/`put_Fill`).
+/// Slots 6/7 of `IShape` (`get_Fill`/`put_Fill`).
 #[repr(C)]
 pub struct IShapeVtbl {
+    pub winrt: WinRtSlots, // 0-5
     pub get_fill:
-        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT,
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT, // 6
     pub put_fill:
-        unsafe extern "system" fn(this: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> HRESULT,
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> HRESULT, // 7
 }
 
-/// Slot 4 of `ISolidColorBrush` (`put_Color`).
+/// Slots 6/7 of `ISolidColorBrush` (`get_Color`/`put_Color`).
 #[repr(C)]
 pub struct ISolidColorBrushVtbl {
-    get_color: usize,
-    pub put_color: unsafe extern "system" fn(this: *mut core::ffi::c_void, color: Color) -> HRESULT,
+    pub winrt: WinRtSlots, // 0-5
+    pub get_color: usize,  // 6
+    pub put_color: unsafe extern "system" fn(this: *mut core::ffi::c_void, color: Color) -> HRESULT, // 7
 }
 
-/// Slots 4 and 6 of `IAcrylicBrush`; the background source is a plain `i32`
-/// enum in the ABI (`AcrylicBackgroundSource.Backdrop` == 0), not a boxed
-/// value.
+/// Slots 6-9 of `IAcrylicBrush`; the background source is a plain `i32` enum in
+/// the ABI (`AcrylicBackgroundSource.Backdrop` == 0), not a boxed value.
 #[repr(C)]
 pub struct IAcrylicBrushVtbl {
-    get_background_source: usize,
-    pub put_background_source: unsafe extern "system" fn(this: *mut core::ffi::c_void, value: i32) -> HRESULT,
-    get_tint_color: usize,
-    pub put_tint_color: unsafe extern "system" fn(this: *mut core::ffi::c_void, color: Color) -> HRESULT,
+    pub winrt: WinRtSlots,                // 0-5
+    pub get_background_source: usize,     // 6
+    pub put_background_source: unsafe extern "system" fn(this: *mut core::ffi::c_void, value: i32) -> HRESULT, // 7
+    pub get_tint_color: usize,            // 8
+    pub put_tint_color: unsafe extern "system" fn(this: *mut core::ffi::c_void, color: Color) -> HRESULT, // 9
 }
 
-/// Slot 9 of `IVisualTreeHelperStatics` (`GetParent`); the preceding six slots
-/// are the FindElementsInHostCoordinates/GetChild family.
+/// Slot 12 of `IVisualTreeHelperStatics` (`GetParent`); the preceding six
+/// methods are the `FindElementsInHostCoordinates`/`GetChild` family.
 #[repr(C)]
 pub struct IVisualTreeHelperStaticsVtbl {
-    before_get_parent: [usize; 6],
+    pub winrt: WinRtSlots,             // 0-5
+    pub before_get_parent: [usize; 6], // 6-11 FindElementsInHostCoordinates ×4, GetChild, GetChildrenCount
     pub get_parent: unsafe extern "system" fn(
         this: *mut core::ffi::c_void,
         object: *mut core::ffi::c_void,
         out: *mut *mut core::ffi::c_void,
-    ) -> HRESULT,
+    ) -> HRESULT, // 12
 }
 
-/// Slots 3 and 5 of `IElementCompositionPreviewStatics`.
+/// Slots 6-8 of `IElementCompositionPreviewStatics`.
 #[repr(C)]
 pub struct IElementCompositionPreviewStaticsVtbl {
+    pub winrt: WinRtSlots, // 0-5
     pub get_element_visual: unsafe extern "system" fn(
         this: *mut core::ffi::c_void,
         element: *mut core::ffi::c_void,
         out: *mut *mut core::ffi::c_void,
-    ) -> HRESULT,
-    get_element_child_visual: usize,
+    ) -> HRESULT, // 6
+    pub get_element_child_visual: usize, // 7
     pub set_element_child_visual: unsafe extern "system" fn(
         this: *mut core::ffi::c_void,
         element: *mut core::ffi::c_void,
         visual: *mut core::ffi::c_void,
-    ) -> HRESULT,
+    ) -> HRESULT, // 8
+}
+
+/// Slot 6 of `ICompositionObject` (`get_Compositor`), the first method of that
+/// interface. Kept here next to its siblings even though `xaml.rs` owns the
+/// call site.
+#[repr(C)]
+pub struct ICompositionObjectVtbl {
+    pub winrt: WinRtSlots, // 0-5
+    pub get_compositor: unsafe extern "system" fn(
+        this: *mut core::ffi::c_void,
+        out: *mut *mut core::ffi::c_void,
+    ) -> HRESULT, // 6
 }
 
 // ---------------------------------------------------------------------------
@@ -292,10 +343,14 @@ unsafe impl Sync for VtblPtr {}
 pub trait ComObj: Sized {
     /// IIDs answered with `S_OK` besides `IUnknown`.
     const SUPPORTED: &'static [GUID];
-    /// Whether the object should also answer `IAgileObject`. Only safe for
-    /// objects whose methods are thread-safe; the tree callback qualifies
-    /// because every method it runs is marshalled back to the UI thread by
-    /// the framework before reaching our state.
+    /// Whether the object should also answer `IAgileObject`.
+    ///
+    /// It usually should *not*. The reference TAP is `winrt::implements<...,
+    /// non_agile>`, and the diagnostics framework relies on that: a non-agile
+    /// callback is marshalled onto the XAML UI thread before it is invoked,
+    /// which is what makes it legal to touch XAML's thread-affine objects from
+    /// the callback. Answering `IAgileObject` lets the framework invoke us on
+    /// whatever thread it likes.
     const AGILE_CALLBACK: bool = false;
     fn ref_count(&self) -> &core::sync::atomic::AtomicU32;
 }
@@ -579,20 +634,9 @@ pub unsafe fn vtbl_of<'a, V>(this: *mut core::ffi::c_void) -> WResult<&'a V> {
     Ok(&*slot)
 }
 
-/// Identity comparison: two interface pointers are the same object when
-/// `QueryInterface(IUnknown)` hands back the same address.
+/// Identity comparison: are these two references the same object?
 pub fn same_object(a: &IUnknown, b: &IUnknown) -> bool {
-    unsafe {
-        let pa = qi_raw(a, &<IUnknown as Interface>::IID);
-        let pb = qi_raw(b, &<IUnknown as Interface>::IID);
-        let equal = match (pa, pb) {
-            (Some(x), Some(y)) => x == y,
-            _ => false,
-        };
-        release_raw(pa.unwrap_or(core::ptr::null_mut()));
-        release_raw(pb.unwrap_or(core::ptr::null_mut()));
-        equal
-    }
+    unsafe { same_raw_identity(a, b.as_raw()) }
 }
 
 pub unsafe fn release_raw(raw: *mut core::ffi::c_void) {
@@ -602,20 +646,32 @@ pub unsafe fn release_raw(raw: *mut core::ffi::c_void) {
     }
 }
 
-/// Identity comparison between an interface wrapper and a raw pointer.
+/// Take a reference on a raw interface pointer, for the cases where a caller
+/// hands us a borrowed one (a COM `[in]` parameter) that has to outlive the
+/// call.
+pub unsafe fn add_ref_raw(raw: *mut core::ffi::c_void) {
+    if !raw.is_null() {
+        let vtbl = *(raw as *mut *mut windows::core::IUnknown_Vtbl);
+        ((*vtbl).AddRef)(raw);
+    }
+}
+
+/// Identity comparison between an interface wrapper and a raw interface
+/// pointer. Both sides are resolved through `IUnknown` first: two references
+/// to one object do not necessarily hold the same interface pointer, so
+/// comparing them directly reports a mismatch for an object that is in fact
+/// the same.
 pub unsafe fn same_raw_identity(unknown: &IUnknown, raw: *mut core::ffi::c_void) -> bool {
     if raw.is_null() {
         return false;
     }
-    let mine = qi_raw(unknown, &<IUnknown as Interface>::IID);
-    
-    match mine {
-        Some(ptr) => {
-            release_raw(ptr);
-            ptr == raw
-        }
-        None => false,
-    }
+    let iid = <IUnknown as Interface>::IID;
+    let mine = qi_raw(unknown, &iid);
+    let theirs = qi_from_raw(raw, &iid);
+    let equal = matches!((mine, theirs), (Some(a), Some(b)) if a == b);
+    release_raw(mine.unwrap_or(core::ptr::null_mut()));
+    release_raw(theirs.unwrap_or(core::ptr::null_mut()));
+    equal
 }
 
 /// Free a BSTR the XAML diagnostics framework handed to a callback.
@@ -626,7 +682,7 @@ pub unsafe fn free_bstr(bstr: *mut u16) {
     }
 }
 
-/// Read a BSTR the framework handed us, as a UTF-16 string view. The BSTR
+/// Read a BSTR the framework handed to a callback, as a UTF-16 string view. The BSTR
 /// itself is freed immediately; only the view is borrowed.
 pub unsafe fn borrow_bstr<'a>(bstr: *mut u16) -> Option<&'a [u16]> {
     if bstr.is_null() {
@@ -635,4 +691,124 @@ pub unsafe fn borrow_bstr<'a>(bstr: *mut u16) -> Option<&'a [u16]> {
     // BSTRs carry their length in bytes as a u32 right before the characters.
     let len_bytes = *(bstr as *const u32).sub(1) as usize;
     Some(core::slice::from_raw_parts(bstr, len_bytes / 2))
+}
+
+// ---------------------------------------------------------------------------
+// Vtable layout tests
+// ---------------------------------------------------------------------------
+//
+// These pin every method against the vtable slot the OS expects, because a
+// wrong slot does not fail loudly: it calls a neighbouring method with the
+// wrong arguments. Slot sources are named per test.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::{offset_of, size_of};
+
+    /// Offset, in bytes, of vtable entry `slot`.
+    fn at(slot: usize) -> usize {
+        slot * size_of::<usize>()
+    }
+
+    #[test]
+    fn xaml_diagnostics_slots() {
+        // xamlOM.idl: GetDispatcher, GetUiLayer, GetApplication,
+        // GetIInspectableFromHandle, GetHandleFromIInspectable, ...
+        assert_eq!(at(6), offset_of!(IXamlDiagnosticsVtbl, get_iinspectable_from_handle));
+        assert_eq!(at(7), offset_of!(IXamlDiagnosticsVtbl, get_handle_from_iinspectable));
+        // Only the prefix we call is modelled; HitTest, RegisterInstance and
+        // GetInitializationData follow.
+        assert_eq!(at(8), size_of::<IXamlDiagnosticsVtbl>());
+    }
+
+    #[test]
+    fn visual_tree_service_advise_is_slot_three() {
+        // IVisualTreeService3 : IVisualTreeService2 : IVisualTreeService :
+        // IUnknown, and AdviseVisualTreeChange is IVisualTreeService's first
+        // method.
+        assert_eq!(at(3), offset_of!(IVisualTreeServiceVtbl, advise_visual_tree_change));
+        assert_eq!(at(4), size_of::<IVisualTreeServiceVtbl>());
+    }
+
+    #[test]
+    fn visual_tree_service_callback_slots() {
+        // Our own object, called by the framework: OnVisualTreeChange is the
+        // first method IVisualTreeServiceCallback adds to IUnknown.
+        assert_eq!(at(3), offset_of!(CallbackVtbl, on_visual_tree_change));
+        assert_eq!(at(4), offset_of!(CallbackVtbl, on_element_state_changed));
+    }
+
+    #[test]
+    fn object_with_site_and_class_factory_slots() {
+        assert_eq!(at(3), offset_of!(SiteVtbl, set_site));
+        assert_eq!(at(4), offset_of!(SiteVtbl, get_site));
+        assert_eq!(at(3), offset_of!(FactoryVtbl, create_instance));
+        assert_eq!(at(4), offset_of!(FactoryVtbl, lock_server));
+    }
+
+    #[test]
+    fn desktop_window_xaml_source_slots() {
+        // desktopwindowxamlsource.idl: classic COM, AttachToWindow then the
+        // WindowHandle property.
+        assert_eq!(
+            at(4),
+            offset_of!(IDesktopWindowXamlSourceNativeVtbl, get_window_handle)
+        );
+        // WinRT: IUnknown + IInspectable, then get_Content at 6.
+        assert_eq!(at(6), offset_of!(IDesktopWindowXamlSourceVtbl, get_content));
+        assert_eq!(at(7), size_of::<IDesktopWindowXamlSourceVtbl>());
+    }
+
+    #[test]
+    fn framework_element_slots() {
+        // Windows.UI.Xaml.winmd, IFrameworkElement's own method order:
+        // 7 get_ActualWidth, 8 get_ActualHeight, 27 get_Name — after the
+        // six-slot IUnknown + IInspectable prefix.
+        assert_eq!(at(13), offset_of!(IFrameworkElementVtbl, get_actual_width));
+        assert_eq!(at(14), offset_of!(IFrameworkElementVtbl, get_actual_height));
+        assert_eq!(at(33), offset_of!(IFrameworkElementVtbl, get_name));
+        assert_eq!(at(34), size_of::<IFrameworkElementVtbl>());
+    }
+
+    #[test]
+    fn brush_and_shape_slots() {
+        // Shapes.IShape: get_Fill, put_Fill.
+        assert_eq!(at(6), offset_of!(IShapeVtbl, get_fill));
+        assert_eq!(at(7), offset_of!(IShapeVtbl, put_fill));
+        // Media.ISolidColorBrush: get_Color, put_Color.
+        assert_eq!(at(7), offset_of!(ISolidColorBrushVtbl, put_color));
+        // Media.IAcrylicBrush: BackgroundSource, TintColor, ...
+        assert_eq!(
+            at(7),
+            offset_of!(IAcrylicBrushVtbl, put_background_source)
+        );
+        assert_eq!(at(9), offset_of!(IAcrylicBrushVtbl, put_tint_color));
+        assert_eq!(at(10), size_of::<IAcrylicBrushVtbl>());
+    }
+
+    #[test]
+    fn statics_slots() {
+        // Media.IVisualTreeHelperStatics: four FindElementsInHostCoordinates
+        // overloads, GetChild, GetChildrenCount, then GetParent.
+        assert_eq!(at(12), offset_of!(IVisualTreeHelperStaticsVtbl, get_parent));
+        assert_eq!(at(13), size_of::<IVisualTreeHelperStaticsVtbl>());
+        // Hosting.IElementCompositionPreviewStatics: GetElementVisual,
+        // GetElementChildVisual, SetElementChildVisual.
+        assert_eq!(
+            at(6),
+            offset_of!(IElementCompositionPreviewStaticsVtbl, get_element_visual)
+        );
+        assert_eq!(
+            at(8),
+            offset_of!(
+                IElementCompositionPreviewStaticsVtbl,
+                set_element_child_visual
+            )
+        );
+        assert_eq!(at(9), size_of::<IElementCompositionPreviewStaticsVtbl>());
+        // UI.Composition.ICompositionObject: get_Compositor first.
+        assert_eq!(at(6), offset_of!(ICompositionObjectVtbl, get_compositor));
+        assert_eq!(at(7), size_of::<ICompositionObjectVtbl>());
+    }
 }

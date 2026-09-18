@@ -54,7 +54,10 @@ pub struct Watcher {
 
 impl ComObj for Watcher {
     const SUPPORTED: &'static [windows::core::GUID] = SUPPORTED;
-    const AGILE_CALLBACK: bool = true;
+    // Non-agile, like the reference TAP: the framework then marshals every
+    // callback onto the XAML UI thread, which is the thread the tree walking
+    // and the repaints below are required to run on.
+    const AGILE_CALLBACK: bool = false;
     fn ref_count(&self) -> &AtomicU32 {
         &self.ref_count
     }
@@ -113,7 +116,9 @@ impl Watcher {
                     };
                     crate::service::debug_log("advise: diagnostics adopted");
                     let advised = advise_visual_tree_change(&diagnostics, this as *mut _);
-                    crate::service::debug_log(&format!("advise_visual_tree_change -> {advised}"));
+                    crate::service::debug_log_fmt(format_args!(
+                        "advise_visual_tree_change -> {advised}"
+                    ));
                     if advised && event != 0 {
                         let _ = windows::Win32::System::Threading::SetEvent(
                             windows::Win32::Foundation::HANDLE(event as *mut core::ffi::c_void),
@@ -129,7 +134,7 @@ impl Watcher {
                         .map(|s| (*s).to_string())
                         .or_else(|| payload.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "opaque panic".into());
-                    crate::service::debug_log(&format!("advise panicked: {text}"));
+                    crate::service::debug_log_fmt(format_args!("advise panicked: {text}"));
                 }
             });
         watcher
@@ -167,7 +172,9 @@ impl Watcher {
         element: &VisualElement,
         mutation: i32,
     ) {
-        crate::service::debug_log(&format!(
+        // Runs on the XAML UI thread for every mutation in the process, which is
+        // why the log call has to stay allocation-free.
+        crate::service::debug_log_fmt(format_args!(
             "tree change: mutation={mutation} handle={:x}",
             element.handle
         ));
@@ -329,7 +336,9 @@ unsafe fn advise_visual_tree_change(
         Ok(vtbl) => (vtbl.advise_visual_tree_change)(service3, callback).is_ok(),
         Err(_) => false,
     };
-    crate::service::debug_log(&format!("advise: AdviseVisualTreeChange returned {advised}"));
+    crate::service::debug_log_fmt(format_args!(
+        "advise: AdviseVisualTreeChange returned {advised}"
+    ));
     com::release_raw(service3);
     advised
 }

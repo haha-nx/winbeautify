@@ -204,19 +204,8 @@ pub unsafe fn create_acrylic_brush(color: Color) -> Option<*mut core::ffi::c_voi
 pub unsafe fn element_compositor(
     element_object: *mut core::ffi::c_void,
 ) -> WResult<windows::UI::Composition::Compositor> {
-    #[repr(C)]
-    struct ICompositionObjectVtbl {
-        before_compositor: [usize; 6], // IUnknown + IInspectable
-        get_compositor: unsafe extern "system" fn(
-            this: *mut core::ffi::c_void,
-            out: *mut *mut core::ffi::c_void,
-        ) -> windows::core::HRESULT,
-    }
-    const IID_ICOMPOSITION_OBJECT: GUID =
-        GUID::from_u128(0xbcb4ad45_7609_4550_934f_16002a68fded);
-
     let visual = element_visual(element_object)?;
-    let composition_object = com::qi_from_raw(visual.as_raw(), &IID_ICOMPOSITION_OBJECT);
+    let composition_object = com::qi_from_raw(visual.as_raw(), &com::IID_ICOMPOSITION_OBJECT);
     let composition_object = match composition_object {
         Some(raw) => raw,
         None => {
@@ -226,7 +215,7 @@ pub unsafe fn element_compositor(
         }
     };
     let result = (|| {
-        let vtbl: &ICompositionObjectVtbl = com::vtbl_of(composition_object)?;
+        let vtbl: &com::ICompositionObjectVtbl = com::vtbl_of(composition_object)?;
         let mut raw: *mut core::ffi::c_void = core::ptr::null_mut();
         (vtbl.get_compositor)(composition_object, &mut raw).ok()?;
         com::adopt(raw)?.cast::<windows::UI::Composition::Compositor>()

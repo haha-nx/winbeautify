@@ -22,6 +22,7 @@
 
 pub mod com;
 pub mod effects;
+pub mod logging;
 pub mod protocol;
 pub mod service;
 pub mod site;

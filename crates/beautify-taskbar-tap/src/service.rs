@@ -66,6 +66,11 @@ struct ControlInfo {
 
 impl Drop for ControlInfo {
     fn drop(&mut self) {
+        // Both are owned references: `shape` was adopted when the rectangle was
+        // registered, `original` when the shell's fill was read.
+        if let Some(shape) = self.shape.take() {
+            unsafe { com::release_raw(shape.0) };
+        }
         if let Some(original) = self.original.take() {
             unsafe { com::release_raw(original.0) };
         }
@@ -553,61 +558,10 @@ fn ensure_subclass(taskbar: isize) {
 // Diagnostics
 // ---------------------------------------------------------------------------
 
-/// `OutputDebugStringW` — invisible in normal operation, invaluable with a
-/// debugger (or DebugView) attached to explorer.
-///
-/// Additionally, while a `wb_tap_debug.flag` file sits next to the DLL, every
-/// line is appended to `wb_tap_debug.log` in the same directory. This is the
-/// only way to see what the TAP is doing inside explorer without a debugger;
-/// the flag file costs one `exists()` per line and exists only when someone
-/// puts it there deliberately.
-pub fn debug_log(message: &str) {
-    unsafe {
-        use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
-        let wide: Vec<u16> = format!("wb-tap: {message}\0").encode_utf16().collect();
-        OutputDebugStringW(PCWSTR(wide.as_ptr()));
-    }
-    if let Some(dir) = module_dir() {
-        let flag = dir.join("wb_tap_debug.flag");
-        if flag.exists() {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("wb_tap_debug.log"))
-            {
-                use std::io::Write;
-                let _ = writeln!(file, "{stamp} {message}");
-            }
-        }
-    }
-}
-
-/// Directory of this DLL, resolved from our own code address.
-fn module_dir() -> Option<std::path::PathBuf> {
-    const FROM_ADDRESS: u32 = windows::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-        | windows::Win32::System::LibraryLoader::GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
-    let mut handle = windows::Win32::Foundation::HMODULE::default();
-    unsafe {
-        windows::Win32::System::LibraryLoader::GetModuleHandleExW(
-            FROM_ADDRESS,
-            windows::core::PCWSTR(module_dir as *const u16),
-            &mut handle,
-        )
-        .ok()?;
-        let mut buffer = [0u16; 512];
-        let len = windows::Win32::System::LibraryLoader::GetModuleFileNameW(Some(handle), &mut buffer);
-        if len == 0 || (len as usize) >= buffer.len() {
-            return None;
-        }
-        std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize]))
-            .parent()
-            .map(std::path::Path::to_path_buf)
-    }
-}
+/// The TAP's logging lives in [`crate::logging`], which is written to be safe
+/// to call from the COM entry points this module runs under. Re-exported so the
+/// call sites read as plain `debug_log(..)`.
+pub use crate::logging::{debug_log, debug_log_fmt};
 
 /// Unused today, kept for the secondary-taskbar path: the pid of the process
 /// owning a window, for debugging mixed-explorer setups.

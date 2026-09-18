@@ -103,20 +103,21 @@ impl ClassFactory {
         // The framework probes with `CreateInstance(IID_IMarshal)` and falls
         // back to the real interface; every call must be able to hand out a
         // fresh object. Single-connection semantics live in
-        // `TapSite::set_site`. Agility is answered by the standard marshaler
-        // wrapper (see `marshal.rs`).
+        // `TapSite::set_site`, and agility is answered per object through
+        // `ComObj::AGILE_CALLBACK`.
         let tap = com::new_com_object(TapSite {
             vtable: com::VtblPtr(&SITE_VTABLE as *const com::SiteVtbl as *const core::ffi::c_void),
             site: AtomicIsize::new(0),
             ref_count: AtomicU32::new(1),
         });
         let ok = com::com_query_interface::<TapSite>(tap as *mut core::ffi::c_void, iid, out);
-        let iid_text = (!iid.is_null()).then(|| unsafe { *iid }).map(|g| format!("{g:?}"));
-        crate::service::debug_log(&format!(
-            "create_instance: qi ok {}, iid {}",
-            ok.is_ok(),
-            iid_text.unwrap_or_default()
-        ));
+        crate::service::debug_log_fmt(format_args!("create_instance: qi ok {}", ok.is_ok()));
+        if !iid.is_null() {
+            // No `format!` here: this runs on a thread the framework owns, and
+            // a heap allocation on that thread is what wedged explorer before.
+            let iid = unsafe { *iid };
+            crate::service::debug_log_fmt(format_args!("create_instance: iid {iid:?}"));
+        }
         if ok.is_err() {
             com::release_raw(tap as *mut core::ffi::c_void);
         }
@@ -149,9 +150,16 @@ impl TapSite {
             // The site must speak `IXamlDiagnostics` — that is the object the
             // watcher walks the tree with. Rejecting anything else mirrors
             // the reference TAP.
+            //
+            // `SetSite`'s parameter is borrowed, and `adopt` takes ownership of
+            // the reference it is handed, so the watcher's reference has to be
+            // taken here; without this the watcher would release a reference the
+            // framework still owns.
+            com::add_ref_raw(site);
             let unknown = match com::adopt(site) {
                 Ok(unknown) => unknown,
                 Err(_err) => {
+                    com::release_raw(site);
                     crate::service::debug_log("set_site: site adopt failed");
                     return windows::core::HRESULT(1);
                 }
@@ -160,7 +168,7 @@ impl TapSite {
                 com::qi_raw(&unknown, &com::IID_IXAML_DIAGNOSTICS)
                     .map(|raw| com::release_raw(raw))
                     .is_some();
-            crate::service::debug_log(&format!(
+            crate::service::debug_log_fmt(format_args!(
                 "set_site: site speaks IXamlDiagnostics: {speaks_xaml_diagnostics}"
             ));
             if !speaks_xaml_diagnostics {
@@ -181,7 +189,9 @@ impl TapSite {
             }
 
             let event = create_ready_event();
-            crate::service::debug_log(&format!("set_site accepted, ready event handle {event}"));
+            crate::service::debug_log_fmt(format_args!(
+                "set_site accepted, ready event handle {event}"
+            ));
             Watcher::create(unknown, event);
             crate::service::debug_log("site set, watcher advising");
             windows::core::HRESULT(0)
@@ -205,24 +215,37 @@ impl TapSite {
     }
 }
 
-/// Create (or open) the named manual-reset event the host waits on. The
-/// handle ownership transfers to the watcher.
+/// Create (or open) the named manual-reset event the host waits on. The handle
+/// ownership transfers to the watcher.
+///
+/// Allocation-free: `SetSite` calls this, and that runs on a thread the
+/// framework owns.
 fn create_ready_event() -> isize {
+    match open_ready_event() {
+        Ok(handle) => handle.0 as isize,
+        Err(_) => 0,
+    }
+}
+
+/// Open the host's ready event, creating it if the host has not yet.
+fn open_ready_event() -> windows::core::Result<windows::Win32::Foundation::HANDLE> {
+    let mut name = [0u16; 64];
+    let mut len = 0;
+    for unit in crate::protocol::READY_EVENT_NAME.encode_utf16() {
+        if len + 1 >= name.len() {
+            break;
+        }
+        name[len] = unit;
+        len += 1;
+    }
+    name[len] = 0;
     unsafe {
-        let name: Vec<u16> = crate::protocol::READY_EVENT_NAME
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        let event = windows::Win32::System::Threading::CreateEventW(
+        windows::Win32::System::Threading::CreateEventW(
             None,
             true, // manual reset
             false,
             windows::core::PCWSTR(name.as_ptr()),
-        );
-        match event {
-            Ok(handle) if !handle.is_invalid() => handle.0 as isize,
-            _ => 0,
-        }
+        )
     }
 }
 
@@ -237,6 +260,11 @@ fn create_ready_event() -> isize {
 /// tool is already attached. On success the framework pins this module in the
 /// process and drives it through `DllGetClassObject`/`SetSite`.
 fn install_thread(module: isize) {
+    // Before anything else: this thread is ours, so it is the one place where
+    // resolving the DLL directory (which takes the loader lock) and starting the
+    // logger is safe. Every later entry point is reached from threads the
+    // framework owns, where that work can deadlock explorer.
+    crate::logging::start();
     let ok = std::panic::catch_unwind(|| install_inner(module)).unwrap_or_else(|_| {
         crate::service::debug_log("install panicked");
         false
@@ -291,7 +319,9 @@ fn install_inner(module: isize) -> bool {
             crate::service::debug_log("XAML diagnostics connected");
             return true;
         }
-        crate::service::debug_log(&format!("connection attempt {attempt} failed: {hr:?}"));
+        crate::service::debug_log_fmt(format_args!(
+            "connection attempt {attempt} failed: {hr:?}"
+        ));
         attempt += 1;
         if attempt > 60 {
             // 60 × 500 ms, matching the reference implementation.
@@ -316,19 +346,9 @@ fn module_path(module: isize) -> Option<String> {
 
 /// Signal the host: connection established, or definitely failed.
 fn signal_ready() {
-    unsafe {
-        let name: Vec<u16> = crate::protocol::READY_EVENT_NAME
-            .encode_utf16()
-            .chain([0])
-            .collect();
-        let event = windows::Win32::System::Threading::CreateEventW(
-            None,
-            true,
-            false,
-            windows::core::PCWSTR(name.as_ptr()),
-        );
-        if let Ok(handle) = event {
-            if !handle.is_invalid() {
+    if let Ok(handle) = open_ready_event() {
+        if !handle.is_invalid() {
+            unsafe {
                 let _ = windows::Win32::System::Threading::SetEvent(handle);
                 let _ = windows::Win32::Foundation::CloseHandle(handle);
             }
@@ -376,15 +396,31 @@ pub unsafe extern "system" fn tap_hook_proc(
 
 /// Are we loaded into explorer.exe? The hook vehicle can drag the DLL into
 /// other processes on the same desktop; only explorer hosts the taskbar.
+///
+/// Allocates nothing: this runs in the hook proc, which the shell calls from a
+/// win32k callback.
 fn is_explorer() -> bool {
-    unsafe {
-        let mut buffer = [0u16; 260];
-        let len = windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut buffer);
-        let path = String::from_utf16_lossy(&buffer[..len as usize]);
-        path.rsplit(['\\', '/'])
-            .next()
-            .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"))
+    const NAME: &[u8] = b"explorer.exe";
+    let mut buffer = [0u16; 260];
+    let len = unsafe {
+        windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut buffer) as usize
+    };
+    if len < NAME.len() {
+        return false;
     }
+    let start = len - NAME.len();
+    // The name has to be the whole file name, so a separator must precede it:
+    // `my-explorer.exe` is a different program.
+    if start > 0 {
+        let before = buffer[start - 1];
+        if before != b'\\' as u16 && before != b'/' as u16 {
+            return false;
+        }
+    }
+    buffer[start..len]
+        .iter()
+        .zip(NAME)
+        .all(|(unit, expected)| *unit < 0x80 && (*unit as u8).to_ascii_lowercase() == *expected)
 }
 
 /// `DllGetClassObject` — how the XAML diagnostics framework reaches the class
@@ -395,14 +431,16 @@ pub unsafe extern "system" fn DllGetClassObject(
     iid: *const windows::core::GUID,
     out: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    let iid_text = (!iid.is_null())
-        .then(|| unsafe { *iid })
-        .map(|g| format!("{g:?}"));
-    crate::service::debug_log(&format!(
-        "DllGetClassObject clsid match: {}, iid: {}",
-        !clsid.is_null() && *clsid == TAP_CLSID,
-        iid_text.unwrap_or_default()
+    crate::service::debug_log_fmt(format_args!(
+        "DllGetClassObject: clsid matches {}",
+        !clsid.is_null() && *clsid == TAP_CLSID
     ));
+    if !iid.is_null() {
+        // Still no `format!`: the framework calls this while it holds the loader
+        // lock, and taking the heap from here is what wedged explorer.
+        let iid = unsafe { *iid };
+        crate::service::debug_log_fmt(format_args!("DllGetClassObject: iid {iid:?}"));
+    }
     if clsid.is_null() || *clsid != TAP_CLSID {
         return windows::Win32::Foundation::CLASS_E_CLASSNOTAVAILABLE;
     }
