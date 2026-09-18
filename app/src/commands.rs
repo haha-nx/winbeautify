@@ -409,20 +409,6 @@ pub fn flyout_tab(state: State<'_, std::sync::Arc<AppState>>) -> FlyoutTab {
     *state.flyout_tab.read()
 }
 
-/// The widget bar tells us how wide its content is; we own the window.
-#[tauri::command]
-pub fn resize_widget(app: AppHandle, width: i32) {
-    win::reposition_widget(&app, width);
-}
-
-#[tauri::command]
-pub fn widget_height(app: AppHandle) -> i32 {
-    app.get_webview_window(win::WIDGET)
-        .and_then(|w| w.inner_size().ok())
-        .map(|s| s.height as i32)
-        .unwrap_or(0)
-}
-
 #[tauri::command]
 pub fn open_settings(app: AppHandle) {
     crate::settings::open(&app);

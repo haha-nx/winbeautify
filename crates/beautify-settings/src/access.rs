@@ -301,11 +301,10 @@ mod tests {
 
     #[test]
     fn the_schema_helpers_agree_with_the_config_enums() {
-        use beautify_core::config::{TaskbarMode, Theme, WidgetAnchor, WidgetRenderer};
+        use beautify_core::config::{TaskbarMode, Theme, WidgetAnchor};
         assert_eq!(schema::mode_from_id("acrylic"), TaskbarMode::Acrylic);
         assert_eq!(schema::mode_from_id("mica").id(), "mica");
         assert_eq!(schema::theme_from_id("auto"), Theme::Auto);
-        assert_eq!(schema::renderer_from_id("webview"), WidgetRenderer::Webview);
         assert_eq!(
             schema::anchor_from_id("bottom-center"),
             WidgetAnchor::BottomCenter

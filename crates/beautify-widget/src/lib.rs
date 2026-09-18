@@ -26,7 +26,7 @@ pub mod surface;
 pub mod theme;
 pub mod window;
 
-use beautify_core::config::{Config, WidgetRenderer};
+use beautify_core::config::Config;
 use beautify_core::event::Event;
 use beautify_core::geometry::Rect;
 use beautify_core::model::Lyrics;
@@ -282,7 +282,6 @@ impl Module for WidgetModule {
 
     fn is_enabled(&self, config: &Config) -> bool {
         config.widget.enabled
-            && config.widget.renderer == WidgetRenderer::Native
             && config.any_widget_source()
     }
 

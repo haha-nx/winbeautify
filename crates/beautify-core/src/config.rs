@@ -369,26 +369,11 @@ impl WidgetAnchor {
     }
 }
 
-/// How the widget bar is drawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum WidgetRenderer {
-    /// Direct2D in the host process: no webview, so the bar costs a few
-    /// megabytes instead of a few hundred. The default.
-    #[default]
-    Native,
-    /// The original WebView2 bar. Kept as a fallback for machines where the
-    /// native renderer misbehaves, and for previewing both side by side.
-    Webview,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WidgetConfig {
     /// Master switch for the embedded widget bar window.
     pub enabled: bool,
-    /// Which renderer draws the bar.
-    pub renderer: WidgetRenderer,
     pub anchor: WidgetAnchor,
     /// Horizontal nudge from the resolved anchor edge, in physical pixels.
     pub offset_x: i32,
@@ -423,7 +408,6 @@ impl Default for WidgetConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            renderer: WidgetRenderer::Native,
             anchor: WidgetAnchor::TaskbarRight,
             offset_x: -10,
             offset_y: 0,

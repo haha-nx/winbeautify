@@ -1,19 +1,19 @@
 //! Window creation and placement.
 //!
-//! Two windows off the webview renderer, both created from Rust rather than
+//! Window management for the host process. Only the flyout panel still uses
 //! `tauri.conf.json` so their styles can depend on the live configuration:
 //!
 //! * `widget` — the launcher + adaptive audio component, floating over the
 //!   taskbar. Created at startup, lives for the whole session.
-//! Only the widget bar's *webview fallback* is a window here: the flyout panel
-//! and the settings centre are drawn natively, by [`beautify_flyout`] and
+//! a webview; the widget bar and the settings centre are drawn natively, by
+//! [`beautify_widget`] and
 //! [`beautify_settings`] respectively, and each owns its own window.
 //!
 //! The settings window is *not* here: it is drawn natively by
 //! [`beautify_settings`], which owns its own window, and is reached through
 //! [`crate::settings`]. The webview settings page it replaced is gone.
 
-use beautify_core::config::{Config, WidgetAnchor, WidgetRenderer};
+use beautify_core::config::{Config, WidgetAnchor};
 use beautify_core::geometry::Rect;
 use beautify_taskbar::shell;
 use tauri::{
@@ -206,43 +206,12 @@ pub fn ensure_widget(app: &AppHandle) -> tauri::Result<Option<WebviewWindow>> {
     }
     let state = app.state::<std::sync::Arc<AppState>>();
     let config = state.config.get();
-    // The native renderer owns the bar itself; there is no webview to create.
-    if config.widget.renderer == WidgetRenderer::Native {
-        return Ok(None);
-    }
+    // The native renderer owns the bar itself; the WebView2 fallback is gone.
     if !config.widget.enabled || !config.any_widget_source() {
         return Ok(None);
     }
-
-    let geometry = widget_geometry(&config, 220);
-    let builder = WebviewWindowBuilder::new(app, WIDGET, WebviewUrl::App("widget.html".into()))
-        .title("WinBeautify 小组件")
-        .inner_size(geometry.width as f64, geometry.height as f64)
-        .position(geometry.x as f64, geometry.y as f64)
-        .resizable(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .maximizable(false)
-        .minimizable(false)
-        .closable(false)
-        // Never take focus: the widget bar sits on the taskbar and stealing the
-        // foreground would dismiss whatever menu the user just opened.
-        .focused(false)
-        // Built visible on purpose. The geometry is already final at this
-        // point, so there is nothing to avoid showing, and a WebView2 created
-        // into a hidden window can miss its first composition frame — the
-        // window then exists, is visible and hit-testable, but never paints.
-        .visible(true);
-
-    let window = apply_panel_style(builder, config.widget.corner_radius as f64).build()?;
-
-    // Belt and braces on top of `focused(false)`: WS_EX_NOACTIVATE means a
-    // click on the bar cannot activate it either.
-    let _ = window.set_focusable(false);
-    adopt_by_taskbar(&window);
-    state.widget_width.store(geometry.width, std::sync::atomic::Ordering::Release);
-    window.show()?;
-    Ok(Some(window))
+    let _ = state;
+    Ok(None)
 }
 
 /// Make the widget bar an *owned* window of the taskbar.
@@ -286,16 +255,11 @@ fn adopt_by_taskbar(window: &WebviewWindow) {
     }
 }
 
-/// Where the visible bar is, whichever renderer is drawing it.
-///
-/// The native bar reports its own geometry; the webview bar is positioned by
-/// [`widget_geometry`], so the rect is derived from the same numbers.
+/// Where the visible bar is. The native bar reports its own geometry.
 pub fn bar_rect(app: &AppHandle, config: &Config) -> Rect {
     let state = app.state::<std::sync::Arc<AppState>>();
-    if config.widget.renderer == WidgetRenderer::Native {
-        if let Some(rect) = state.widget.rect() {
-            return rect;
-        }
+    if let Some(rect) = state.widget.rect() {
+        return rect;
     }
     let geometry = widget_geometry(config, current_widget_width(app));
     Rect::new(
@@ -326,49 +290,11 @@ pub fn current_widget_width(app: &AppHandle) -> i32 {
         .load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Move and resize the widget bar to match the configuration and `width`.
+/// Record the widget bar width callers computed from the webview side. The
+/// native renderer places its own window, so there is nothing to move here.
 pub fn reposition_widget(app: &AppHandle, width: i32) {
     let state = app.state::<std::sync::Arc<AppState>>();
-    let config = state.config.get();
-    if state.is_shutting_down() {
-        return;
-    }
-    // The native renderer places its own window; there is nothing to move here.
-    if config.widget.renderer == WidgetRenderer::Native {
-        return;
-    }
-    let Some(window) = app.get_webview_window(WIDGET) else {
-        return;
-    };
-    if !config.widget.enabled || !config.any_widget_source() {
-        let _ = window.hide();
-        return;
-    }
-
-    // Respect auto-hide: a retracted taskbar has no room for the bar.
-    if config.widget.hide_with_autohide && shell::is_autohide_enabled() {
-        let retracted = shell::primary_taskbar()
-            .and_then(|bar| {
-                let rect = shell::window_rect(bar)?;
-                let monitor = shell::monitor_rect_of(bar)?;
-                Some(rect.top >= monitor.bottom)
-            })
-            .unwrap_or(false);
-        if retracted {
-            let _ = window.hide();
-            return;
-        }
-    }
-
-    adopt_by_taskbar(&window);
-
-    let geometry = widget_geometry(&config, width);
     state
         .widget_width
-        .store(geometry.width, std::sync::atomic::Ordering::Release);
-    let _ = window.set_size(PhysicalSize::new(geometry.width as u32, geometry.height as u32));
-    let _ = window.set_position(PhysicalPosition::new(geometry.x, geometry.y));
-    if !window.is_visible().unwrap_or(false) {
-        let _ = window.show();
-    }
+        .store(widget_geometry(&state.config.get(), width).width, std::sync::atomic::Ordering::Release);
 }

@@ -11,7 +11,7 @@
 //! `every_field_round_trips` does — a typo in a path fails the test suite rather
 //! than silently doing nothing when the user drags a slider.
 
-use beautify_core::config::{Config, LyricProvider, TaskbarMode, Theme, WidgetAnchor, WidgetRenderer};
+use beautify_core::config::{Config, LyricProvider, TaskbarMode, Theme, WidgetAnchor};
 
 /// How a numeric value is rendered next to its slider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,17 +259,6 @@ const THEMES: &[Choice] = &[
     Choice {
         value: "auto",
         label: "跟随系统",
-    },
-];
-
-const RENDERERS: &[Choice] = &[
-    Choice {
-        value: "native",
-        label: "原生渲染（推荐，占用低）",
-    },
-    Choice {
-        value: "webview",
-        label: "WebView2（兼容回退）",
     },
 ];
 
@@ -626,13 +615,6 @@ const WIDGET: &[Card] = &[
         title: None,
         fields: &[
             switch("widget.enabled", "显示小组件栏"),
-            when(
-                hint(
-                    select("widget.renderer", "渲染方式", RENDERERS),
-                    "原生渲染由 Direct2D 直接绘制，内存占用约 30MB；WebView2 是早期实现，功能相同但会额外拉起 Chromium 进程树（实测约 350MB）。",
-                ),
-                widget_on,
-            ),
             when(
                 switch_hint(
                     "widget.hide_with_autohide",
@@ -1235,14 +1217,6 @@ pub fn theme_from_id(id: &str) -> Theme {
         "light" => Theme::Light,
         "auto" => Theme::Auto,
         _ => Theme::Dark,
-    }
-}
-
-/// Parse a `WidgetRenderer` from its stored id.
-pub fn renderer_from_id(id: &str) -> WidgetRenderer {
-    match id {
-        "webview" => WidgetRenderer::Webview,
-        _ => WidgetRenderer::Native,
     }
 }
 

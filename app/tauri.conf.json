@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "io.winbeautify.app",
   "build": {
-    "frontendDist": "../ui/dist"
+    "frontendDist": "./frontend"
   },
   "app": {
     "withGlobalTauri": false,
@@ -13,21 +13,32 @@
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$LOCALDATA/WinBeautify/clipboard/**"]
+        "scope": [
+          "$LOCALDATA/WinBeautify/clipboard/**"
+        ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "category": "Utility",
     "shortDescription": "Windows 桌面美化与增强工具",
     "longDescription": "任务栏透明/亚克力/云母材质、任务栏歌词与实时频谱、剪贴板历史、任务清单。模块化、事件驱动，常驻后台资源占用极低。",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico"
+    ],
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "languages": ["SimpChinese", "English"]
+        "languages": [
+          "SimpChinese",
+          "English"
+        ]
       }
     }
   }

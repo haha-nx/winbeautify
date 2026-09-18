@@ -91,8 +91,6 @@ fn main() {
             commands::hide_flyout,
             commands::toggle_flyout,
             commands::flyout_tab,
-            commands::resize_widget,
-            commands::widget_height,
             commands::open_settings,
             commands::minimize_settings,
             commands::close_settings,
@@ -119,9 +117,6 @@ fn main() {
 
             if let Err(e) = tray::install(&handle) {
                 tracing::error!("tray icon unavailable: {e}");
-            }
-            if let Err(e) = win::ensure_widget(&handle) {
-                tracing::error!("could not create the widget bar: {e}");
             }
             crate::sync_side_effects(&handle, &manager.get());
 
@@ -250,9 +245,7 @@ fn bridge_events(app: &AppHandle) {
                 let _ = handle.emit("lyric-index", serde_json::json!({ "index": index }));
             }
             Event::Spectrum(frame) => {
-                if handle.get_webview_window(win::WIDGET).is_some() {
-                    let _ = handle.emit_to(win::WIDGET, "spectrum", frame.as_ref());
-                }
+                let _ = handle.emit("spectrum", frame.as_ref());
             }
             Event::TaskbarChanged(taskbar) => {
                 *handle.state::<Arc<AppState>>().taskbar_state.write() = taskbar.as_ref().clone();
@@ -320,23 +313,8 @@ pub fn sync_side_effects(app: &AppHandle, config: &beautify_core::Config) {
     // A disabled widget bar should disappear rather than linger. The native
     // bar is stopped and started by the module registry instead, which rebuilds
     // its state from scratch — so re-push what only the host still knows.
-    if config.widget.renderer == beautify_core::config::WidgetRenderer::Native {
-        sync_flyout_state(app);
-        push_widget_state(app);
-        return;
-    }
-    if let Some(window) = app.get_webview_window(win::WIDGET) {
-        if !config.widget.enabled || !config.any_widget_source() {
-            let _ = window.hide();
-        } else {
-            let width = win::current_widget_width(app);
-            win::reposition_widget(app, width);
-        }
-    } else if config.widget.enabled && config.any_widget_source() {
-        if let Err(e) = win::ensure_widget(app) {
-            tracing::error!("could not create the widget bar: {e}");
-        }
-    }
+    sync_flyout_state(app);
+    push_widget_state(app);
 }
 
 /// Tear everything down and exit. Safe to call more than once.
