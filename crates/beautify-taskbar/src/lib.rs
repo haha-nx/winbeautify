@@ -186,10 +186,13 @@ impl Shared {
             .name("wb-tap-inject".into())
             .spawn(move || {
                 let taskbar = HWND(taskbar_raw as *mut core::ffi::c_void);
-                if let Err(err) = inject::inject(taskbar) {
-                    tracing::warn!("taskbar TAP injection failed: {err}");
-                    return;
-                }
+                let hook = match inject::inject(taskbar) {
+                    Ok(hook) => hook,
+                    Err(err) => {
+                        tracing::warn!("taskbar TAP injection failed: {err}");
+                        return;
+                    }
+                };
                 // The command window appears once the TAP has seen its first
                 // visual tree; give it a moment.
                 let mut found = None;
@@ -205,9 +208,14 @@ impl Shared {
                         thread_shared
                             .tap_window
                             .store(window.0 as isize, Ordering::Release);
+                        // The TAP is live, so the framework holds the DLL and
+                        // the hook has done its job. See `inject::Hook`.
+                        hook.remove();
                         tracing::info!("taskbar TAP channel established");
                     }
                     None => {
+                        // Leave the hook installed rather than risk unmapping a
+                        // DLL whose threads may still be inside the framework.
                         tracing::warn!("TAP connected but its command window never appeared")
                     }
                 }

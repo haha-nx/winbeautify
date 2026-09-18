@@ -34,12 +34,39 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// How long the host waits for the injected DLL to finish connecting before
-/// giving up and leaving the hook. The TAP signals both success and failure.
-const READY_TIMEOUT_MS: u32 = 300_000;
+/// giving up. It has to outlast the TAP's own retry budget (60 attempts at
+/// 500 ms each, matching the reference implementation), so that a failure is
+/// reported by the TAP rather than guessed at by the host.
+const READY_TIMEOUT_MS: u32 = 35_000;
 
 /// Command round-trip budget. The XAML UI thread is responsive; if it is not,
 /// a lost repaint is better than hanging the pump.
 const COMMAND_TIMEOUT_MS: u32 = 2_000;
+
+/// The hook that forced the TAP DLL into explorer, kept installed until the TAP
+/// is confirmed live.
+///
+/// The hook is what keeps the DLL mapped in explorer. Removing it lets the
+/// loader unmap the module, and doing that while the TAP's install or advise
+/// thread is still inside a framework call is a use-after-free that takes the
+/// shell down with it — the shell then restarts, the host injects again, and
+/// explorer crash-loops. So the hook is released only once the TAP's command
+/// window exists, which proves its visual tree callback ran and therefore that
+/// the framework's advise call has returned.
+///
+/// Dropping a `Hook` without calling [`Hook::remove`] deliberately leaves it
+/// installed: an extra no-op hook in the taskbar's message path costs
+/// nanoseconds, an unmapped DLL costs the user their desktop.
+pub struct Hook(HHOOK);
+
+impl Hook {
+    /// Remove the hook. Only safe once the TAP is live (see the type docs).
+    pub fn remove(self) {
+        unsafe {
+            let _ = UnhookWindowsHookEx(self.0);
+        }
+    }
+}
 
 /// Is the channel window still a live window? (Explorer restarts invalidate
 /// the old HWND even though the class name would resolve again once the new
@@ -65,12 +92,12 @@ pub fn find_channel() -> Option<HWND> {
     }
 }
 
-/// Force the TAP DLL into the taskbar's process and wait for it to be ready.
+/// Force the TAP DLL into the taskbar's process and wait for it to connect.
 ///
 /// Blocks for up to `READY_TIMEOUT_MS`; run it on a helper thread so the pump
-/// keeps ticking. The hook is removed once the event fires either way — on
-/// success the framework pins the DLL forever, on failure it unloads.
-pub fn inject(taskbar: HWND) -> Result<(), String> {
+/// keeps ticking. The returned hook must be kept — see [`Hook`] — until the
+/// TAP's command window turns up.
+pub fn inject(taskbar: HWND) -> Result<Hook, String> {
     let dll_path = dll_path().ok_or_else(|| "cannot resolve executable directory".to_string())?;
     if !dll_path.exists() {
         return Err(format!("TAP DLL not found at {}", dll_path.display()));
@@ -120,10 +147,9 @@ pub fn inject(taskbar: HWND) -> Result<(), String> {
             Some(&mut reply),
         );
         let outcome = WaitForSingleObject(ready, READY_TIMEOUT_MS);
-        let _ = UnhookWindowsHookEx(hook);
         let _ = CloseHandle(ready);
         match outcome {
-            WAIT_OBJECT_0 => Ok(()),
+            WAIT_OBJECT_0 => Ok(Hook(hook)),
             WAIT_TIMEOUT => Err("TAP did not signal readiness in time".to_string()),
             code => Err(format!("waiting for TAP readiness failed: {code:?}")),
         }
