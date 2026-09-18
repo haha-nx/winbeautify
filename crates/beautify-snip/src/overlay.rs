@@ -41,8 +41,8 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect, GetDC,
     GetStockObject, IntersectClipRect, ReleaseDC, RestoreDC, SaveDC, SelectObject, SetBkMode,
-    SetStretchBltMode, SetTextColor, StretchDIBits, BACKGROUND_MODE, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, COLORONCOLOR, DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX,
+    SetTextColor, BACKGROUND_MODE, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER, DT_NOPREFIX,
     DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -231,16 +231,17 @@ fn changed_strips(previous: Area, next: Area, pad: i32, width: i32, height: i32)
 
 /// A memory DC with a top-down DIB selected into it.
 ///
-/// Top-down to match how [`Shot`] stores its rows, which is what lets
-/// `StretchDIBits` move a region from the shot to the frame with no flipping.
+/// Top-down to match how [`Shot`] stores its rows, which is what lets the
+/// composers move a region from the shot to the frame with no flipping.
 struct Frame {
     dc: HDC,
     bitmap: HBITMAP,
     previous: HGDIOBJ,
-    /// Base of the pixel buffer, kept so a test can read back what a blit
-    /// actually wrote.
-    #[cfg(test)]
+    /// Base of the pixel buffer. Composition writes this memory directly —
+    /// see `copy_rows` and `expand` for why this does not go through GDI.
     bits: *mut u8,
+    width: i32,
+    height: i32,
 }
 
 impl Frame {
@@ -271,17 +272,29 @@ impl Frame {
             }
         };
         let previous = unsafe { SelectObject(dc, bitmap.into()) };
-        // The magnifier scales a patch of the capture into the frame, and a
-        // screenshot tool is expected to show the pixel grid rather than a
-        // smoothed guess at it.
-        unsafe { SetStretchBltMode(dc, COLORONCOLOR) };
         Some(Self {
             dc,
             bitmap,
             previous,
-            #[cfg(test)]
             bits: bits as *mut u8,
+            width,
+            height,
         })
+    }
+
+    /// The frame's pixel buffer as a slice, one row of `width` pixels.
+    ///
+    /// # Safety
+    ///
+    /// `bits` stays valid for the frame's lifetime, and the frame is only ever
+    /// composed on its own window's thread between messages.
+    unsafe fn pixels(&mut self) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.bits,
+                (self.width as usize * self.height as usize) * 4,
+            )
+        }
     }
 }
 
@@ -453,10 +466,12 @@ fn select(options: Options) -> Result<Captured, Failure> {
         return Err(Failure::Unavailable);
     };
 
-    let session = Box::new(Session {
+    // The whole frame is composed before the window is shown, or the first paint
+    // would blit an uninitialised (black) buffer.
+    let mut session = Box::new(Session {
         hwnd,
-        // `Shot::dim` premultiplies, so a plain SRCCOPY blit of the result is
-        // already the darkened pixel: no alpha blending anywhere.
+        // `Shot::dim` premultiplies, so a plain blit of the result is already
+        // the darkened pixel: no alpha blending anywhere.
         dimmed: screen.dim(options.dim),
         screen,
         origin: (rect.left, rect.top),
@@ -470,10 +485,8 @@ fn select(options: Options) -> Result<Captured, Failure> {
         result: None,
         finished: false,
     });
-    // The whole frame is composed before the window is shown, or the first paint
-    // would blit an uninitialised (black) buffer.
     compose(
-        &session,
+        &mut session,
         Area {
             left: 0,
             top: 0,
@@ -722,7 +735,7 @@ fn repaint(session: &mut Session, areas: &[Area]) {
 
 /// Draw `area` of the frame: the dimmed screen, the bright selection over it,
 /// then the selection's frame.
-fn compose(session: &Session, area: Area) {
+fn compose(session: &mut Session, area: Area) {
     let dc = session.frame.dc;
     // Everything below draws into the frame buffer, which is the size of the
     // whole desktop and knows nothing about `area`. Clipping here is what makes
@@ -739,26 +752,25 @@ fn compose(session: &Session, area: Area) {
     }
 }
 
-fn compose_inner(session: &Session, dc: HDC, area: Area) {
+fn compose_inner(session: &mut Session, dc: HDC, area: Area) {
     // 1. The darkened screen, so anything the selection no longer covers goes
-    //    back to reading as "not taken".
-    blit_dib(dc, &session.dimmed, area);
-
-    // 2. The selection, if there is one: the same rectangle at full brightness,
-    //    so the part that will be taken stands out from the part that will not.
-    if let Some(selection) = session.selection {
-        let bright = Area {
-            left: area.left.max(selection.left),
-            top: area.top.max(selection.top),
-            right: area.right.min(selection.right),
-            bottom: area.bottom.min(selection.bottom),
-        };
-        if bright.width() > 0 && bright.height() > 0 {
-            blit_dib(dc, &session.screen, bright);
+    //    back to reading as "not taken", and the selection at full brightness.
+    //    Both are plain memory writes into the frame's DIB — see `copy_rows`
+    //    for why they do not go through GDI.
+    {
+        let width = session.frame.width;
+        let pixels = unsafe { session.frame.pixels() };
+        copy_rows(&session.dimmed, area, pixels, width, area);
+        if let Some(selection) = session.selection {
+            if let Some(bright) = overlap(selection, area) {
+                copy_rows(&session.screen, bright, pixels, width, area);
+            }
         }
+    }
 
-        // A thin frame around it, drawn as four bands so the pixels inside stay
-        // exactly as captured.
+    // 2. A thin frame around the selection, drawn as four bands so the pixels
+    //    inside stay exactly as captured.
+    if let Some(selection) = session.selection {
         let thickness = (session.screen.width / 1000).clamp(1, 3);
         let brush = unsafe { CreateSolidBrush(COLORREF(session.options.accent.to_bgr_u32())) };
         for band in border_bands(selection, thickness) {
@@ -785,7 +797,15 @@ fn compose_inner(session: &Session, dc: HDC, area: Area) {
         if session.selection.is_none() && !session.dragging {
             draw_hint(session, dc, area, cursor);
         }
-        draw_magnifier(session, dc, area, cursor);
+        // The magnified patch is pixels, not fills, so it is written before the
+        // chrome around it is drawn over it.
+        {
+            let (source, patch) = magnifier_source_and_patch(session, cursor);
+            let width = session.frame.width;
+            let pixels = unsafe { session.frame.pixels() };
+            expand(&session.screen, source, patch, pixels, width, area);
+        }
+        draw_magnifier_chrome(session, dc, area, cursor);
     }
     draw_badge(session, dc, area);
 }
@@ -913,40 +933,45 @@ fn magnifier_area(session: &Session, cursor: (i32, i32)) -> Area {
     .clamped(width, height)
 }
 
-/// The magnifier: the pixels around the pointer, blown up, with the pixel under
-/// it marked and its colour written underneath.
+/// Where the magnifier samples from, and where its patch goes.
 ///
-/// This is the part of a screenshot tool that makes a selection land on the
-/// pixel you meant, which guessing at full-screen zoom never does.
-fn draw_magnifier(session: &Session, dc: HDC, area: Area, cursor: (i32, i32)) {
+/// The patch is next to the pointer, flipped near an edge; the source is the
+/// 21×21 patch around the pointer, clamped to the picture so a corner does not
+/// read outside it.
+fn magnifier_source_and_patch(session: &Session, cursor: (i32, i32)) -> (Area, Area) {
     let plate = magnifier_area(session, cursor);
-    if !intersects(plate, area.to_rect()) {
-        return;
-    }
     let patch = Area {
         left: plate.left,
         top: plate.top,
         right: plate.right,
         bottom: plate.bottom - 18,
     };
-    let zoom = patch.width() / MAGNIFIER_SOURCE;
-    // The source rectangle, relative to the pointer and clamped to the picture
-    // so a corner does not read outside it.
     let half = MAGNIFIER_SOURCE / 2;
     let source_x = (cursor.0 - half).clamp(0, (session.screen.width - MAGNIFIER_SOURCE).max(0));
     let source_y = (cursor.1 - half).clamp(0, (session.screen.height - MAGNIFIER_SOURCE).max(0));
+    let source = Area {
+        left: source_x,
+        top: source_y,
+        right: source_x + MAGNIFIER_SOURCE,
+        bottom: source_y + MAGNIFIER_SOURCE,
+    };
+    (source, patch)
+}
 
-    blit_dib_scaled(
-        dc,
-        &session.screen,
-        Area {
-            left: source_x,
-            top: source_y,
-            right: source_x + MAGNIFIER_SOURCE,
-            bottom: source_y + MAGNIFIER_SOURCE,
-        },
-        patch,
-    );
+/// The magnifier's chrome: the pixel under the pointer outlined inside the
+/// patch, a border around the whole plate, and the coordinate and colour
+/// read-out underneath. The magnified pixels themselves are written by
+/// `expand` before this runs.
+fn draw_magnifier_chrome(session: &Session, dc: HDC, area: Area, cursor: (i32, i32)) {
+    let plate = magnifier_area(session, cursor);
+    if !intersects(plate, area.to_rect()) {
+        return;
+    }
+    let (_, patch) = magnifier_source_and_patch(session, cursor);
+    let zoom = patch.width() / MAGNIFIER_SOURCE;
+    let half = MAGNIFIER_SOURCE / 2;
+    let source_x = (cursor.0 - half).clamp(0, (session.screen.width - MAGNIFIER_SOURCE).max(0));
+    let source_y = (cursor.1 - half).clamp(0, (session.screen.height - MAGNIFIER_SOURCE).max(0));
 
     // The pixel the pointer is on, outlined inside the patch.
     let centre_x = patch.left + (cursor.0 - source_x) * zoom;
@@ -1061,8 +1086,58 @@ fn draw_hint(session: &Session, dc: HDC, area: Area, cursor: (i32, i32)) {
     draw_centered(dc, session.font, "拖动选择区域 · Esc 或右键取消", bounds);
 }
 
-/// Copy a region of a shot into `destination`, scaled to fit it.
-fn blit_dib_scaled(dc: HDC, shot: &Shot, source: Area, destination: Area) {
+/// The intersection of two areas, or `None` when they do not overlap.
+fn overlap(area: Area, clip: Area) -> Option<Area> {
+    let clipped = Area {
+        left: area.left.max(clip.left),
+        top: area.top.max(clip.top),
+        right: area.right.min(clip.right),
+        bottom: area.bottom.min(clip.bottom),
+    };
+    (!clipped.is_empty()).then_some(clipped)
+}
+
+/// Copy `area` of `shot` into a top-down BGRA buffer `width` pixels wide,
+/// limited to `clip`.
+///
+/// This used to be a `StretchDIBits` call, and the magnifier's scaled variant
+/// beside it. Measured on this machine, GDI does not honour either reliably
+/// when the source DIB is the size of the whole desktop: a 1:1 copy drew
+/// correct pixels only while source and destination rectangles coincided, and
+/// the 21×21 → 168×168 magnifier patch drew whatever neighbouring scanlines
+/// the driver's banding pass felt like — the frame buffer held the right
+/// pixels, the screen showed the wrong ones. Writing the buffer directly has
+/// exactly one behaviour on every machine, and it is testable without a
+/// desktop.
+fn copy_rows(shot: &Shot, area: Area, bits: &mut [u8], width: i32, clip: Area) {
+    let Some(area) = overlap(area.clamped(shot.width, shot.height), clip) else {
+        return;
+    };
+    let source_stride = shot.stride();
+    let target_stride = width as usize * 4;
+    for row in area.top..area.bottom {
+        let source = (row as usize * source_stride) + area.left as usize * 4;
+        let target = (row as usize * target_stride) + area.left as usize * 4;
+        let bytes = area.width() as usize * 4;
+        bits[target..target + bytes]
+            .copy_from_slice(&shot.bgra[source..source + bytes]);
+    }
+}
+
+/// Blow `source` up into `destination` on a top-down BGRA buffer `width` wide,
+/// limited to `clip`.
+///
+/// Nearest-neighbour by hand rather than through `StretchDIBits`, for the same
+/// reason as [`copy_rows`] — and because a screenshot tool is expected to show
+/// the pixel grid rather than a smoothed guess at it.
+fn expand(
+    shot: &Shot,
+    source: Area,
+    destination: Area,
+    bits: &mut [u8],
+    width: i32,
+    clip: Area,
+) {
     if source.is_empty() || destination.is_empty() {
         return;
     }
@@ -1073,34 +1148,26 @@ fn blit_dib_scaled(dc: HDC, shot: &Shot, source: Area, destination: Area) {
     {
         return;
     }
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: shot.width,
-            biHeight: -shot.height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
+    let Some(area) = overlap(destination, clip) else {
+        return;
     };
-    unsafe {
-        StretchDIBits(
-            dc,
-            destination.left,
-            destination.top,
-            destination.width(),
-            destination.height(),
-            source.left,
-            source.top,
-            source.width(),
-            source.height(),
-            Some(shot.bgra.as_ptr() as *const core::ffi::c_void),
-            &bmi,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        );
+    let source_stride = shot.stride();
+    let target_stride = width as usize * 4;
+    for row in area.top..area.bottom {
+        // Sample positions come from the unclipped `destination`, so a clip at
+        // the top or left edge shows the part of the picture that belongs
+        // there rather than the top-left corner of the whole patch.
+        let source_row = source.top
+            + ((row - destination.top) * source.height()) / destination.height();
+        let source_base = source_row as usize * source_stride;
+        let target_base = row as usize * target_stride;
+        for column in area.left..area.right {
+            let source_column = source.left
+                + ((column - destination.left) * source.width()) / destination.width();
+            let from = source_base + source_column as usize * 4;
+            let to = target_base + column as usize * 4;
+            bits[to..to + 4].copy_from_slice(&shot.bgra[from..from + 4]);
+        }
     }
 }
 
@@ -1184,52 +1251,6 @@ fn border_bands(selection: Area, thickness: i32) -> [Area; 4] {
             bottom: selection.bottom,
         },
     ]
-}
-
-/// Copy the part of `shot` that `area` covers into the frame at the same place.
-fn blit_dib(dc: HDC, shot: &Shot, area: Area) {
-    if area.width() <= 0 || area.height() <= 0 {
-        tracing::debug!(?area, "a blit was asked for an empty area");
-        return;
-    }
-    if area.left < 0 || area.top < 0 || area.right > shot.width || area.bottom > shot.height {
-        tracing::warn!(
-            ?area,
-            width = shot.width,
-            height = shot.height,
-            "a blit was refused: the area is outside the capture"
-        );
-        return;
-    }
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: shot.width,
-            biHeight: -shot.height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    unsafe {
-        StretchDIBits(
-            dc,
-            area.left,
-            area.top,
-            area.width(),
-            area.height(),
-            area.left,
-            area.top,
-            area.width(),
-            area.height(),
-            Some(shot.bgra.as_ptr() as *const core::ffi::c_void),
-            &bmi,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        );
-    }
 }
 
 /// Borrow the session out of the window's user data.
@@ -1510,17 +1531,17 @@ fn message_font() -> HGDIOBJ {
 mod tests {
     use super::*;
 
-    /// A region blit has to land on the rows that were asked for.
+    /// A region copy has to land on the rows that were asked for.
     ///
     /// This is the check for the worst bug this window has had: the overlay's
     /// dimmed background and its bright selection are both *sub-rectangles* of
-    /// one captured DIB, and if the source rectangle of such a blit is
-    /// interpreted against the wrong end of the bitmap, the picture the user
-    /// drags over has nothing to do with the picture underneath it — while the
-    /// file that comes out (a plain crop of the buffer) is perfectly correct.
+    /// one captured DIB. The copies used to go through `StretchDIBits`, which
+    /// on this machine mangled exactly those sub-rectangle reads — the frame
+    /// buffer then held scanlines from elsewhere in the shot, which is why the
+    /// magnifier showed the wrong part of the screen. The writers are plain
+    /// memory moves now, and this asserts their one behaviour.
     #[test]
-    #[ignore = "needs a desktop session (a screen DC)"]
-    fn a_region_blit_lands_on_the_rows_it_was_asked_for() {
+    fn a_region_copy_lands_on_the_rows_it_was_asked_for() {
         const W: i32 = 8;
         const H: i32 = 16;
         // Every row carries its own index in the blue channel.
@@ -1537,28 +1558,167 @@ mod tests {
             }
         }
 
-        let window_dc = unsafe { GetDC(None) };
-        let frame = Frame::new(window_dc, W, H).expect("a frame");
+        let mut frame = vec![0u8; (W * H * 4) as usize];
         let area = Area {
             left: 0,
             top: 4,
             right: W,
             bottom: 12,
         };
-        blit_dib(frame.dc, &shot, area);
-        unsafe { ReleaseDC(None, window_dc) };
+        copy_rows(&shot, area, &mut frame, W, Area {
+            left: 0,
+            top: 0,
+            right: W,
+            bottom: H,
+        });
 
-        let blue = |y: i32| unsafe { *frame.bits.add((y * W * 4) as usize) };
+        let blue = |y: i32| frame[(y * W * 4) as usize];
         for y in area.top..area.bottom {
             assert_eq!(
                 blue(y),
                 y as u8,
-                "row {y} of the frame holds row {} of the shot: the source                  rectangle is being read from the wrong end",
+                "row {y} of the frame holds row {} of the shot",
                 blue(y)
             );
         }
+        // Rows the copy did not ask for stay untouched.
+        assert_eq!(blue(0), 0);
+        assert_eq!(blue(15), 0);
     }
 
+    /// A copy clipped to a strip only touches that strip.
+    #[test]
+    fn a_copy_stays_inside_its_clip() {
+        let shot = Shot {
+            width: 4,
+            height: 4,
+            bgra: vec![0xAA; (4 * 4 * 4) as usize],
+        };
+        let mut frame = vec![0u8; (4 * 4 * 4) as usize];
+        copy_rows(
+            &shot,
+            Area {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 4,
+            },
+            &mut frame,
+            4,
+            Area {
+                left: 1,
+                top: 2,
+                right: 3,
+                bottom: 4,
+            },
+        );
+        let at = |x: i32, y: i32| frame[((y * 4 + x) * 4) as usize];
+        assert_eq!(at(0, 0), 0, "outside the clip");
+        assert_eq!(at(1, 2), 0xAA, "inside the clip");
+        assert_eq!(at(2, 2), 0xAA);
+        assert_eq!(at(3, 3), 0, "the clip's right edge is exclusive");
+        assert_eq!(at(0, 3), 0);
+    }
+
+    /// The magnifier blows up exactly the pixels it was asked for, in order.
+    #[test]
+    fn the_magnifier_expands_the_sampled_patch_in_order() {
+        const W: i32 = 4;
+        let mut shot = Shot {
+            width: W,
+            height: W,
+            bgra: vec![0; (W * W * 4) as usize],
+        };
+        for y in 0..W {
+            for x in 0..W {
+                let at = ((y * W + x) * 4) as usize;
+                shot.bgra[at] = y as u8;
+                shot.bgra[at + 1] = x as u8;
+                shot.bgra[at + 3] = 0xFF;
+            }
+        }
+        // 2×2 source (1,1)..(3,3) blown up 4× into an 8×8 frame.
+        let mut frame = vec![0u8; (8 * 8 * 4) as usize];
+        expand(
+            &shot,
+            Area {
+                left: 1,
+                top: 1,
+                right: 3,
+                bottom: 3,
+            },
+            Area {
+                left: 0,
+                top: 0,
+                right: 8,
+                bottom: 8,
+            },
+            &mut frame,
+            8,
+            Area {
+                left: 0,
+                top: 0,
+                right: 8,
+                bottom: 8,
+            },
+        );
+        let at = |x: i32, y: i32| (frame[((y * 8 + x) * 4) as usize], frame[((y * 8 + x) * 4 + 1) as usize]);
+        assert_eq!(at(0, 0), (1, 1), "top-left is the source's top-left");
+        assert_eq!(at(7, 0), (1, 2), "top-right is the source's top-right");
+        assert_eq!(at(0, 7), (2, 1), "bottom-left is the source's bottom-left");
+        assert_eq!(at(7, 7), (2, 2));
+        assert_eq!(at(4, 6), (2, 2), "the middle switches where the samples do");
+    }
+
+    /// A magnifier patch clipped by the strip it is being composed into shows
+    /// the part of the picture that belongs at those coordinates, not the
+    /// patch's own top-left corner.
+    #[test]
+    fn an_expansion_clipped_at_the_top_keeps_its_sample_mapping() {
+        const W: i32 = 2;
+        let mut shot = Shot {
+            width: W,
+            height: W,
+            bgra: vec![0; (W * W * 4) as usize],
+        };
+        for y in 0..W {
+            for x in 0..W {
+                let at = ((y * W + x) * 4) as usize;
+                shot.bgra[at] = y as u8;
+                shot.bgra[at + 1] = x as u8;
+            }
+        }
+        // 2×2 source into a 4×4 destination, but only the destination's bottom
+        // half is composed.
+        let mut frame = vec![0u8; (4 * 4 * 4) as usize];
+        expand(
+            &shot,
+            Area {
+                left: 0,
+                top: 0,
+                right: 2,
+                bottom: 2,
+            },
+            Area {
+                left: 0,
+                top: 0,
+                right: 4,
+                bottom: 4,
+            },
+            &mut frame,
+            4,
+            Area {
+                left: 0,
+                top: 2,
+                right: 4,
+                bottom: 4,
+            },
+        );
+        let at = |x: i32, y: i32| (frame[((y * 4 + x) * 4) as usize], frame[((y * 4 + x) * 4 + 1) as usize]);
+        assert_eq!(at(0, 2), (1, 0), "destination row 2 samples source row 1");
+        assert_eq!(at(2, 3), (1, 1));
+        assert_eq!(at(0, 0), (0, 0), "the clipped-off half stays untouched");
+    }
 
     /// Every pixel of `a` and `b` that belongs to only one of them has to be
     /// inside one of the strips.
