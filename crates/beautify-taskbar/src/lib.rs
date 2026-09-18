@@ -17,6 +17,7 @@
 
 pub mod accent;
 pub mod ffi;
+pub mod inject;
 pub mod shell;
 pub mod winver;
 
@@ -26,9 +27,11 @@ use beautify_core::event::Event;
 use beautify_core::geometry::Rect;
 use beautify_core::model::{TaskbarState, TaskbarVisualState};
 use beautify_core::module::{Module, ModuleContext, ModuleResult};
+use beautify_taskbar_tap::protocol::{BrushKind, CommandKind, TapCommand};
 use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -59,6 +62,11 @@ const TIMER_DEBOUNCE: usize = 1;
 const TIMER_SAFETY: usize = 2;
 const DEBOUNCE_MS: u32 = 120;
 const SAFETY_MS: u32 = 3000;
+
+/// Minimum spacing between TAP injection attempts; each attempt can block its
+/// own thread for up to the ready timeout, so this must stay above it or
+/// attempts would pile up.
+const INJECT_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 const WINDOW_CLASS: PCWSTR = w!("WinBeautify.TaskbarHost");
 
@@ -117,6 +125,10 @@ struct Shared {
     pump_hwnd: AtomicIsize,
     pump_thread: AtomicU32,
     dark_theme: AtomicBool,
+    /// Message-only window of the injected TAP, `0` while absent.
+    tap_window: AtomicIsize,
+    /// Rate limiting for `inject` attempts.
+    last_inject_attempt: Mutex<Option<Instant>>,
     /// Set to true once the thread has finished its teardown.
     stopped: AtomicBool,
 }
@@ -131,16 +143,98 @@ impl Shared {
             }
         }
     }
+
+    /// Resolve the TAP control channel for this evaluation: reuse the known
+    /// window, adopt one left over from a previous run, or start an
+    /// injection on a helper thread. `None` means "not available *yet*" —
+    /// the legacy accent path stays in charge until the channel exists.
+    fn resolve_tap(shared: &Arc<Shared>, primary: Option<HWND>) -> Option<HWND> {
+        if !winver::taskbar_ignores_composition_requests() {
+            // Pre-22H2 taskbars still honour composition requests.
+            return None;
+        }
+
+        let mut window = shared.tap_window.load(Ordering::Acquire);
+        if window != 0 && !inject::channel_alive(HWND(window as *mut core::ffi::c_void)) {
+            shared.tap_window.store(0, Ordering::Release);
+            window = 0;
+        }
+        if window == 0 {
+            if let Some(found) = inject::find_channel() {
+                shared.tap_window.store(found.0 as isize, Ordering::Release);
+                window = found.0 as isize;
+            } else if let Some(bar) = primary {
+                Shared::try_inject(shared, bar);
+            }
+        }
+        (window != 0).then_some(HWND(window as *mut core::ffi::c_void))
+    }
+
+    /// Kick off one TAP injection on a helper thread, rate limited so explorer
+    /// restarts cannot turn the safety timer into an injection storm.
+    fn try_inject(shared: &Arc<Shared>, taskbar: HWND) {
+        {
+            let mut last = shared.last_inject_attempt.lock();
+            if last.is_some_and(|at| at.elapsed() < INJECT_RETRY_INTERVAL) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let thread_shared = Arc::clone(shared);
+        let taskbar_raw = taskbar.0 as isize;
+        let spawned = std::thread::Builder::new()
+            .name("wb-tap-inject".into())
+            .spawn(move || {
+                let taskbar = HWND(taskbar_raw as *mut core::ffi::c_void);
+                if let Err(err) = inject::inject(taskbar) {
+                    tracing::warn!("taskbar TAP injection failed: {err}");
+                    return;
+                }
+                // The command window appears once the TAP has seen its first
+                // visual tree; give it a moment.
+                let mut found = None;
+                for _ in 0..50 {
+                    if let Some(window) = inject::find_channel() {
+                        found = Some(window);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                match found {
+                    Some(window) => {
+                        thread_shared
+                            .tap_window
+                            .store(window.0 as isize, Ordering::Release);
+                        tracing::info!("taskbar TAP channel established");
+                    }
+                    None => {
+                        tracing::warn!("TAP connected but its command window never appeared")
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // Allow a retry on the next evaluation.
+            *shared.last_inject_attempt.lock() = None;
+        }
+    }
+
+    /// Forget the channel (explorer restarted, or we are shutting down).
+    fn drop_tap(shared: &Arc<Shared>) {
+        shared.tap_window.store(0, Ordering::Release);
+    }
 }
 
 /// What the module decided for a given moment, kept so the safety timer can
-/// skip work when nothing moved.
+/// skip work when nothing moved. `primary` is part of the key so an explorer
+/// restart (same geometry, new windows) is never mistaken for "unchanged".
 #[derive(Debug, Clone, PartialEq)]
 struct Applied {
     backdrop: Backdrop,
     state: TaskbarVisualState,
     geometry: Option<Rect>,
     bars: usize,
+    tap: bool,
+    primary: isize,
 }
 
 /// Taskbar transparency module.
@@ -164,6 +258,8 @@ impl TaskbarModule {
                 pump_hwnd: AtomicIsize::new(0),
                 pump_thread: AtomicU32::new(0),
                 dark_theme: AtomicBool::new(true),
+                tap_window: AtomicIsize::new(0),
+                last_inject_attempt: Mutex::new(None),
                 stopped: AtomicBool::new(false),
             }),
             thread: Mutex::new(None),
@@ -362,8 +458,20 @@ fn run_pump(shared: Arc<Shared>) -> Result<(), Box<dyn std::error::Error + Send 
             let _ = UnhookWinEvent(hook);
         }
     }
-    // Hand the taskbar back to Windows unless the user explicitly asked to keep
-    // the effect applied after we exit.
+    // Always hand the XAML taskbar back to the shell: the TAP outlives this
+    // module in explorer, and its own worker-death watcher only covers a host
+    // crash, not a clean module stop.
+    let tap = shared.tap_window.load(Ordering::Acquire);
+    if tap != 0 {
+        let mut cmd = beautify_taskbar_tap::protocol::TapCommand::new(
+            beautify_taskbar_tap::protocol::CommandKind::RestoreAll,
+        );
+        cmd.worker_pid = std::process::id();
+        let _ = inject::send(HWND(tap as *mut core::ffi::c_void), &cmd);
+        Shared::drop_tap(&shared);
+    }
+    // Hand the legacy accent back to Windows unless the user explicitly asked
+    // to keep the effect applied after we exit.
     if shared.desired.read().restore_on_exit {
         APPLICATOR.with(|slot| slot.borrow_mut().reset_all());
     }
@@ -505,11 +613,14 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
     };
 
     let backdrop = Backdrop::new(effective_mode, desired.color, desired.opacity);
+    let tap_window = Shared::resolve_tap(shared, primary);
     let applied = Applied {
         backdrop,
         state,
         geometry,
         bars: bars.len(),
+        tap: tap_window.is_some(),
+        primary: primary.map(|h| h.0 as isize).unwrap_or(0),
     };
 
     let unchanged = LAST.with(|slot| slot.borrow().as_ref() == Some(&applied));
@@ -518,22 +629,31 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
     }
 
     if !skip_apply {
-        let mica_ok = MICA_OK.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            *slot.get_or_insert_with(|| primary.map(AccentApplicator::probe_mica).unwrap_or(false))
-        });
-
-        APPLICATOR.with(|slot| {
-            let mut applicator = slot.borrow_mut();
-            applicator.prune();
-            for bar in &bars {
-                if effective_mode == TaskbarMode::Normal {
-                    applicator.reset(*bar);
-                } else {
-                    applicator.apply(*bar, &backdrop, dark, mica_ok);
-                }
+        match tap_window {
+            Some(channel) => {
+                apply_via_tap(shared, channel, &bars, effective_mode, &desired);
             }
-        });
+            None => {
+                let mica_ok = MICA_OK.with(|cell| {
+                    let mut slot = cell.borrow_mut();
+                    *slot.get_or_insert_with(|| {
+                        primary.map(AccentApplicator::probe_mica).unwrap_or(false)
+                    })
+                });
+
+                APPLICATOR.with(|slot| {
+                    let mut applicator = slot.borrow_mut();
+                    applicator.prune();
+                    for bar in &bars {
+                        if effective_mode == TaskbarMode::Normal {
+                            applicator.reset(*bar);
+                        } else {
+                            applicator.apply(*bar, &backdrop, dark, mica_ok);
+                        }
+                    }
+                });
+            }
+        }
     }
 
     LAST.with(|slot| *slot.borrow_mut() = Some(applied.clone()));
@@ -545,30 +665,113 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
             secondary_bars: bars.len().saturating_sub(1) as u32,
             rect: geometry,
             autohide,
-            shell_managed: winver::taskbar_ignores_composition_requests(),
+            shell_managed: tap_window.is_none()
+                && winver::taskbar_ignores_composition_requests(),
         })));
     }
-    warn_if_ignored(effective_mode);
+    warn_if_ignored(effective_mode, tap_window.is_some());
     let _ = hwnd;
     tracing::debug!(
         mode = effective_mode.id(),
         state = ?state,
         bars = bars.len(),
+        tap = tap_window.is_some(),
         dpi = primary.map(|h| unsafe { GetDpiForWindow(h) }).unwrap_or(0),
         "taskbar backdrop applied"
     );
 }
 
+/// Push the resolved visual state through the injected TAP.
+///
+/// Clear keeps the configured tint with zero alpha (fully transparent over
+/// the zeroed window surface), Opaque forces full alpha, Acrylic and Blur
+/// carry the user's opacity. Mica has no XAML counterpart in the TAP — the
+/// DWM material would be covered by the island anyway — so it falls back to
+/// acrylic with a one-time warning.
+fn apply_via_tap(
+    shared: &Arc<Shared>,
+    channel: HWND,
+    bars: &[HWND],
+    mode: TaskbarMode,
+    desired: &Desired,
+) {
+    let alpha = (desired.opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let rgb = (u32::from(desired.color.r) << 16)
+        | (u32::from(desired.color.g) << 8)
+        | u32::from(desired.color.b);
+
+    let mut delivered = true;
+    for bar in bars {
+        let mut cmd = match mode {
+            TaskbarMode::Normal => TapCommand::new(CommandKind::Restore),
+            TaskbarMode::Clear => {
+                let mut cmd = TapCommand::new(CommandKind::Set);
+                cmd.brush = BrushKind::Solid as u32;
+                cmd.argb = rgb; // alpha 0: fully transparent
+                cmd
+            }
+            TaskbarMode::Opaque => {
+                let mut cmd = TapCommand::new(CommandKind::Set);
+                cmd.brush = BrushKind::Solid as u32;
+                cmd.argb = 0xFF00_0000 | rgb;
+                cmd
+            }
+            TaskbarMode::Acrylic => {
+                let mut cmd = TapCommand::new(CommandKind::Set);
+                cmd.brush = BrushKind::Acrylic as u32;
+                cmd.argb = (alpha << 24) | rgb;
+                cmd
+            }
+            TaskbarMode::Blur => {
+                let mut cmd = TapCommand::new(CommandKind::Set);
+                cmd.brush = BrushKind::Blur as u32;
+                cmd.argb = (alpha << 24) | rgb;
+                cmd.blur_amount = 10.0;
+                cmd
+            }
+            TaskbarMode::Mica => {
+                warn_mica_fallback();
+                let mut cmd = TapCommand::new(CommandKind::Set);
+                cmd.brush = BrushKind::Acrylic as u32;
+                cmd.argb = (alpha << 24) | rgb;
+                cmd
+            }
+        };
+        cmd.taskbar = bar.0 as usize;
+        cmd.worker_pid = std::process::id();
+        delivered &= inject::send(channel, &cmd);
+    }
+
+    if !delivered {
+        // The channel is gone (explorer restarted mid-send, or the TAP
+        // refused everything); drop it so the next evaluation rediscovers or
+        // re-injects.
+        Shared::drop_tap(shared);
+    }
+}
+
+/// One-time note that Mica is not reachable through the injected path.
+fn warn_mica_fallback() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "Mica is covered by the taskbar's XAML surface on this build; using acrylic instead"
+        );
+    }
+}
+
 /// Say once, in the log, that the shell is ignoring the request.
 ///
-/// From Windows 11 22H2 the taskbar is a XAML surface inside `explorer.exe`, so
-/// its background is not a window surface and every composition call below
+/// From Windows 11 22H2 the taskbar is a XAML surface inside `explorer.exe`,
+/// so its background is not a window surface and every composition call below
 /// succeeds while changing nothing. Without this the log reads as perfectly
-/// healthy and the app looks broken rather than limited.
-fn warn_if_ignored(mode: TaskbarMode) {
+/// healthy and the app looks broken rather than limited. The message only
+/// applies while the injected TAP is *not* in charge.
+fn warn_if_ignored(mode: TaskbarMode, tap_active: bool) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    if mode == TaskbarMode::Normal || !winver::taskbar_ignores_composition_requests() {
+    if mode == TaskbarMode::Normal || tap_active || !winver::taskbar_ignores_composition_requests()
+    {
         return;
     }
     if WARNED.swap(true, Ordering::Relaxed) {

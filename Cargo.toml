@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/beautify-core",
     "crates/beautify-taskbar",
+    "crates/beautify-taskbar-tap",
     "crates/beautify-media",
     "crates/beautify-clipboard",
     "crates/beautify-todo",
@@ -24,6 +25,7 @@ repository = "https://github.com/winbeautify/winbeautify"
 [workspace.dependencies]
 beautify-core = { path = "crates/beautify-core" }
 beautify-taskbar = { path = "crates/beautify-taskbar" }
+beautify-taskbar-tap = { path = "crates/beautify-taskbar-tap" }
 beautify-media = { path = "crates/beautify-media" }
 beautify-clipboard = { path = "crates/beautify-clipboard" }
 beautify-todo = { path = "crates/beautify-todo" }

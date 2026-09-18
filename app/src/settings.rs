@@ -149,13 +149,7 @@ impl Host for SettingsHost {
         }
 
         status.set_info(InfoKey::Version, env!("CARGO_PKG_VERSION"));
-        status.set_info(
-            InfoKey::Renderer,
-            match config.widget.renderer {
-                beautify_core::config::WidgetRenderer::Native => "原生 Direct2D",
-                beautify_core::config::WidgetRenderer::Webview => "WebView2",
-            },
-        );
+        status.set_info(InfoKey::Renderer, "原生 Direct2D");
         status.set_info(
             InfoKey::Build,
             beautify_taskbar::winver::build_number()
