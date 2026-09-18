@@ -367,28 +367,53 @@ impl Watcher {
         };
         let mut queue = vec![frame];
         let mut visited = 0usize;
+        // The taskbar paints its background with one big `Rectangle`; the other
+        // shapes in the island (running indicators, tray backgrounds) are small.
+        // Picking by size rather than by name: the name property is not readable
+        // from here without faulting inside the shell's string code.
+        let mut best: Option<(f64, u64)> = None;
         while let Some(element) = queue.pop() {
             visited += 1;
-            if visited > 400 {
+            if visited > 4000 {
                 crate::service::debug_log("stopped walking the frame: tree larger than expected");
-                return;
+                break;
             }
             for child in unsafe { xaml::children_of(element.as_raw(), 64) } {
-                // A `Rectangle` with a fill is the background the shell paints;
-                // its sibling with only a stroke is the border. Matching by class
-                // rather than by the element's name property, which is not
-                // readable from here (see `find_frame`).
                 let class = unsafe { xaml::runtime_class_name(child.as_raw()) };
                 if class.as_deref() == Some(RECTANGLE_TYPE) {
-                    if unsafe { xaml::fill_of(child.as_raw()) }.is_some() {
+                    // Size decides, and a null fill does not disqualify: the shell
+                    // has usually not painted the background yet when we get here
+                    // (the reference TAP notes the same), and the rectangle that
+                    // covers the whole taskbar is the one to paint.
+                    let (width, height) =
+                        unsafe { xaml::actual_size_of(child.as_raw()) }.unwrap_or((0.0, 0.0));
+                    let area = width * height;
+                    if best.map(|(best_area, _)| area > best_area).unwrap_or(true) {
                         if let Some(handle) = self.handle_of(&child) {
-                            self.register_rectangle(frame_handle, handle, true);
+                            let fill = unsafe { xaml::fill_of(child.as_raw()) };
+                            let color = fill.and_then(|fill| unsafe { xaml::solid_color_of(fill) });
+                            if let Some(fill) = fill {
+                                unsafe { com::release_raw(fill) };
+                            }
+                            crate::service::debug_log_fmt(format_args!(
+                                "claim: rectangle {width}x{height} fill {color:?} (candidate)"
+                            ));
+                            best = Some((area, handle));
                         }
                     }
                     continue;
                 }
                 queue.push(child);
             }
+        }
+        match best {
+            Some((area, handle)) => {
+                crate::service::debug_log_fmt(format_args!(
+                    "claim: background rectangle is the largest one ({area} dp^2)"
+                ));
+                self.register_rectangle(frame_handle, handle, true);
+            }
+            None => crate::service::debug_log("claim: no filled rectangle inside the frame"),
         }
     }
 

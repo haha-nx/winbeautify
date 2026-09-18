@@ -646,7 +646,25 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
     }
 
     let delivered = match tap_window {
-        Some(channel) => apply_via_tap(shared, channel, &bars, effective_mode, &desired),
+        Some(channel) => {
+            // The XAML fill only covers the island. The taskbar *window* paints
+            // its own surface underneath, and while that one is opaque the island
+            // cannot show what is behind it — a fully transparent fill just
+            // reveals the window's own black. So ask for a transparent window
+            // accent as well: the same DWM accent the pre-22H2 path uses, with
+            // nothing in it. The tint itself comes from the XAML fill.
+            if !skip_apply {
+                let clear_backdrop = Backdrop::new(TaskbarMode::Clear, desired.color, 0.0);
+                APPLICATOR.with(|slot| {
+                    let mut applicator = slot.borrow_mut();
+                    applicator.prune();
+                    for bar in &bars {
+                        applicator.apply(*bar, &clear_backdrop, dark, false);
+                    }
+                });
+            }
+            apply_via_tap(shared, channel, &bars, effective_mode, &desired)
+        }
         None => {
             if !skip_apply {
                 let mica_ok = MICA_OK.with(|cell| {

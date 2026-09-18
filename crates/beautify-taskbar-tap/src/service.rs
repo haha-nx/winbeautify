@@ -62,7 +62,12 @@ fn own(unknown: IUnknown) -> SendPtr {
 #[derive(Default)]
 struct ControlInfo {
     shape: Option<SendPtr>,
+    /// The shell.s own brush, captured once. `None` after capture means the
+    /// shell had not painted the element yet, and restoring means clearing the
+    /// fill again — which is why the capture needs its own flag: a null fill is
+    /// a value to restore to, not "not captured yet".
     original: Option<SendPtr>,
+    captured: bool,
 }
 
 impl Drop for ControlInfo {
@@ -300,20 +305,19 @@ fn set_appearance(cmd: &TapCommand) -> bool {
             debug_log("appearance: the background rectangle is not registered yet");
             return false;
         }
-        if bar.background.original.is_none() {
+        if !bar.background.captured {
             let shape_raw = bar.background.shape.as_ref().map(|s| s.0);
-            let fill = shape_raw.and_then(|raw| unsafe { xaml::fill_of(raw) });
-            let Some(fill) = fill else {
-                debug_log("appearance: the shell.s fill is still null");
-                return false;
-            };
-            bar.background.original = Some(SendPtr(fill));
+            bar.background.original =
+                shape_raw.and_then(|raw| unsafe { xaml::fill_of(raw) }).map(SendPtr);
+            bar.background.captured = true;
+            debug_log("appearance: captured the shell's own fill");
         }
-        if bar.border.shape.is_some() && bar.border.original.is_none() {
+        if bar.border.shape.is_some() && !bar.border.captured {
             let border_raw = bar.border.shape.as_ref().map(|s| s.0);
             bar.border.original = border_raw
                 .and_then(|raw| unsafe { xaml::fill_of(raw) })
                 .map(SendPtr);
+            bar.border.captured = true;
         }
         true
     });
@@ -485,8 +489,10 @@ fn restore_bar(bar: &mut Bar) {
         bar.blur_attached = false;
     }
     for control in [&mut bar.background, &mut bar.border] {
-        if let (Some(shape), Some(original)) = (&control.shape, control.original) {
-            unsafe { xaml::set_fill(shape.0, original.0) };
+        if let Some(shape) = &control.shape {
+            // A missing original is a value: the shell had no fill to begin with.
+            let original = control.original.map(|original| original.0).unwrap_or(core::ptr::null_mut());
+            unsafe { xaml::set_fill(shape.0, original) };
         }
     }
 }
@@ -676,15 +682,26 @@ unsafe extern "system" fn taskbar_subclass(
 
 fn ensure_subclass(taskbar: isize) {
     let already = with_service(|svc| !svc.subclassed.insert(taskbar));
-    if already {
-        return;
+    if !already {
+        let ok = unsafe {
+            SetWindowSubclass(HWND(taskbar as *mut _), Some(taskbar_subclass), SUBCLASS_ID, 0)
+        };
+        if !ok.as_bool() {
+            with_service(|svc| {
+                svc.subclassed.remove(&taskbar);
+            });
+            return;
+        }
     }
-    let ok =
-        unsafe { SetWindowSubclass(HWND(taskbar as *mut _), Some(taskbar_subclass), SUBCLASS_ID, 0) };
-    if !ok.as_bool() {
-        with_service(|svc| {
-            svc.subclassed.remove(&taskbar);
-        });
+    // The window's own surface is painted by the shell and stays opaque until
+    // something asks it to paint; a translucent XAML brush on top of an opaque
+    // surface still looks opaque. Force one paint so the subclass below can
+    // zero the surface out.
+    unsafe {
+        let hwnd = HWND(taskbar as *mut core::ffi::c_void);
+        debug_log("appearance: forcing a taskbar repaint");
+        let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
+        let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
     }
 }
 

@@ -160,7 +160,7 @@ pub struct IShapeVtbl {
 #[repr(C)]
 pub struct ISolidColorBrushVtbl {
     pub winrt: WinRtSlots, // 0-5
-    pub get_color: usize,  // 6
+    pub get_color: unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut Color) -> HRESULT, // 6
     pub put_color: unsafe extern "system" fn(this: *mut core::ffi::c_void, color: Color) -> HRESULT, // 7
 }
 

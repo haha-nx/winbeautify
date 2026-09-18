@@ -408,3 +408,22 @@ unsafe fn source_content_raw(source: *mut core::ffi::c_void) -> Option<*mut core
         None
     }
 }
+
+/// `ISolidColorBrush.Color`, for reading back what a rectangle is painted with.
+pub unsafe fn solid_color_of(brush: *mut core::ffi::c_void) -> Option<Color> {
+    let typed = com::qi_from_raw(brush, &com::IID_ISOLID_COLOR_BRUSH)?;
+    let color = match com::vtbl_of::<com::ISolidColorBrushVtbl>(typed) {
+        Ok(vtbl) => {
+            let mut out = Color::from_argb(0);
+            (vtbl.get_color)(typed, &mut out).is_ok().then_some(out)
+        }
+        Err(_) => None,
+    };
+    com::release_raw(typed);
+    color
+}
+
+/// The brush a shape is filled with, as an owned pointer.
+pub unsafe fn current_fill_of(shape: *mut core::ffi::c_void) -> Option<*mut core::ffi::c_void> {
+    fill_of(shape)
+}
