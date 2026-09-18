@@ -4,7 +4,7 @@
 //! thread owns one and the event bus writes into it, so it is kept behind a
 //! lock and cloned only for the fields that are cheap to clone.
 
-use beautify_core::config::{Config, TaskbarMode};
+use beautify_core::config::Config;
 use beautify_core::model::{Lyrics, MediaSnapshot, SpectrumFrame};
 use std::sync::Arc;
 
@@ -50,6 +50,7 @@ impl WidgetState {
             show_spectrum: cfg.media.enabled && cfg.media.show_spectrum,
             show_lyrics: cfg.media.enabled && cfg.media.show_lyrics,
             show_badge: cfg.todo.enabled && cfg.todo.show_badge && self.open_tasks > 0,
+            launcher_trailing: cfg.widget.anchor.flyout_button_trailing(),
         }
     }
 
@@ -93,17 +94,6 @@ impl WidgetState {
 
     pub fn is_playing(&self) -> bool {
         self.media.status == beautify_core::model::PlaybackStatus::Playing
-    }
-
-    /// Bar opacity, boosted when the taskbar itself is being tinted so the pill
-    /// does not vanish into a taskbar of the same colour.
-    pub fn effective_opacity(&self) -> f32 {
-        let cfg = &self.config;
-        if cfg.taskbar.enabled && cfg.taskbar.mode != TaskbarMode::Normal {
-            cfg.widget.opacity.max(0.35)
-        } else {
-            cfg.widget.opacity
-        }
     }
 
     /// Spectrum bands, padded or truncated to the fixed band count.
@@ -225,12 +215,18 @@ mod tests {
         assert_eq!(bars[3], 0.0, "missing bands pad with silence");
     }
 
+    /// The default bar has no pill, so the theme's pill colour must not leak
+    /// into it. This is the regression that made a faded-out background
+    /// unreadable: the glyph colour used to be derived from the pill.
     #[test]
-    fn a_tinted_taskbar_lifts_a_very_transparent_pill() {
-        let mut state = WidgetState::new(Config::default());
-        let mut cfg = (*state.config).clone();
-        cfg.widget.opacity = 0.05;
-        state.config = Arc::new(cfg);
-        assert!(state.effective_opacity() > 0.3);
+    fn the_default_bar_has_no_background_to_derive_a_colour_from() {
+        let state = WidgetState::new(Config::default());
+        assert_eq!(state.config.widget.opacity, 0.0);
+        let theme = crate::theme::Theme::resolve(&state.config);
+        assert_eq!(theme.pill.a, 0.0);
+        assert!(
+            theme.foreground.a > 0.9,
+            "the glyphs are still there: they are the whole bar"
+        );
     }
 }

@@ -228,6 +228,14 @@ enum Hit {
         value: &'static str,
     },
     DismissDropdown,
+    /// A swatch in an open colour palette, by grid position.
+    ColorChoice {
+        row_index: usize,
+        grid_row: usize,
+        column: usize,
+    },
+    /// A click anywhere else while a palette is open.
+    DismissColor,
     Row(usize),
     Nothing,
 }
@@ -404,6 +412,7 @@ impl Window {
             self.interaction.hover_nav,
             self.interaction.hover_window,
             self.interaction.dropdown_highlight,
+            self.interaction.color_highlight,
         );
 
         // The title-bar buttons are above the page and belong to no row, so
@@ -471,6 +480,16 @@ impl Window {
             }
         }
 
+        // Same for the swatches of an open palette. Unlike the dropdown there is
+        // no "chosen" entry to fall back to: the colour the row holds is marked
+        // by the painter, and this is only the cell the pointer is over.
+        if let Some(row_index) = self.interaction.open_color {
+            let hovered = self
+                .color_popup_rect(row_index)
+                .and_then(|rect| paint::swatch_at(rect, x, y, &self.metrics));
+            self.interaction.color_highlight = hovered;
+        }
+
         previous
             != (
                 self.interaction.hover_row,
@@ -478,6 +497,7 @@ impl Window {
                 self.interaction.hover_nav,
                 self.interaction.hover_window,
                 self.interaction.dropdown_highlight,
+                self.interaction.color_highlight,
             )
     }
 
@@ -488,6 +508,15 @@ impl Window {
             return None;
         };
         paint::dropdown_rect(row, choices.len(), &self.metrics)
+    }
+
+    /// Where a row's colour palette is drawn, if it is a colour row and open.
+    fn color_popup_rect(&self, row_index: usize) -> Option<Rect> {
+        let row = self.row(row_index)?;
+        if !matches!(row.field.kind, Kind::Color) {
+            return None;
+        }
+        paint::color_popup_rect(row, &self.metrics)
     }
 
     /// Work out what a click at `(x, y)` landed on.
@@ -525,6 +554,23 @@ impl Window {
                     value: choice.value,
                 },
                 None => Hit::DismissDropdown,
+            };
+        }
+
+        // An open colour palette swallows it too, for the same reason: a click
+        // that lands beside the grid is a dismissal, not a click on whatever the
+        // grid happens to be covering.
+        if let Some(row_index) = self.interaction.open_color {
+            let cell = self
+                .color_popup_rect(row_index)
+                .and_then(|rect| paint::swatch_at(rect, x, y, &self.metrics));
+            return match cell {
+                Some((grid_row, column)) => Hit::ColorChoice {
+                    row_index,
+                    grid_row,
+                    column,
+                },
+                None => Hit::DismissColor,
             };
         }
 
@@ -570,6 +616,21 @@ impl Window {
             }
             Hit::DismissDropdown => {
                 self.interaction.open_dropdown = None;
+                self.repaint();
+            }
+            Hit::ColorChoice {
+                row_index,
+                grid_row,
+                column,
+            } => {
+                self.interaction.open_color = None;
+                self.interaction.color_highlight = None;
+                let colour = crate::schema::swatch_color(grid_row, column);
+                self.write_value(row_index, Value::Text(colour.to_string()));
+            }
+            Hit::DismissColor => {
+                self.interaction.open_color = None;
+                self.interaction.color_highlight = None;
                 self.repaint();
             }
             Hit::Nothing => {
@@ -633,6 +694,10 @@ impl Window {
                     .unwrap_or(0);
                 self.repaint();
             }
+            // The swatch opens the palette; the hex box beside it stays a text
+            // field, so an exact value is still reachable when the grid is not
+            // precise enough.
+            (Kind::Color, controls::Part::Box(0)) => self.open_palette(row_index),
             (Kind::Hotkey, _) => self.begin_recording(row_index),
             // Every editable box puts the caret in the text, so the value can be
             // corrected by hand as well as dragged.
@@ -695,6 +760,8 @@ impl Window {
         self.active = section;
         self.scroll = 0.0;
         self.interaction.open_dropdown = None;
+        self.interaction.open_color = None;
+        self.interaction.color_highlight = None;
         self.interaction.hover_row = None;
         self.interaction.hover_part = None;
         self.repaint();
@@ -759,6 +826,19 @@ impl Window {
         self.commit_edit();
         self.interaction.recording = Some(row_index);
         self.interaction.recording_text = "请按下组合键…".to_string();
+        self.repaint();
+    }
+
+    /// Open the colour palette for a row.
+    ///
+    /// Any edit in progress is committed first: the palette writes the field,
+    /// and a half-typed hex value would otherwise be committed over the result
+    /// when the palette closes.
+    fn open_palette(&mut self, row_index: usize) {
+        self.commit_edit();
+        self.interaction.open_dropdown = None;
+        self.interaction.open_color = Some(row_index);
+        self.interaction.color_highlight = None;
         self.repaint();
     }
 
@@ -929,6 +1009,18 @@ impl Window {
                     self.repaint();
                 }
                 _ => {}
+            }
+            return;
+        }
+
+        // A palette consumes the keyboard while it is open, so Escape there
+        // means "close the palette" rather than "close the window". There is no
+        // arrow-key navigation to offer: the grid is a pointing target.
+        if self.interaction.open_color.is_some() {
+            if key == 0x1B {
+                self.interaction.open_color = None;
+                self.interaction.color_highlight = None;
+                self.repaint();
             }
             return;
         }

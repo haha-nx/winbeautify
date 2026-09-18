@@ -11,10 +11,10 @@ Windows 桌面美化与增强工具。任务栏材质、任务栏歌词与实时
 
 | 模块 | 内容 |
 |---|---|
-| **任务栏** | 全透明 / 模糊 / 亚克力 Acrylic / 云母 Mica / 纯色，自定义着色与不透明度，副屏任务栏，动态模式（窗口最大化时切换效果），全屏应用自动暂停，退出时还原 |
-| **小组件栏** | 嵌入任务栏的 Widget Bar：启动器 + 自适应宽度的音频组件 |
+| **任务栏** | 正常 / 透明 / 模糊 / 亚克力 Acrylic / 纯色（纯色可自定义着色与不透明度），顶部细线开关，副屏任务栏，动态模式（窗口最大化时切换效果），全屏应用自动暂停，退出时还原 |
+| **小组件栏** | 嵌入任务栏的 Widget Bar：启动器 + 自适应宽度的音频组件；前景色可跟随主题或自定义 |
 | **任务栏歌词** | 通过 GSMTC 读取当前曲目，LRC 解析、可选在线接口（结果只存内存），歌词偏移补偿 |
-| **音乐频谱** | WASAPI 回环捕获系统音频 + rustfft，对数分频，无需虚拟声卡 |
+| **音乐频谱** | WASAPI 回环捕获系统音频 + rustfft，对数分频，无需虚拟声卡；柱状与上下律动两种样式 |
 | **媒体控制** | 指针悬停时显示上一首 / 播放暂停 / 下一首 |
 | **剪贴板** | 事件驱动监听，文本 / 图片 / 文件列表，搜索、收藏（★）、去重、容量上限；图片可一键贴到屏幕 |
 | **任务清单** | SQLite 存储，原生面板内增删改查（勾选、就地改名、删除），Markdown / JSON 导出 |
@@ -117,18 +117,24 @@ pub trait Module: Send + Sync {
 
 ```toml
 [taskbar]
-mode = "acrylic"            # normal | clear | blur | acrylic | mica | opaque
+mode = "acrylic"            # normal | clear | blur | acrylic | opaque
+                            # 只有 opaque（纯色）能改 color / opacity
+show_hairline = false       # 任务栏顶部那条细线，默认隐藏
 dynamic_mode = true         # 窗口最大化时切换到 dynamic_mode_override
 hide_on_fullscreen = true   # 全屏应用前台时还原为系统默认
 restore_on_exit = true      # 退出时把任务栏还给 Windows
 
 [media]
 demo_mode = false           # 预览模式：伪造曲目/歌词/频谱，用来看外观
+spectrum_style = "bars"     # bars（柱状）| bounce（上下律动）
 lyric_provider = "netease"  # off | netease | qq | kugou | lrclib | custom
 online_api = ""             # 仅 lyric_provider = "custom" 时使用
 
 [widget]
 anchor = "taskbar-right"    # taskbar-* / bottom-*
+opacity = 0.0               # 背景不透明度，0 = 只留文字与图标
+color_mode = "theme"        # theme（跟随软件主题）| custom
+foreground = "#FFFFFF"      # 仅 color_mode = "custom" 时使用
 lyric_min_width = 96        # 宽度跟随歌词，这两项是下限/上限（物理像素）
 lyric_max_width = 280
 audio_min_width = 168       # 整个音频组件的下限/上限
@@ -231,8 +237,8 @@ alpha 全部正确合成。
 做宽度动画——既省掉了窗口尺寸与动画不同步的所有竞态，也不会挡住任务栏的点击。
 
 代价是失去 DWM 的亚克力模糊背景（分层窗口不能叠加系统 backdrop）。胶囊是一块半透明
-纯色，而不是磨砂玻璃。设置里的背景不透明度因此默认调到 0.78：没有模糊层托底时，
-太透会让文字对比度不足。
+纯色，而不是磨砂玻璃。由于没有模糊层托底，背景不透明度默认是 **0**：不画胶囊，只留
+文字与图标浮在任务栏上；需要一块底板时再把它调上去。
 
 ### 仍然想用 WebView2
 

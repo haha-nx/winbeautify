@@ -78,22 +78,27 @@ pub enum TaskbarMode {
     Blur,
     /// Win10-1803+/Win11 acrylic: blur plus a noise layer.
     Acrylic,
-    /// Win11 22H2+ Mica / Mica Alt, falling back to acrylic when unsupported.
+    /// Win11 22H2+ Mica / Mica Alt.
     ///
-    /// The default: the whole point of the app is to change how the taskbar
-    /// looks rather than leaving it alone.
+    /// No longer offered and no longer reachable from the settings page: on
+    /// every build where the taskbar is a XAML surface the material sits
+    /// *behind* the island and is covered by it, so this behaved as acrylic.
+    /// The variant is kept because the config format still has to *read*
+    /// `mode = "mica"` — dropping it would make an existing `config.toml` fail
+    /// to parse, and a file that does not parse is quarantined and replaced
+    /// with defaults. [`Config::clamp`] migrates it to acrylic instead.
     #[default]
     Mica,
 }
 
 impl TaskbarMode {
-    pub const ALL: [TaskbarMode; 6] = [
+    /// The modes the settings page offers, in the order it lists them.
+    pub const ALL: [TaskbarMode; 5] = [
         TaskbarMode::Normal,
-        TaskbarMode::Opaque,
         TaskbarMode::Clear,
         TaskbarMode::Blur,
         TaskbarMode::Acrylic,
-        TaskbarMode::Mica,
+        TaskbarMode::Opaque,
     ];
 
     /// Stable identifier used over the Tauri command boundary.
@@ -116,8 +121,19 @@ pub struct TaskbarConfig {
     pub mode: TaskbarMode,
     /// Tint colour behind the taskbar.
     pub color: Color,
-    /// Tint alpha, 0.0 (invisible) .. 1.0 (opaque). Ignored by `Opaque`.
+    /// Tint alpha, 0.0 (invisible) .. 1.0 (opaque).
+    ///
+    /// Only adjustable — and only shown — in [`TaskbarMode::Opaque`]. The
+    /// translucent modes still use whatever is stored here, so switching back
+    /// and forth does not lose the colour that was chosen.
     pub opacity: f32,
+    /// Keep the shell's hairline along the taskbar's top edge.
+    ///
+    /// Off by default. The line exists to separate the taskbar from the
+    /// desktop; it is the wrong cue once the taskbar is translucent and the
+    /// desktop shows through it, and it is the first thing that looks wrong
+    /// when the fill behind it has been replaced.
+    pub show_hairline: bool,
     /// Second taskbars on non-primary monitors get the same treatment.
     pub apply_to_secondary: bool,
     /// TranslucentTB-style "dynamic windows": go clear while any window on the
@@ -138,6 +154,7 @@ impl Default for TaskbarConfig {
             mode: TaskbarMode::Acrylic,
             color: Color::rgb(0x14, 0x16, 0x1c),
             opacity: 0.35,
+            show_hairline: false,
             apply_to_secondary: true,
             dynamic_mode: false,
             dynamic_mode_override: TaskbarMode::Clear,
@@ -193,12 +210,37 @@ impl LyricProvider {
     }
 }
 
+/// How the spectrum bars grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpectrumStyle {
+    /// Level-meter bars standing on the bottom edge.
+    #[default]
+    Bars,
+    /// Bars growing both ways from a centre line, so the display pulses up and
+    /// down instead of rising from the floor.
+    Bounce,
+}
+
+impl SpectrumStyle {
+    pub const ALL: [SpectrumStyle; 2] = [SpectrumStyle::Bars, SpectrumStyle::Bounce];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            SpectrumStyle::Bars => "bars",
+            SpectrumStyle::Bounce => "bounce",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MediaConfig {
     pub enabled: bool,
     pub show_lyrics: bool,
     pub show_spectrum: bool,
+    /// Which way the spectrum bars grow.
+    pub spectrum_style: SpectrumStyle,
     /// Linear gain applied before the log-frequency mapping.
     pub spectrum_sensitivity: f32,
     /// Per-frame smoothing, 0.0 (no smoothing) .. 0.95 (very slow).
@@ -225,6 +267,7 @@ impl Default for MediaConfig {
             enabled: true,
             show_lyrics: true,
             show_spectrum: true,
+            spectrum_style: SpectrumStyle::default(),
             spectrum_sensitivity: 1.0,
             spectrum_smoothing: 0.6,
             lyric_provider: LyricProvider::default(),
@@ -367,6 +410,46 @@ impl WidgetAnchor {
             WidgetAnchor::TaskbarLeft | WidgetAnchor::TaskbarCenter | WidgetAnchor::TaskbarRight
         )
     }
+
+    /// Should the flyout button sit at the bar's trailing end?
+    ///
+    /// Only for the anchors that put the bar on the right — the notification
+    /// area and the bottom-right corner. There the button belongs beside the
+    /// tray, which is the edge the pointer is already near; on a left-hand or
+    /// centred bar it stays on the leading edge, where the bar starts.
+    pub const fn flyout_button_trailing(self) -> bool {
+        matches!(
+            self,
+            WidgetAnchor::TaskbarRight | WidgetAnchor::BottomRight
+        )
+    }
+}
+
+/// Where the widget bar's *foreground* — the lyric, the glyphs, the spectrum —
+/// takes its colour from.
+///
+/// Deliberately separate from [`WidgetConfig::background`]: the pill and the
+/// text on it answer different questions, and tying them together made the bar
+/// unreadable whenever the pill was made light or transparent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WidgetColorMode {
+    /// Follow the app theme: black on the light theme, white on the dark one.
+    #[default]
+    Theme,
+    /// Use [`WidgetConfig::foreground`].
+    Custom,
+}
+
+impl WidgetColorMode {
+    pub const ALL: [WidgetColorMode; 2] = [WidgetColorMode::Theme, WidgetColorMode::Custom];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            WidgetColorMode::Theme => "theme",
+            WidgetColorMode::Custom => "custom",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -382,7 +465,13 @@ pub struct WidgetConfig {
     /// Gap between the bar and the taskbar/tray neighbours.
     pub margin: i32,
     pub background: Color,
+    /// How opaque the background pill is. 0 leaves no pill at all, which is the
+    /// default: the bar then floats on the taskbar as bare glyphs and text.
     pub opacity: f32,
+    /// Where the foreground colour comes from.
+    pub color_mode: WidgetColorMode,
+    /// Foreground colour used when `color_mode` is [`WidgetColorMode::Custom`].
+    pub foreground: Color,
     pub corner_radius: f32,
     /// Width transition duration for the adaptive audio component.
     pub animation_ms: u32,
@@ -413,7 +502,9 @@ impl Default for WidgetConfig {
             offset_y: 0,
             margin: 8,
             background: Color::rgb(0x14, 0x16, 0x1c),
-            opacity: 0.78,
+            opacity: 0.0,
+            color_mode: WidgetColorMode::default(),
+            foreground: Color::rgb(0xFF, 0xFF, 0xFF),
             corner_radius: 8.0,
             animation_ms: 150,
             hide_with_autohide: true,
@@ -563,6 +654,17 @@ impl Config {
     /// Called after every load and every mutation so the rest of the program
     /// never has to re-validate.
     pub fn clamp(&mut self) {
+        // Mica is no longer one of the modes. Migrating here — rather than in a
+        // one-shot version bump — means every path that can produce a config
+        // (a fresh load, a hand-edit, an old file) ends up on a mode the
+        // settings page can actually display. See `TaskbarMode::Mica`.
+        if self.taskbar.mode == TaskbarMode::Mica {
+            self.taskbar.mode = TaskbarMode::Acrylic;
+        }
+        if self.taskbar.dynamic_mode_override == TaskbarMode::Mica {
+            self.taskbar.dynamic_mode_override = TaskbarMode::Acrylic;
+        }
+
         self.taskbar.opacity = self.taskbar.opacity.clamp(0.0, 1.0);
         self.widget.opacity = self.widget.opacity.clamp(0.0, 1.0);
         // Windows rounds window corners at a fixed 8 px (DWMWA_WINDOW_CORNER_PREFERENCE
@@ -708,6 +810,48 @@ mod tests {
         assert_eq!(cfg.widget.audio_min_width, 900);
         // max is pulled up to stay at least min
         assert!(cfg.widget.audio_max_width >= cfg.widget.audio_min_width);
+    }
+
+    /// A config written before Mica was dropped must still load — as acrylic.
+    ///
+    /// If the variant were removed from the enum instead, `toml` would fail to
+    /// parse the file, and a file that does not parse is quarantined and
+    /// replaced with defaults: the user would silently lose every other
+    /// setting they had.
+    #[test]
+    fn a_config_still_naming_mica_loads_as_acrylic() {
+        let cfg = Config::from_toml(
+            "[taskbar]\nmode = \"mica\"\ndynamic_mode_override = \"mica\"\nopacity = 0.5\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.taskbar.mode, TaskbarMode::Acrylic);
+        assert_eq!(cfg.taskbar.dynamic_mode_override, TaskbarMode::Acrylic);
+        assert_eq!(cfg.taskbar.opacity, 0.5, "the rest of the file survives");
+
+        // Mica is reachable by name but is not one of the offered modes.
+        assert!(!TaskbarMode::ALL.contains(&TaskbarMode::Mica));
+        assert_eq!(TaskbarMode::ALL.len(), 5);
+    }
+
+    #[test]
+    fn the_widget_ships_with_no_pill_and_theme_coloured_glyphs() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.widget.opacity, 0.0,
+            "the bar defaults to bare glyphs on the taskbar"
+        );
+        assert_eq!(cfg.widget.color_mode, WidgetColorMode::Theme);
+        assert!(!cfg.taskbar.show_hairline, "the hairline is off by default");
+        assert_eq!(cfg.media.spectrum_style, SpectrumStyle::Bars);
+    }
+
+    #[test]
+    fn every_offered_mode_round_trips_through_the_config_file() {
+        for mode in TaskbarMode::ALL {
+            let text = format!("[taskbar]\nmode = \"{}\"\n", mode.id());
+            let cfg = Config::from_toml(&text).unwrap();
+            assert_eq!(cfg.taskbar.mode, mode, "{} did not survive", mode.id());
+        }
     }
 
     #[test]

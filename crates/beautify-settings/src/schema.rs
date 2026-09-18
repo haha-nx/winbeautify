@@ -11,7 +11,9 @@
 //! `every_field_round_trips` does — a typo in a path fails the test suite rather
 //! than silently doing nothing when the user drags a slider.
 
-use beautify_core::config::{Config, LyricProvider, TaskbarMode, Theme, WidgetAnchor};
+use beautify_core::config::{
+    Config, LyricProvider, SpectrumStyle, TaskbarMode, Theme, WidgetAnchor, WidgetColorMode,
+};
 
 /// How a numeric value is rendered next to its slider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,16 +220,21 @@ pub struct Section {
 // Shared option lists
 // ---------------------------------------------------------------------------
 
-/// The taskbar backdrop modes. Reused by `taskbar.mode` and the dynamic
-/// override, which is why it is one table rather than two.
+/// The taskbar backdrop modes, in the order the page lists them. Reused by
+/// `taskbar.mode` and the dynamic override, which is why it is one table rather
+/// than two.
+///
+/// Only 纯色 carries a user-visible tint: the other modes are defined by the
+/// material rather than by a colour, so the tint rows behind
+/// [`taskbar_solid`] are hidden for them.
 pub const MODES: &[Choice] = &[
     Choice {
         value: "normal",
-        label: "跟随系统（不做修改）",
+        label: "正常（跟随系统）",
     },
     Choice {
         value: "clear",
-        label: "全透明",
+        label: "透明",
     },
     Choice {
         value: "blur",
@@ -238,14 +245,86 @@ pub const MODES: &[Choice] = &[
         label: "亚克力 Acrylic",
     },
     Choice {
-        value: "mica",
-        label: "云母 Mica（Win11 22H2+）",
-    },
-    Choice {
         value: "opaque",
-        label: "纯色不透明",
+        label: "纯色",
     },
 ];
+
+const WIDGET_COLOR_MODES: &[Choice] = &[
+    Choice {
+        value: "theme",
+        label: "跟随软件主题",
+    },
+    Choice {
+        value: "custom",
+        label: "自定义",
+    },
+];
+
+const SPECTRUM_STYLES: &[Choice] = &[
+    Choice {
+        value: "bars",
+        label: "柱状（自下而上）",
+    },
+    Choice {
+        value: "bounce",
+        label: "上下律动（自中间向两侧）",
+    },
+];
+
+// ---------------------------------------------------------------------------
+// The colour palette a swatch opens
+// ---------------------------------------------------------------------------
+
+/// Columns of the palette: one hue step every 30°.
+pub const SWATCH_COLUMNS: usize = 12;
+/// Rows of the palette: a grayscale ramp on top of eight brightness steps.
+pub const SWATCH_ROWS: usize = 9;
+
+/// The colour at `(row, column)` of the palette.
+///
+/// Row 0 is a grayscale ramp — white at the leading edge, black at the trailing
+/// one — which is the row a taskbar tint actually wants most of the time. The
+/// rows below it are the twelve hues at eight brightnesses, so the interesting
+/// colours are one click away without a picker that has to be dragged.
+pub fn swatch_color(row: usize, column: usize) -> beautify_core::geometry::Color {
+    let column = column.min(SWATCH_COLUMNS - 1);
+    let row = row.min(SWATCH_ROWS - 1);
+    let last = (SWATCH_COLUMNS - 1) as f32;
+    if row == 0 {
+        let level = 1.0 - column as f32 / last;
+        return grey(level);
+    }
+    let shades = (SWATCH_ROWS - 1) as f32;
+    let level = 1.0 - (row - 1) as f32 / shades;
+    hsv(column as f32 * (360.0 / SWATCH_COLUMNS as f32), 1.0, level)
+}
+
+fn grey(level: f32) -> beautify_core::geometry::Color {
+    let byte = (level.clamp(0.0, 1.0) * 255.0).round() as u8;
+    beautify_core::geometry::Color::rgb(byte, byte, byte)
+}
+
+/// HSV — hue in degrees, saturation and value in `0..=1` — to sRGB.
+///
+/// Written out rather than pulled in: it is fifteen lines, and the palette is
+/// the only thing in the process that needs it.
+fn hsv(hue: f32, saturation: f32, value: f32) -> beautify_core::geometry::Color {
+    let sector = hue.rem_euclid(360.0) / 60.0;
+    let chroma = value * saturation;
+    let second = chroma * (1.0 - (sector % 2.0 - 1.0).abs());
+    let base = value - chroma;
+    let (r, g, b) = match sector as u32 {
+        0 => (chroma, second, 0.0),
+        1 => (second, chroma, 0.0),
+        2 => (0.0, chroma, second),
+        3 => (0.0, second, chroma),
+        4 => (second, 0.0, chroma),
+        _ => (chroma, 0.0, second),
+    };
+    let byte = |channel: f32| ((channel + base).clamp(0.0, 1.0) * 255.0).round() as u8;
+    beautify_core::geometry::Color::rgb(byte(r), byte(g), byte(b))
+}
 
 const THEMES: &[Choice] = &[
     Choice {
@@ -342,14 +421,20 @@ const LOG_LEVELS: &[Choice] = &[
 fn taskbar_on(c: &Config) -> bool {
     c.taskbar.enabled
 }
-fn taskbar_tinted(c: &Config) -> bool {
-    c.taskbar.enabled && c.taskbar.mode != TaskbarMode::Normal
+/// Only the solid mode has a tint the user can set. The translucent modes still
+/// read the stored colour, so switching away and back does not lose it, but
+/// they are defined by their material rather than by a colour.
+fn taskbar_solid(c: &Config) -> bool {
+    c.taskbar.enabled && c.taskbar.mode == TaskbarMode::Opaque
 }
 fn taskbar_dynamic(c: &Config) -> bool {
     c.taskbar.enabled && c.taskbar.dynamic_mode
 }
 fn widget_on(c: &Config) -> bool {
     c.widget.enabled
+}
+fn widget_custom_foreground(c: &Config) -> bool {
+    c.widget.color_mode == WidgetColorMode::Custom
 }
 fn widget_lyrics(c: &Config) -> bool {
     c.widget.enabled && c.media.show_lyrics
@@ -520,7 +605,15 @@ const APPEARANCE: &[Card] = &[
         title: Some("小组件"),
         fields: &[
             color("widget.background", "背景色"),
-            slider("widget.opacity", "背景不透明度", None, 0.0, 1.0, 0.01, Format::Percent),
+            slider("widget.opacity", "背景不透明度", Some("0 表示不画背景，只留文字与图标。"), 0.0, 1.0, 0.01, Format::Percent),
+            hint(
+                select("widget.color_mode", "前景颜色", WIDGET_COLOR_MODES),
+                "文字、图标与频谱的颜色。跟随主题时，浅色主题为黑色，深色主题为白色。",
+            ),
+            when(
+                color("widget.foreground", "自定义前景色"),
+                widget_custom_foreground,
+            ),
             hint(
                 slider(
                     "widget.corner_radius",
@@ -563,11 +656,25 @@ const TASKBAR: &[Card] = &[
     Card {
         title: Some("效果"),
         fields: &[
-            when(select("taskbar.mode", "背景模式", MODES), taskbar_on),
-            when(color("taskbar.color", "着色"), taskbar_tinted),
+            when(
+                hint(
+                    select("taskbar.mode", "背景模式", MODES),
+                    "只有「纯色」可以自己指定颜色与不透明度；透明、模糊与亚克力由系统材质决定。",
+                ),
+                taskbar_on,
+            ),
+            when(color("taskbar.color", "着色"), taskbar_solid),
             when(
                 slider("taskbar.opacity", "着色不透明度", None, 0.0, 1.0, 0.01, Format::Percent),
-                taskbar_tinted,
+                taskbar_solid,
+            ),
+            when(
+                switch_hint(
+                    "taskbar.show_hairline",
+                    "显示任务栏顶部细线",
+                    "任务栏上沿的那条分隔线。默认隐藏：任务栏透明后它不再分隔任何东西，反而最显眼。",
+                ),
+                taskbar_on,
             ),
             when(
                 switch("taskbar.apply_to_secondary", "应用到副屏任务栏"),
@@ -685,6 +792,10 @@ const MEDIA: &[Card] = &[
         fields: &[
             when(switch("media.show_lyrics", "显示歌词"), media_on),
             when(switch("media.show_spectrum", "显示频谱"), media_on),
+            when(
+                select("media.spectrum_style", "频谱样式", SPECTRUM_STYLES),
+                media_spectrum,
+            ),
             when(
                 slider(
                     "media.spectrum_sensitivity",
@@ -1200,14 +1311,33 @@ impl Section {
 }
 
 /// Parse a `TaskbarMode` from its stored id.
+///
+/// `mica` is kept as an alias rather than dropped: the settings page can no
+/// longer show it, but a config that still names it must resolve to something
+/// rather than to `Normal`, which would silently undo the user's effect.
 pub fn mode_from_id(id: &str) -> TaskbarMode {
     match id {
         "opaque" => TaskbarMode::Opaque,
         "clear" => TaskbarMode::Clear,
         "blur" => TaskbarMode::Blur,
-        "acrylic" => TaskbarMode::Acrylic,
-        "mica" => TaskbarMode::Mica,
+        "acrylic" | "mica" => TaskbarMode::Acrylic,
         _ => TaskbarMode::Normal,
+    }
+}
+
+/// Parse a `WidgetColorMode` from its stored id.
+pub fn color_mode_from_id(id: &str) -> WidgetColorMode {
+    match id {
+        "custom" => WidgetColorMode::Custom,
+        _ => WidgetColorMode::Theme,
+    }
+}
+
+/// Parse a `SpectrumStyle` from its stored id.
+pub fn spectrum_style_from_id(id: &str) -> SpectrumStyle {
+    match id {
+        "bounce" => SpectrumStyle::Bounce,
+        _ => SpectrumStyle::Bars,
     }
 }
 
@@ -1316,16 +1446,78 @@ mod tests {
     #[test]
     fn the_tint_rows_follow_the_mode() {
         let mut config = Config::default();
-        config.taskbar.mode = TaskbarMode::Normal;
+        config.taskbar.enabled = true;
         let section = section("taskbar").unwrap();
         let shows_tint = |c: &Config| {
             section
                 .visible_fields(c)
                 .any(|(_, field)| field.path == "taskbar.color")
         };
-        assert!(!shows_tint(&config), "no tint to configure in normal mode");
-        config.taskbar.mode = TaskbarMode::Acrylic;
-        assert!(shows_tint(&config));
+        // The default mode is a material, so there is no tint to configure.
+        assert!(!shows_tint(&config), "no tint to configure in acrylic mode");
+        config.taskbar.mode = TaskbarMode::Clear;
+        assert!(!shows_tint(&config), "clear has nothing to tint");
+        config.taskbar.mode = TaskbarMode::Opaque;
+        assert!(shows_tint(&config), "the solid mode is the one with a colour");
+
+        // Opacity travels with the colour: they are one control surface.
+        let shows_opacity = |c: &Config| {
+            section
+                .visible_fields(c)
+                .any(|(_, field)| field.path == "taskbar.opacity")
+        };
+        assert!(shows_opacity(&config));
+        config.taskbar.mode = TaskbarMode::Blur;
+        assert!(!shows_opacity(&config));
+    }
+
+    #[test]
+    fn the_hairline_switch_is_offered_and_off_by_default() {
+        let config = Config::default();
+        assert!(!config.taskbar.show_hairline);
+        let section = section("taskbar").unwrap();
+        let row = section
+            .visible_fields(&config)
+            .find(|(_, field)| field.path == "taskbar.show_hairline");
+        assert!(row.is_some(), "the switch must be reachable");
+
+        let mut off = Config::default();
+        off.taskbar.enabled = false;
+        assert!(
+            !section
+                .visible_fields(&off)
+                .any(|(_, field)| field.path == "taskbar.show_hairline"),
+            "a disabled module hides its own settings"
+        );
+    }
+
+    #[test]
+    fn the_widget_foreground_colour_only_shows_when_it_is_custom() {
+        let section = section("appearance").unwrap();
+        let shows = |c: &Config| {
+            section
+                .visible_fields(c)
+                .any(|(_, field)| field.path == "widget.foreground")
+        };
+        let mut config = Config::default();
+        assert_eq!(config.widget.color_mode, WidgetColorMode::Theme);
+        assert!(!shows(&config), "a colour nobody reads is a dead control");
+        config.widget.color_mode = WidgetColorMode::Custom;
+        assert!(shows(&config));
+    }
+
+    #[test]
+    fn the_spectrum_style_follows_the_spectrum_switch() {
+        let section = section("media").unwrap();
+        let shows = |c: &Config| {
+            section
+                .visible_fields(c)
+                .any(|(_, field)| field.path == "media.spectrum_style")
+        };
+        let mut config = Config::default();
+        assert!(shows(&config));
+        config.media.show_spectrum = false;
+        assert!(!shows(&config), "a hidden spectrum has no style to pick");
     }
 
     #[test]
@@ -1415,6 +1607,94 @@ mod tests {
         for choice in MODES {
             assert_eq!(mode_from_id(choice.value).id(), choice.value);
             assert_ne!(mode_label(choice.value), "未知");
+        }
+    }
+
+    /// Every enum entry has a row and every row has an entry.
+    ///
+    /// The failure this catches is a value added to the config but not to the
+    /// page: it would be storable and invisible, which for `TaskbarMode::Mica`
+    /// was the whole point of dropping it.
+    #[test]
+    fn every_storable_choice_is_offered_on_the_page() {
+        let offered = |id: &str, choices: &[Choice]| choices.iter().any(|c| c.value == id);
+
+        for mode in TaskbarMode::ALL {
+            assert!(offered(mode.id(), MODES), "{} has no row", mode.id());
+        }
+        assert_eq!(
+            MODES.len(),
+            TaskbarMode::ALL.len(),
+            "the page offers a mode the config does not have"
+        );
+
+        for mode in WidgetColorMode::ALL {
+            assert!(
+                offered(mode.id(), WIDGET_COLOR_MODES),
+                "{} has no row",
+                mode.id()
+            );
+        }
+        assert_eq!(WIDGET_COLOR_MODES.len(), WidgetColorMode::ALL.len());
+
+        for style in SpectrumStyle::ALL {
+            assert!(
+                offered(style.id(), SPECTRUM_STYLES),
+                "{} has no row",
+                style.id()
+            );
+        }
+        assert_eq!(SPECTRUM_STYLES.len(), SpectrumStyle::ALL.len());
+    }
+
+    /// The palette is the answer to "clicking the swatch does nothing", so its
+    /// grid has to actually contain colours — and the two ends of its grayscale
+    /// row have to be the two a tint is most likely to want.
+    #[test]
+    fn the_swatch_grid_is_a_usable_palette() {
+        use beautify_core::geometry::Color;
+        assert_eq!(
+            swatch_color(0, 0),
+            Color::rgb(0xFF, 0xFF, 0xFF),
+            "the grayscale row starts at white"
+        );
+        assert_eq!(
+            swatch_color(0, SWATCH_COLUMNS - 1),
+            Color::rgb(0x00, 0x00, 0x00),
+            "and ends at black"
+        );
+
+        // Every row below the grayscale ramp is a saturated hue at full
+        // brightness on its first entry.
+        assert_eq!(swatch_color(1, 0), Color::rgb(0xFF, 0x00, 0x00), "red");
+        assert_eq!(swatch_color(1, 4), Color::rgb(0x00, 0xFF, 0x00), "green");
+        assert_eq!(swatch_color(1, 8), Color::rgb(0x00, 0x00, 0xFF), "blue");
+
+        // Every cell is a colour of its own: a grid with duplicates in it would
+        // look like a palette that had gone wrong.
+        let mut seen = std::collections::HashSet::new();
+        for row in 0..SWATCH_ROWS {
+            for column in 0..SWATCH_COLUMNS {
+                let colour = swatch_color(row, column);
+                assert!(
+                    seen.insert((colour.r, colour.g, colour.b)),
+                    "duplicate swatch at ({row}, {column})"
+                );
+            }
+        }
+        // Out-of-range indices clamp rather than panic: the grid indices come
+        // from a division of a pointer position.
+        assert_eq!(swatch_color(99, 0), swatch_color(SWATCH_ROWS - 1, 0));
+        assert_eq!(swatch_color(0, 99), swatch_color(0, SWATCH_COLUMNS - 1));
+    }
+
+    /// The palette writes the same string the hex box accepts, or picking a
+    /// colour and then typing one would take different code paths.
+    #[test]
+    fn a_swatch_round_trips_through_the_stored_hex_form() {
+        for (row, column) in [(0, 0), (0, 11), (1, 3), (5, 7), (8, 11)] {
+            let colour = swatch_color(row, column);
+            assert_eq!(colour.to_string().parse::<beautify_core::geometry::Color>(), Ok(colour));
         }
     }
 }

@@ -53,6 +53,10 @@ pub struct Interaction {
     pub open_dropdown: Option<usize>,
     /// Index of the highlighted entry in that dropdown.
     pub dropdown_highlight: usize,
+    /// The row whose colour palette is open.
+    pub open_color: Option<usize>,
+    /// The palette cell under the pointer, as `(row, column)`.
+    pub color_highlight: Option<(usize, usize)>,
     /// The row whose text box has focus.
     pub focused_row: Option<usize>,
     /// Text being typed into the box that has focus.
@@ -236,6 +240,20 @@ impl Painter {
             let current = crate::access::read(config, row.field.path);
             let current = current.as_ref().and_then(|v| v.as_text()).unwrap_or("");
             self.draw_dropdown(canvas, row, metrics, palette, interaction, current)?;
+        }
+
+        // A colour palette is the same kind of thing and goes in the same place.
+        if let Some(row) = layout
+            .content
+            .cards
+            .iter()
+            .flat_map(|card| card.rows.iter())
+            .nth(interaction.open_color.unwrap_or(usize::MAX))
+        {
+            let current = crate::access::read(config, row.field.path)
+                .and_then(|value| value.as_text().map(str::to_string))
+                .and_then(|text| text.parse::<beautify_core::geometry::Color>().ok());
+            self.draw_color_popup(canvas, row, metrics, palette, interaction, current)?;
         }
         Ok(())
     }
@@ -820,6 +838,53 @@ impl Painter {
         Ok(())
     }
 
+    /// The open colour palette, drawn over the page.
+    ///
+    /// A grid of swatches rather than a wheel or a pair of gradient sliders:
+    /// every colour it offers is one click, it needs no extra Direct2D
+    /// primitives, and the hex box beside the swatch already covers the exact
+    /// value when the grid is not precise enough.
+    fn draw_color_popup(
+        &self,
+        canvas: &Canvas<'_>,
+        row: &Row,
+        metrics: &Metrics,
+        palette: &Palette,
+        interaction: &Interaction,
+        current: Option<beautify_core::geometry::Color>,
+    ) -> Result<()> {
+        use crate::schema::{self, SWATCH_COLUMNS, SWATCH_ROWS};
+
+        let Some(rect) = color_popup_rect(row, metrics) else {
+            return Ok(());
+        };
+        canvas.fill_rounded(rect, metrics.px(6.0), palette.card);
+        canvas.stroke_rounded(rect, metrics.px(6.0), palette.control_border, 1.0);
+
+        for grid_row in 0..SWATCH_ROWS {
+            for column in 0..SWATCH_COLUMNS {
+                let colour = schema::swatch_color(grid_row, column);
+                let cell = swatch_cell_rect(rect, grid_row, column, metrics);
+                canvas.fill_rounded(cell, metrics.px(3.0), Rgba::from_color(colour, 1.0));
+                // Every cell gets an edge: without one, the white end of the
+                // grayscale row disappears into a light card.
+                let marker = if interaction.color_highlight == Some((grid_row, column)) {
+                    Some(2.0)
+                } else if current == Some(colour) {
+                    Some(1.5)
+                } else {
+                    None
+                };
+                let (border, width) = match marker {
+                    Some(width) => (palette.text, width),
+                    None => (palette.card_border, 1.0),
+                };
+                canvas.stroke_rounded(cell, metrics.px(3.0), border, width);
+            }
+        }
+        Ok(())
+    }
+
     fn draw_scrollbar(
         &self,
         canvas: &Canvas<'_>,
@@ -936,6 +1001,84 @@ pub fn dropdown_rect(
     ))
 }
 
+/// Where a colour swatch's palette appears.
+///
+/// Anchored to the trailing edge of the control column and grown leftwards, the
+/// way every other value on the page is: the grid is wider than the column, and
+/// growing right from the swatch would push it off the window.
+pub fn color_popup_rect(row: &Row, metrics: &Metrics) -> Option<Rect> {
+    let (width, height) = color_popup_size(metrics);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let below = row.control.bottom + metrics.px(2.0);
+    let above = row.control.top - metrics.px(2.0) - height;
+    let top = if row.control.top > height { above } else { below };
+    let right = row.control.right;
+    Some(Rect::new(
+        (right - width).max(0.0),
+        top,
+        right,
+        top + height,
+    ))
+}
+
+/// The size of the palette, from the grid it holds.
+pub fn color_popup_size(metrics: &Metrics) -> (f32, f32) {
+    use crate::schema::{SWATCH_COLUMNS, SWATCH_ROWS};
+    let pad = metrics.popup_padding();
+    let cell = metrics.swatch_cell_size();
+    let gap = metrics.swatch_cell_gap();
+    let width =
+        SWATCH_COLUMNS as f32 * cell + (SWATCH_COLUMNS - 1) as f32 * gap + pad * 2.0;
+    let height = SWATCH_ROWS as f32 * cell + (SWATCH_ROWS - 1) as f32 * gap + pad * 2.0;
+    (width, height)
+}
+
+/// The rectangle of one palette cell.
+///
+/// The single place the cells are positioned, so the painter and the hit tester
+/// cannot disagree about where a colour is — the arrangement this crate is built
+/// around.
+pub fn swatch_cell_rect(
+    popup: Rect,
+    row: usize,
+    column: usize,
+    metrics: &Metrics,
+) -> Rect {
+    let pad = metrics.popup_padding();
+    let cell = metrics.swatch_cell_size();
+    let stride = cell + metrics.swatch_cell_gap();
+    let left = popup.left + pad + column as f32 * stride;
+    let top = popup.top + pad + row as f32 * stride;
+    Rect::new(left, top, left + cell, top + cell)
+}
+
+/// Which palette cell `(x, y)` is on, if any.
+///
+/// The gaps between cells are not cells: a click that lands in one is a miss
+/// rather than a guess at the nearest colour.
+pub fn swatch_at(popup: Rect, x: f32, y: f32, metrics: &Metrics) -> Option<(usize, usize)> {
+    use crate::schema::{SWATCH_COLUMNS, SWATCH_ROWS};
+    let pad = metrics.popup_padding();
+    let cell = metrics.swatch_cell_size();
+    let stride = cell + metrics.swatch_cell_gap();
+    let offset_x = x - (popup.left + pad);
+    let offset_y = y - (popup.top + pad);
+    if offset_x < 0.0 || offset_y < 0.0 {
+        return None;
+    }
+    let column = (offset_x / stride) as usize;
+    let row = (offset_y / stride) as usize;
+    if column >= SWATCH_COLUMNS || row >= SWATCH_ROWS {
+        return None;
+    }
+    if offset_x - column as f32 * stride > cell || offset_y - row as f32 * stride > cell {
+        return None;
+    }
+    Some((row, column))
+}
+
 /// The four corners of a thin bar through `centre`, tilted by `tilt` (a slope).
 fn bar_points(centre: (f32, f32), arm: f32, thickness: f32, tilt: f32) -> [(f32, f32); 4] {
     let half = thickness * 0.5;
@@ -1045,5 +1188,87 @@ mod tests {
         assert!(close.rect.left > minimize.rect.right, "close is at the corner");
         assert!(close.rect.right <= layout.titlebar.right);
         assert!(minimize.rect.left > 0.0);
+    }
+
+    /// The palette has to be clickable where it is drawn, which is the whole
+    /// class of bug that made the swatch feel dead: the hit test and the paint
+    /// have to read the same rectangles.
+    #[test]
+    fn every_swatch_is_hit_testable_where_it_is_drawn() {
+        use crate::schema::{SWATCH_COLUMNS, SWATCH_ROWS};
+        let metrics = Metrics::new(96);
+        let layout = crate::layout::layout(
+            Rect::new(0.0, 0.0, 900.0, 640.0),
+            &metrics,
+            crate::schema::section("appearance").unwrap(),
+            &beautify_core::config::Config::default(),
+            0.0,
+            &|_, _| 14.0,
+        );
+        let row = layout
+            .content
+            .cards
+            .iter()
+            .flat_map(|card| card.rows.iter())
+            .find(|row| matches!(row.field.kind, Kind::Color))
+            .expect("a colour row");
+        let popup = color_popup_rect(row, &metrics).expect("a palette");
+
+        for grid_row in 0..SWATCH_ROWS {
+            for column in 0..SWATCH_COLUMNS {
+                let cell = swatch_cell_rect(popup, grid_row, column, &metrics);
+                assert!(cell.width() > 0.0 && cell.height() > 0.0);
+                assert!(
+                    popup.contains(cell.center_x(), cell.center_y()),
+                    "cell ({grid_row}, {column}) is drawn outside the palette"
+                );
+                assert_eq!(
+                    swatch_at(popup, cell.center_x(), cell.center_y(), &metrics),
+                    Some((grid_row, column)),
+                    "cell ({grid_row}, {column}) is not where it is drawn"
+                );
+            }
+        }
+
+        // The gaps and the padding are misses, not a guess at the nearest
+        // colour — otherwise clicking the border would silently pick something.
+        assert_eq!(swatch_at(popup, popup.left + 1.0, popup.top + 1.0, &metrics), None);
+        let first = swatch_cell_rect(popup, 0, 0, &metrics);
+        let second = swatch_cell_rect(popup, 0, 1, &metrics);
+        assert_eq!(
+            swatch_at(popup, (first.right + second.left) * 0.5, first.center_y(), &metrics),
+            None
+        );
+        assert_eq!(
+            swatch_at(popup, popup.right - 1.0, popup.bottom - 1.0, &metrics),
+            None
+        );
+    }
+
+    /// The palette is wider than the control column, so it grows leftwards from
+    /// the column's trailing edge; growing rightwards would push it off the
+    /// window it is drawn in.
+    #[test]
+    fn the_palette_stays_inside_the_window_it_floats_over() {
+        let metrics = Metrics::new(96);
+        let window = Rect::new(0.0, 0.0, 880.0, 620.0);
+        let layout = crate::layout::layout(
+            window,
+            &metrics,
+            crate::schema::section("appearance").unwrap(),
+            &beautify_core::config::Config::default(),
+            0.0,
+            &|_, _| 14.0,
+        );
+        for row in layout.content.cards.iter().flat_map(|card| card.rows.iter()) {
+            let Some(popup) = color_popup_rect(row, &metrics) else {
+                continue;
+            };
+            assert!(popup.left >= 0.0, "the palette ran off the left edge");
+            assert!(
+                popup.right <= window.right + 0.01,
+                "the palette ran off the right edge: {popup:?}"
+            );
+        }
     }
 }

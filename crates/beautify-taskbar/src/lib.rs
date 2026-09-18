@@ -19,6 +19,7 @@ pub mod accent;
 pub mod ffi;
 pub mod inject;
 pub mod shell;
+pub mod theme;
 pub mod winver;
 
 use accent::{AccentApplicator, Backdrop};
@@ -78,6 +79,7 @@ struct Desired {
     mode: TaskbarMode,
     color: beautify_core::geometry::Color,
     opacity: f32,
+    show_hairline: bool,
     apply_secondary: bool,
     dynamic_mode: bool,
     dynamic_override: TaskbarMode,
@@ -93,6 +95,7 @@ impl Default for Desired {
             mode: d.mode,
             color: d.color,
             opacity: d.opacity,
+            show_hairline: d.show_hairline,
             apply_secondary: d.apply_to_secondary,
             dynamic_mode: d.dynamic_mode,
             dynamic_override: d.dynamic_mode_override,
@@ -109,6 +112,7 @@ impl Desired {
             mode: cfg.taskbar.mode,
             color: cfg.taskbar.color,
             opacity: cfg.taskbar.opacity,
+            show_hairline: cfg.taskbar.show_hairline,
             apply_secondary: cfg.taskbar.apply_to_secondary,
             dynamic_mode: cfg.taskbar.dynamic_mode,
             dynamic_override: cfg.taskbar.dynamic_mode_override,
@@ -775,6 +779,21 @@ fn apply_via_tap(
         cmd.taskbar = bar.0 as usize;
         cmd.worker_pid = std::process::id();
         delivered &= inject::send(channel, &cmd);
+
+        // The hairline is independent of the backdrop mode, so it is its own
+        // command sent after the fill: in 跟随系统 the command above is a
+        // `Restore`, which puts the shell's own line back, and hiding it has to
+        // happen after that rather than instead of it.
+        //
+        // Best effort, and deliberately *not* folded into `delivered`: a TAP
+        // injected by an older build does not know this command and answers
+        // "not applied", which would otherwise look like a lost channel and make
+        // the host drop it and re-inject on every evaluation.
+        let mut hairline = TapCommand::new(CommandKind::SetHairline);
+        hairline.taskbar = bar.0 as usize;
+        hairline.worker_pid = std::process::id();
+        hairline.argb = u32::from(desired.show_hairline);
+        let _ = inject::send(channel, &hairline);
     }
 
     if !delivered {

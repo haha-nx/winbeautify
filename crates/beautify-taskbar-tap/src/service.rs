@@ -90,6 +90,14 @@ struct Bar {
     taskbar: isize,
     background: ControlInfo,
     border: ControlInfo,
+    /// Whether the host wants the top hairline visible, once it has said.
+    ///
+    /// Remembered rather than only acted on, because the host's command and the
+    /// shell's hairline rectangle are not synchronised: the rectangle turns up
+    /// from a visual tree callback, which can be after the command that wanted
+    /// it hidden. Nothing would ever ask again, so the state waits here until
+    /// there is something to apply it to.
+    hairline: Option<bool>,
     blur_attached: bool,
 }
 
@@ -128,6 +136,7 @@ pub fn register_taskbar(frame_handle: u64, taskbar: isize) {
             taskbar,
             background: ControlInfo::default(),
             border: ControlInfo::default(),
+            hairline: None,
             blur_attached: false,
         });
     });
@@ -150,13 +159,28 @@ pub fn register_taskbar_background(frame_handle: u64, shape: IUnknown) {
     debug_log("registered background rectangle");
 }
 
-/// Remember the taskbar's border rectangle (kept for restore only).
+/// Remember the taskbar's border rectangle (the hairline along its top edge).
 pub fn register_taskbar_border(frame_handle: u64, shape: IUnknown) {
-    with_service(|svc| {
-        if let Some(bar) = svc.bars.get_mut(&frame_handle) {
-            bar.border.shape = Some(own(shape));
+    let shape = own(shape);
+    let write = with_service(|svc| {
+        let bar = svc.bars.get_mut(&frame_handle)?;
+        let first_sighting = bar.border.shape.is_none();
+        bar.border.shape = Some(shape);
+        // The host may have asked for a hairline state while this rectangle was
+        // still unknown — the two run on different schedules, and nothing would
+        // ever ask again. Applying it on the first sighting is what makes the
+        // switch reliable rather than a race.
+        //
+        // Only on the *first* sighting: this runs inside a visual tree callback,
+        // and re-applying on every notification would repaint the element on
+        // each of the shell's many tree mutations.
+        if first_sighting {
+            plan_hairline(bar)
+        } else {
+            None
         }
     });
+    commit_hairline(write);
 }
 
 /// Drop a taskbar (its XAML island was torn down).
@@ -252,6 +276,10 @@ fn handle_command(cmd: &TapCommand) -> bool {
             restore_taskbar(cmd.taskbar as isize)
         }
         c if c == CommandKind::RestoreAll as u32 => restore_all(),
+        c if c == CommandKind::SetHairline as u32 => {
+            watch_worker(cmd.worker_pid);
+            set_hairline(cmd.taskbar as isize, cmd.argb != 0)
+        }
         _ => false,
     }
 }
@@ -453,6 +481,76 @@ unsafe fn attach_blur(shape: SendPtr, color: Color, blur_amount: f32) -> bool {
     true
 }
 
+/// Show or hide the hairline along the taskbar's top edge.
+///
+/// The shell paints it as a thin `BackgroundStroke` rectangle, so hiding it is
+/// clearing that rectangle's fill and showing it is putting the shell's own
+/// brush back. `argb` carries the flag rather than a colour — see
+/// [`CommandKind::SetHairline`].
+fn set_hairline(taskbar: isize, visible: bool) -> bool {
+    let Some(handle) = find_bar(taskbar) else {
+        debug_log_fmt(format_args!(
+            "hairline: no taskbar registered for {:#x}",
+            taskbar
+        ));
+        return false;
+    };
+    let write = with_service(|svc| {
+        let bar = svc.bars.get_mut(&handle)?;
+        bar.hairline = Some(visible);
+        plan_hairline(bar)
+    });
+    // "Nothing to write" is not a failure here: the wanted state stays in the
+    // registry and `register_taskbar_border` applies it the moment the rectangle
+    // turns up.
+    let applied = commit_hairline(write);
+    debug_log(if applied {
+        "hairline applied"
+    } else {
+        "hairline: nothing to apply yet"
+    });
+    applied
+}
+
+/// Work out the fill write that carries out the remembered hairline state.
+///
+/// Separated from performing it because the decision needs the registry lock and
+/// the write is a XAML call: holding the lock across one would deadlock if the
+/// shell re-entered our tree callback. `None` means there is nothing to do —
+/// either the host has not asked for anything yet, or the rectangle the shell
+/// paints the line with has not been seen.
+fn plan_hairline(bar: &mut Bar) -> Option<(SendPtr, SendPtr)> {
+    let wanted = bar.hairline?;
+    let shape = bar.border.shape?;
+    let brush = if wanted {
+        // Nothing has been read, so nothing was ever cleared either — and
+        // reading now could snapshot a fill the shell has not painted yet, which
+        // would turn "show" into "clear" the next time it was applied.
+        if !bar.border.captured {
+            return None;
+        }
+        bar.border.original
+    } else {
+        // Snapshot before the first change, so "show" has something to put back.
+        // A null fill is a value to restore to, not "not captured yet", which is
+        // why the flag is separate.
+        if !bar.border.captured {
+            bar.border.original = unsafe { xaml::fill_of(shape.0) }.map(SendPtr);
+            bar.border.captured = true;
+        }
+        None
+    };
+    Some((shape, brush.unwrap_or(SendPtr(core::ptr::null_mut()))))
+}
+
+/// Perform a write from [`plan_hairline`], outside the registry lock.
+fn commit_hairline(write: Option<(SendPtr, SendPtr)>) -> bool {
+    match write {
+        Some((shape, brush)) => unsafe { xaml::set_fill(shape.0, brush.0) },
+        None => false,
+    }
+}
+
 /// Hand a taskbar back to the shell's own brushes.
 fn restore_taskbar(taskbar: isize) -> bool {
     let Some(handle) = find_bar(taskbar) else {
@@ -489,9 +587,19 @@ fn restore_bar(bar: &mut Bar) {
         bar.blur_attached = false;
     }
     for control in [&mut bar.background, &mut bar.border] {
+        // Only a fill this process actually read gets written back. Restoring a
+        // control that was never captured would clear a fill the shell had
+        // painted, which for the hairline means erasing it rather than leaving
+        // it alone — the exact opposite of "hand the taskbar back".
+        if !control.captured {
+            continue;
+        }
         if let Some(shape) = &control.shape {
             // A missing original is a value: the shell had no fill to begin with.
-            let original = control.original.map(|original| original.0).unwrap_or(core::ptr::null_mut());
+            let original = control
+                .original
+                .map(|original| original.0)
+                .unwrap_or(core::ptr::null_mut());
             unsafe { xaml::set_fill(shape.0, original) };
         }
     }

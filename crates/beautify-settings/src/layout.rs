@@ -178,6 +178,21 @@ impl Metrics {
         self.px(46.0)
     }
 
+    /// Edge length of one swatch in an open colour palette.
+    pub fn swatch_cell_size(&self) -> f32 {
+        self.px(16.0)
+    }
+
+    /// Gap between two swatches, and around the palette's own edge.
+    pub fn swatch_cell_gap(&self) -> f32 {
+        self.px(3.0)
+    }
+
+    /// Padding between a floating popup's border and its contents.
+    pub fn popup_padding(&self) -> f32 {
+        self.px(8.0)
+    }
+
     /// Width of an action button.
     pub fn button_width(&self) -> f32 {
         self.px(112.0)

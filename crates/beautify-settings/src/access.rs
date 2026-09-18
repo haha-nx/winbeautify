@@ -265,9 +265,10 @@ mod tests {
     #[test]
     fn a_type_mismatch_is_refused() {
         let mut config = Config::default();
+        let before = config.widget.opacity;
         assert!(!write(&mut config, "widget.opacity", Value::Text("nope".into())));
         // …and the config is untouched.
-        assert!(config.widget.opacity > 0.0);
+        assert_eq!(config.widget.opacity, before);
     }
 
     #[test]
@@ -301,9 +302,12 @@ mod tests {
 
     #[test]
     fn the_schema_helpers_agree_with_the_config_enums() {
-        use beautify_core::config::{TaskbarMode, Theme, WidgetAnchor};
+        use beautify_core::config::{SpectrumStyle, TaskbarMode, Theme, WidgetAnchor, WidgetColorMode};
         assert_eq!(schema::mode_from_id("acrylic"), TaskbarMode::Acrylic);
-        assert_eq!(schema::mode_from_id("mica").id(), "mica");
+        assert_eq!(schema::mode_from_id("opaque").id(), "opaque");
+        // Mica is gone from the page but must still resolve, and to something
+        // that keeps the effect the user chose rather than to "no effect".
+        assert_eq!(schema::mode_from_id("mica"), TaskbarMode::Acrylic);
         assert_eq!(schema::theme_from_id("auto"), Theme::Auto);
         assert_eq!(
             schema::anchor_from_id("bottom-center"),
@@ -313,5 +317,15 @@ mod tests {
             schema::anchor_from_id("taskbar-right"),
             WidgetAnchor::TaskbarRight
         );
+        assert_eq!(
+            schema::color_mode_from_id("custom"),
+            WidgetColorMode::Custom
+        );
+        assert_eq!(schema::color_mode_from_id("theme"), WidgetColorMode::Theme);
+        assert_eq!(
+            schema::spectrum_style_from_id("bounce"),
+            SpectrumStyle::Bounce
+        );
+        assert_eq!(schema::spectrum_style_from_id("bars"), SpectrumStyle::Bars);
     }
 }

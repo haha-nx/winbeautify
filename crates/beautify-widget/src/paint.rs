@@ -416,6 +416,7 @@ fn draw_scene(scene: &Scene<'_>) -> Result<()> {
                 &bands,
                 scene.theme.spectrum,
                 scene.metrics,
+                scene.state.config.media.spectrum_style,
             );
         }
     }
@@ -736,6 +737,7 @@ fn draw_spectrum(
     bands: &[f32],
     color: Rgba,
     metrics: &Metrics,
+    style: beautify_core::config::SpectrumStyle,
 ) {
     let count = bands.len();
     if count == 0 || area.width() < 2.0 || area.height() < 2.0 {
@@ -745,12 +747,29 @@ fn draw_spectrum(
     // space with, so the drawn bars fill that space exactly.
     let (bar, gap) = crate::layout::spectrum_band(metrics);
     let radius = (bar * 0.5).min(1.5 * metrics.scale);
+    let middle = area.center_y();
 
     for (index, value) in bands.iter().enumerate() {
         let level = value.clamp(0.0, 1.0);
-        let height = (level * area.height()).max(bar * 0.75);
         let left = area.left + index as f32 * (bar + gap);
-        let rect = Rect::new(left, area.bottom - height, left + bar, area.bottom);
+        // Both styles draw the level as a length; only the end it grows from
+        // differs. The floor keeps a silent band as a dot rather than nothing,
+        // so the display does not blink out between beats.
+        let height = (level * area.height()).max(bar * 0.75);
+        let rect = match style {
+            // Standing on the bottom edge, like a level meter.
+            beautify_core::config::SpectrumStyle::Bars => {
+                Rect::new(left, area.bottom - height, left + bar, area.bottom)
+            }
+            // Split about the centre line, so the display pulses upwards and
+            // downwards at once instead of rising from the floor.
+            beautify_core::config::SpectrumStyle::Bounce => Rect::new(
+                left,
+                middle - height * 0.5,
+                left + bar,
+                middle + height * 0.5,
+            ),
+        };
         // Quiet bars stay faint, so the display does not read as stuck noise.
         canvas::set_brush(brush, color.with_alpha(0.28 + level * 0.72));
         unsafe { target.FillRoundedRectangle(&canvas::rounded(rect, radius), brush) };

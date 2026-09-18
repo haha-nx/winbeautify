@@ -272,28 +272,11 @@ impl Host for SettingsHost {
 /// The Windows apps-light-theme setting.
 ///
 /// Shared with the flyout panel, which has to resolve `主题 = 跟随系统` the same
-/// way this window does.
+/// way this window does. The read lives in `beautify-taskbar` so the whole
+/// process shares one memoised answer — the widget bar asks for it while it
+/// draws.
 pub fn system_is_light() -> bool {
-    {
-        use windows::core::w;
-        use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-        let mut value = 0u32;
-        let mut size = std::mem::size_of::<u32>() as u32;
-        let ok = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-                w!("AppsUseLightTheme"),
-                RRF_RT_REG_DWORD,
-                None,
-                Some(&mut value as *mut u32 as *mut core::ffi::c_void),
-                Some(&mut size),
-            )
-        };
-        // Anything but an explicit 1 means dark, which is also the app's default
-        // and what a missing key should look like.
-        ok.is_ok() && value == 1
-    }
+    beautify_taskbar::theme::apps_use_light_theme()
 }
 
 /// What the taskbar status pill should say.

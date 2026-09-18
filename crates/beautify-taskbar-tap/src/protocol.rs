@@ -38,6 +38,15 @@ pub enum CommandKind {
     RestoreAll = 3,
     /// Paint one taskbar with the requested brush.
     Set = 1,
+    /// Show or hide the hairline along the taskbar's top edge.
+    ///
+    /// `argb` carries the flag rather than a colour: a non-zero value restores
+    /// the shell's own brush and zero clears the fill. Added to an existing
+    /// protocol without bumping the version on purpose — the struct layout is
+    /// unchanged, and a TAP from a previous run answers an unknown command with
+    /// "not applied" instead of misreading it, where a version bump would make
+    /// it reject *every* command until explorer restarts.
+    SetHairline = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,5 +119,17 @@ mod tests {
         assert_eq!(cmd.version, PROTOCOL_VERSION);
         assert_eq!(cmd.command, CommandKind::Set as u32);
         assert_eq!(cmd.brush, BrushKind::Acrylic as u32);
+    }
+
+    /// The hairline rides in `argb` of an existing command rather than in a new
+    /// field, which is what lets it reach a TAP that was injected before this
+    /// version of the host existed.
+    #[test]
+    fn the_hairline_command_needs_no_extra_field() {
+        let mut cmd = TapCommand::new(CommandKind::SetHairline);
+        cmd.taskbar = 0x1234;
+        cmd.argb = 1; // show; 0 would hide
+        assert_eq!(cmd.command, 4);
+        assert_eq!(std::mem::size_of::<TapCommand>(), 32);
     }
 }

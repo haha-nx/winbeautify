@@ -91,6 +91,10 @@ impl Rect {
         (self.top + self.bottom) * 0.5
     }
 
+    pub fn center_x(&self) -> f32 {
+        (self.left + self.right) * 0.5
+    }
+
     /// True when `(x, y)` — in the same coordinate space — is inside.
     ///
     /// Half-open on the right and bottom edges, so two adjacent rectangles never
@@ -214,6 +218,14 @@ pub struct Content {
     pub show_spectrum: bool,
     pub show_lyrics: bool,
     pub show_badge: bool,
+    /// Put the launcher — the button that opens the flyout — at the bar's
+    /// trailing end instead of its leading one.
+    ///
+    /// A bar anchored to the right of the screen, or to the notification area,
+    /// has its button on the right, next to the tray the pointer is already
+    /// near; a left-hand bar keeps it on the left. See
+    /// [`beautify_core::config::WidgetAnchor::flyout_button_trailing`].
+    pub launcher_trailing: bool,
 }
 
 /// Widths the layout needs from outside.
@@ -466,12 +478,25 @@ pub fn layout(
         (window.bottom - inset).max(window.top + inset),
     );
 
-    let launcher = Rect::new(
-        pill.left + pad,
-        pill.center_y() - metrics.launcher() * 0.5,
-        pill.left + pad + metrics.launcher(),
-        pill.center_y() + metrics.launcher() * 0.5,
-    );
+    // The launcher sits at whichever end of the pill the anchor asks for: the
+    // bar's own edge when it is anchored right, so the button lands beside the
+    // tray rather than at the far side of the bar.
+    let launcher_size = metrics.launcher();
+    let launcher = if content.launcher_trailing {
+        Rect::new(
+            pill.right - pad - launcher_size,
+            pill.center_y() - launcher_size * 0.5,
+            pill.right - pad,
+            pill.center_y() + launcher_size * 0.5,
+        )
+    } else {
+        Rect::new(
+            pill.left + pad,
+            pill.center_y() - launcher_size * 0.5,
+            pill.left + pad + launcher_size,
+            pill.center_y() + launcher_size * 0.5,
+        )
+    };
 
     if !content.audio {
         return Layout {
@@ -481,8 +506,19 @@ pub fn layout(
         };
     }
 
-    let audio_left = launcher.right + metrics.gap();
-    let audio_width = (pill.right - pad - audio_left).max(0.0);
+    // Whatever the launcher left behind, on the opposite side of it.
+    let (audio_left, audio_right) = if content.launcher_trailing {
+        (
+            pill.left + pad,
+            (launcher.left - metrics.gap()).max(pill.left + pad),
+        )
+    } else {
+        (
+            launcher.right + metrics.gap(),
+            (pill.right - pad).max(launcher.right + metrics.gap()),
+        )
+    };
+    let audio_width = (audio_right - audio_left).max(0.0);
 
     // The spectrum is a fixed size, so it is placed first and the lyric slot
     // takes whatever is left. The other order is what lets the spectrum poke
@@ -492,23 +528,42 @@ pub fn layout(
     let slot_w =
         (audio_width - cover_w - gap - if spectrum_w > 0.0 { gap + spectrum_w } else { 0.0 }).max(0.0);
 
+    // Cover, slot and spectrum exactly fill the band, so one origin serves both
+    // orders — only which of the three comes first changes. Trailing, the cover
+    // ends up beside the launcher and the spectrum against the pill's far edge,
+    // which is the mirror image of the leading case.
+    let span = cover_w + gap + slot_w + if spectrum_w > 0.0 { gap + spectrum_w } else { 0.0 };
+    let origin = if content.launcher_trailing {
+        (audio_right - span).max(audio_left)
+    } else {
+        audio_left
+    };
+    let (cover_left, slot_left, spectrum_left) = if content.launcher_trailing {
+        let spectrum_left = origin;
+        let slot_left = spectrum_left + if spectrum_w > 0.0 { spectrum_w + gap } else { 0.0 };
+        (slot_left + slot_w + gap, slot_left, spectrum_left)
+    } else {
+        let cover_left = origin;
+        let slot_left = cover_left + cover_w + gap;
+        (cover_left, slot_left, slot_left + slot_w + gap)
+    };
+
     let cover = Rect::new(
-        audio_left,
+        cover_left,
         pill.center_y() - cover_w * 0.5,
-        audio_left + cover_w,
+        cover_left + cover_w,
         pill.center_y() + cover_w * 0.5,
     );
-    let slot_left = cover.right + gap;
     let slot_right = slot_left + slot_w;
     let spectrum = if spectrum_w > 0.0 {
         Rect::new(
-            slot_right + gap,
+            spectrum_left,
             pill.center_y() - metrics.spectrum_height() * 0.5,
-            slot_right + gap + spectrum_w,
+            spectrum_left + spectrum_w,
             pill.center_y() + metrics.spectrum_height() * 0.5,
         )
     } else {
-        Rect::new(slot_right, pill.center_y(), slot_right, pill.center_y())
+        Rect::new(spectrum_left, pill.center_y(), spectrum_left, pill.center_y())
     };
 
     Layout {
@@ -545,6 +600,16 @@ mod tests {
             show_spectrum: true,
             show_lyrics: true,
             show_badge: true,
+            launcher_trailing: false,
+        }
+    }
+
+    /// The same content with the launcher moved to the trailing end, which is
+    /// what a right-hand or notification-area anchor asks for.
+    fn content_trailing(audio: bool) -> Content {
+        Content {
+            launcher_trailing: true,
+            ..content(audio)
         }
     }
 
@@ -782,6 +847,112 @@ mod tests {
         assert!((centre(&narrow) - centre(&wide)).abs() < 0.01);
         assert!(wide.pill.left < narrow.pill.left);
         assert!(wide.pill.right > narrow.pill.right);
+    }
+
+    /// Lay one content variant out in the same window, so the two can be
+    /// compared rectangle for rectangle.
+    fn lay_content(c: &Content, lyric: f32) -> Layout {
+        let m = metrics();
+        let l = limits();
+        let width = bar_width(c, &l, &m, lyric);
+        let window = Rect::new(0.0, 0.0, 900.0, 44.0);
+        layout(window, width, Align::End, c, &m)
+    }
+
+    #[test]
+    fn a_right_hand_anchor_puts_the_launcher_beside_the_tray() {
+        let trailing = lay_content(&content_trailing(true), 120.0);
+        let leading = lay_content(&content(true), 120.0);
+
+        // Same bar, opposite ends for the button.
+        assert!((trailing.pill.left - leading.pill.left).abs() < 0.01);
+        assert!((trailing.pill.right - leading.pill.right).abs() < 0.01);
+        assert!(
+            trailing.launcher.right > trailing.pill.right - BAR_PAD - 0.01
+                && trailing.launcher.right < trailing.pill.right,
+            "the button sits against the bar's trailing edge, got {:?}",
+            trailing.launcher
+        );
+        assert!(
+            leading.launcher.left < leading.pill.left + BAR_PAD + 0.01,
+            "the leading layout is unchanged"
+        );
+
+        // The audio component takes the other side, and the spectrum ends up
+        // against the far edge — the mirror of the leading case.
+        let audio = trailing.audio.unwrap();
+        assert!(audio.spectrum.right < trailing.launcher.left);
+        assert!(
+            (audio.spectrum.left - (trailing.pill.left + BAR_PAD)).abs() < 0.51,
+            "the reversed component should start at the pill's leading edge, got {}",
+            audio.spectrum.left
+        );
+        assert!(
+            (audio.cover.right - (trailing.launcher.left - AUDIO_GAP)).abs() < 0.51,
+            "the cover belongs beside the button, got {}",
+            audio.cover.right
+        );
+    }
+
+    #[test]
+    fn the_reversed_layout_is_the_mirror_of_the_leading_one() {
+        let leading = lay_content(&content(true), 120.0);
+        let trailing = lay_content(&content_trailing(true), 120.0);
+        let pill = leading.pill;
+        let mirror = |rect: Rect| {
+            Rect::new(
+                pill.left + pill.right - rect.right,
+                rect.top,
+                pill.left + pill.right - rect.left,
+                rect.bottom,
+            )
+        };
+        let close = |a: Rect, b: Rect| {
+            (a.left - b.left).abs() < 0.01
+                && (a.right - b.right).abs() < 0.01
+                && (a.top - b.top).abs() < 0.01
+                && (a.bottom - b.bottom).abs() < 0.01
+        };
+
+        let (a, b) = (leading.audio.unwrap(), trailing.audio.unwrap());
+        assert!(close(mirror(leading.launcher), trailing.launcher));
+        assert!(close(mirror(a.cover), b.cover), "{:?} vs {:?}", mirror(a.cover), b.cover);
+        assert!(close(mirror(a.spectrum), b.spectrum));
+        assert!(close(mirror(a.slot), b.slot));
+    }
+
+    #[test]
+    fn a_reversed_component_still_fits_inside_its_pill() {
+        let m = metrics();
+        let c = content_trailing(true);
+        let window = Rect::new(0.0, 0.0, 200.0, 44.0);
+        let layout = layout(window, 120.0, Align::End, &c, &m);
+        let audio = layout.audio.unwrap();
+        assert!(audio.slot.width() >= 0.0, "slot must not invert");
+        assert!(audio.cover.left >= layout.pill.left - 0.01);
+        assert!(
+            audio.spectrum.left >= layout.pill.left + BAR_PAD - 0.51,
+            "spectrum escaped the pill's leading edge, got {} vs {}",
+            audio.spectrum.left,
+            layout.pill.left
+        );
+        assert!(audio.cover.right <= layout.launcher.left + 0.01);
+    }
+
+    #[test]
+    fn hit_testing_still_finds_the_launcher_when_it_is_on_the_right() {
+        let layout = lay_content(&content_trailing(true), 120.0);
+        let m = metrics();
+        let centre = (
+            (layout.launcher.left + layout.launcher.right) * 0.5,
+            layout.launcher.center_y(),
+        );
+        assert_eq!(layout.hit(&m, centre.0, centre.1), Some(Hit::Launcher));
+        let audio = layout.audio.unwrap();
+        assert_eq!(
+            layout.hit(&m, audio.cover.left + 1.0, audio.cover.center_y()),
+            Some(Hit::Cover)
+        );
     }
 
     #[test]

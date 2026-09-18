@@ -17,6 +17,14 @@ const XAML_SOURCE_TYPE: &str = "Windows.UI.Xaml.Hosting.DesktopWindowXamlSource"
 const TASKBAR_FRAME_TYPE: &str = "Taskbar.TaskbarFrame";
 const RECTANGLE_TYPE: &str = "Windows.UI.Xaml.Shapes.Rectangle";
 
+/// Tallest a rectangle may be and still be taken for the shell's hairline, in
+/// device-independent pixels. The line is one physical pixel; the slack covers
+/// a scaled display, where one pixel is a fraction of a DIP.
+const HAIRLINE_MAX_HEIGHT_DIP: f64 = 3.0;
+/// How much of the frame's width the hairline must span to be recognised.
+/// Anything narrower is one of the island's many other shapes.
+const HAIRLINE_MIN_WIDTH_FRACTION: f64 = 0.8;
+
 const SUPPORTED: &[windows::core::GUID] = &[
     com::IID_IVISUAL_TREE_SERVICE_CALLBACK,
     // `IVisualTreeServiceCallback2` is deliberately *not* answered. Answering it
@@ -361,10 +369,22 @@ impl Watcher {
     /// Find the `BackgroundFill`/`BackgroundStroke` rectangles of a frame by
     /// walking its children. Names are unique enough inside one taskbar island
     /// — the tray's own background is called `BackgroundBorder`.
+    ///
+    /// The shell's hairline is the same shape of problem as the background, so
+    /// it is found the same way — by geometry rather than by name, because the
+    /// name property is not readable from here without faulting inside the
+    /// shell's string code. It is the mirror image of the background rectangle:
+    /// as wide as the frame and a device pixel or two tall.
     fn register_frame_children(&self, frame_handle: u64) {
         let Some(frame) = self.inspectable_at(frame_handle) else {
             return;
         };
+        // Only used as a sanity bound on the hairline candidate; without it no
+        // hairline is claimed at all rather than a small rectangle being taken
+        // for one and cleared.
+        let frame_width = unsafe { xaml::actual_size_of(frame.as_raw()) }
+            .map(|(width, _)| width)
+            .filter(|width| *width > 0.0);
         let mut queue = vec![frame];
         let mut visited = 0usize;
         // The taskbar paints its background with one big `Rectangle`; the other
@@ -372,6 +392,7 @@ impl Watcher {
         // Picking by size rather than by name: the name property is not readable
         // from here without faulting inside the shell's string code.
         let mut best: Option<(f64, u64)> = None;
+        let mut hairline: Option<(f64, u64)> = None;
         while let Some(element) = queue.pop() {
             visited += 1;
             if visited > 4000 {
@@ -401,6 +422,22 @@ impl Watcher {
                             best = Some((area, handle));
                         }
                     }
+                    // The hairline: full width, a hair tall. Widest wins, and a
+                    // frame of unknown size disqualifies every candidate.
+                    if height > 0.0
+                        && height <= HAIRLINE_MAX_HEIGHT_DIP
+                        && frame_width
+                            .map(|frame| width >= frame * HAIRLINE_MIN_WIDTH_FRACTION)
+                            .unwrap_or(false)
+                        && hairline.map(|(widest, _)| width > widest).unwrap_or(true)
+                    {
+                        if let Some(handle) = self.handle_of(&child) {
+                            crate::service::debug_log_fmt(format_args!(
+                                "claim: hairline rectangle {width}x{height} dp (candidate)"
+                            ));
+                            hairline = Some((width, handle));
+                        }
+                    }
                     continue;
                 }
                 queue.push(child);
@@ -414,6 +451,15 @@ impl Watcher {
                 self.register_rectangle(frame_handle, handle, true);
             }
             None => crate::service::debug_log("claim: no filled rectangle inside the frame"),
+        }
+        match hairline {
+            Some((width, handle)) => {
+                crate::service::debug_log_fmt(format_args!(
+                    "claim: hairline rectangle is {width} dp wide"
+                ));
+                self.register_rectangle(frame_handle, handle, false);
+            }
+            None => crate::service::debug_log("claim: no hairline rectangle inside the frame"),
         }
     }
 
