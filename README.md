@@ -33,7 +33,10 @@ npm run build
 
 # 后端
 cd ..
-cargo build --release -p winbeautify
+# beautify-taskbar-tap 必须一起构建：它是注入 explorer 的 TAP DLL
+# （beautify_taskbar_tap.dll），宿主在 exe 同目录找它，缺了任务栏透明
+# 就只能退回 22H2 之前的旧路径。
+cargo build --release -p winbeautify -p beautify-taskbar-tap
 ./target/release/winbeautify.exe
 ```
 
