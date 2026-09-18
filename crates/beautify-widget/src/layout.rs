@@ -525,14 +525,23 @@ pub fn layout(
     // out of the pill while the bar is mid-animation.
     let requested = spectrum_width(metrics, content.show_spectrum);
     let spectrum_w = requested.min((audio_width - cover_w - 2.0 * gap).max(0.0));
-    let slot_w =
-        (audio_width - cover_w - gap - if spectrum_w > 0.0 { gap + spectrum_w } else { 0.0 }).max(0.0);
+    // What the spectrum costs the band: its own width plus the gap that
+    // separates it from the slot, or nothing at all when it is not drawn.
+    let spectrum_span = if spectrum_w > 0.0 {
+        gap + spectrum_w
+    } else {
+        0.0
+    };
+    let slot_w = (audio_width - cover_w - gap - spectrum_span).max(0.0);
 
     // Cover, slot and spectrum exactly fill the band, so one origin serves both
     // orders — only which of the three comes first changes. Trailing, the cover
     // ends up beside the launcher and the spectrum against the pill's far edge,
     // which is the mirror image of the leading case.
-    let span = cover_w + gap + slot_w + if spectrum_w > 0.0 { gap + spectrum_w } else { 0.0 };
+    //
+    // An undrawn spectrum is a zero-width rectangle, so where exactly it lands
+    // does not matter; it is never painted and never hit.
+    let span = cover_w + gap + slot_w + spectrum_span;
     let origin = if content.launcher_trailing {
         (audio_right - span).max(audio_left)
     } else {
@@ -540,7 +549,7 @@ pub fn layout(
     };
     let (cover_left, slot_left, spectrum_left) = if content.launcher_trailing {
         let spectrum_left = origin;
-        let slot_left = spectrum_left + if spectrum_w > 0.0 { spectrum_w + gap } else { 0.0 };
+        let slot_left = spectrum_left + spectrum_span;
         (slot_left + slot_w + gap, slot_left, spectrum_left)
     } else {
         let cover_left = origin;
@@ -887,8 +896,13 @@ mod tests {
             "the reversed component should start at the pill's leading edge, got {}",
             audio.spectrum.left
         );
+        // The gap between the launcher and the component is the *launcher* gap,
+        // not the one used between the component's own parts — the leading case
+        // has always used the narrower of the two, and the reversed one has to
+        // keep it or the two orders are not mirror images.
+        assert_eq!(LAUNCHER_GAP, 6.0, "the launcher gap is the narrow one");
         assert!(
-            (audio.cover.right - (trailing.launcher.left - AUDIO_GAP)).abs() < 0.51,
+            (audio.cover.right - (trailing.launcher.left - LAUNCHER_GAP)).abs() < 0.51,
             "the cover belongs beside the button, got {}",
             audio.cover.right
         );
@@ -916,7 +930,12 @@ mod tests {
 
         let (a, b) = (leading.audio.unwrap(), trailing.audio.unwrap());
         assert!(close(mirror(leading.launcher), trailing.launcher));
-        assert!(close(mirror(a.cover), b.cover), "{:?} vs {:?}", mirror(a.cover), b.cover);
+        assert!(
+            close(mirror(a.cover), b.cover),
+            "{:?} vs {:?}",
+            mirror(a.cover),
+            b.cover
+        );
         assert!(close(mirror(a.spectrum), b.spectrum));
         assert!(close(mirror(a.slot), b.slot));
     }

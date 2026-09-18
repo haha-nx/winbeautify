@@ -1458,7 +1458,10 @@ mod tests {
         config.taskbar.mode = TaskbarMode::Clear;
         assert!(!shows_tint(&config), "clear has nothing to tint");
         config.taskbar.mode = TaskbarMode::Opaque;
-        assert!(shows_tint(&config), "the solid mode is the one with a colour");
+        assert!(
+            shows_tint(&config),
+            "the solid mode is the one with a colour"
+        );
 
         // Opacity travels with the colour: they are one control surface.
         let shows_opacity = |c: &Config| {
@@ -1694,7 +1697,10 @@ mod tests {
     fn a_swatch_round_trips_through_the_stored_hex_form() {
         for (row, column) in [(0, 0), (0, 11), (1, 3), (5, 7), (8, 11)] {
             let colour = swatch_color(row, column);
-            assert_eq!(colour.to_string().parse::<beautify_core::geometry::Color>(), Ok(colour));
+            assert_eq!(
+                colour.to_string().parse::<beautify_core::geometry::Color>(),
+                Ok(colour)
+            );
         }
     }
 }

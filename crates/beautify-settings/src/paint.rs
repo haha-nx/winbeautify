@@ -1013,7 +1013,11 @@ pub fn color_popup_rect(row: &Row, metrics: &Metrics) -> Option<Rect> {
     }
     let below = row.control.bottom + metrics.px(2.0);
     let above = row.control.top - metrics.px(2.0) - height;
-    let top = if row.control.top > height { above } else { below };
+    let top = if row.control.top > height {
+        above
+    } else {
+        below
+    };
     let right = row.control.right;
     Some(Rect::new(
         (right - width).max(0.0),
@@ -1029,8 +1033,7 @@ pub fn color_popup_size(metrics: &Metrics) -> (f32, f32) {
     let pad = metrics.popup_padding();
     let cell = metrics.swatch_cell_size();
     let gap = metrics.swatch_cell_gap();
-    let width =
-        SWATCH_COLUMNS as f32 * cell + (SWATCH_COLUMNS - 1) as f32 * gap + pad * 2.0;
+    let width = SWATCH_COLUMNS as f32 * cell + (SWATCH_COLUMNS - 1) as f32 * gap + pad * 2.0;
     let height = SWATCH_ROWS as f32 * cell + (SWATCH_ROWS - 1) as f32 * gap + pad * 2.0;
     (width, height)
 }
@@ -1040,12 +1043,7 @@ pub fn color_popup_size(metrics: &Metrics) -> (f32, f32) {
 /// The single place the cells are positioned, so the painter and the hit tester
 /// cannot disagree about where a colour is — the arrangement this crate is built
 /// around.
-pub fn swatch_cell_rect(
-    popup: Rect,
-    row: usize,
-    column: usize,
-    metrics: &Metrics,
-) -> Rect {
+pub fn swatch_cell_rect(popup: Rect, row: usize, column: usize, metrics: &Metrics) -> Rect {
     let pad = metrics.popup_padding();
     let cell = metrics.swatch_cell_size();
     let stride = cell + metrics.swatch_cell_gap();
@@ -1232,11 +1230,19 @@ mod tests {
 
         // The gaps and the padding are misses, not a guess at the nearest
         // colour — otherwise clicking the border would silently pick something.
-        assert_eq!(swatch_at(popup, popup.left + 1.0, popup.top + 1.0, &metrics), None);
+        assert_eq!(
+            swatch_at(popup, popup.left + 1.0, popup.top + 1.0, &metrics),
+            None
+        );
         let first = swatch_cell_rect(popup, 0, 0, &metrics);
         let second = swatch_cell_rect(popup, 0, 1, &metrics);
         assert_eq!(
-            swatch_at(popup, (first.right + second.left) * 0.5, first.center_y(), &metrics),
+            swatch_at(
+                popup,
+                (first.right + second.left) * 0.5,
+                first.center_y(),
+                &metrics
+            ),
             None
         );
         assert_eq!(
@@ -1260,7 +1266,12 @@ mod tests {
             0.0,
             &|_, _| 14.0,
         );
-        for row in layout.content.cards.iter().flat_map(|card| card.rows.iter()) {
+        for row in layout
+            .content
+            .cards
+            .iter()
+            .flat_map(|card| card.rows.iter())
+        {
             let Some(popup) = color_popup_rect(row, &metrics) else {
                 continue;
             };

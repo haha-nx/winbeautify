@@ -165,10 +165,22 @@ impl Theme {
         };
         let foreground_dim = foreground.with_alpha(FOREGROUND_DIM_ALPHA);
 
-        let overlay = if light {
+        // Two different questions that used to share one answer.
+        //
+        // The hairline separates the *fill* from whatever is behind it, so it
+        // takes the opposite tone to the fill. The hover wash goes *under* the
+        // glyphs, so it takes the glyphs' own tone — a wash of the opposite tone
+        // is invisible exactly where it is needed: the default bar has no pill
+        // at all, and a black wash on a dark taskbar is nothing.
+        let hairline_tone = if light {
             Rgba::from_rgb(0x00, 0x00, 0x00)
         } else {
             Rgba::from_rgb(0xff, 0xff, 0xff)
+        };
+        let wash_tone = if foreground.luminance() > 0.5 {
+            Rgba::from_rgb(0xff, 0xff, 0xff)
+        } else {
+            Rgba::from_rgb(0x00, 0x00, 0x00)
         };
 
         Self {
@@ -178,12 +190,12 @@ impl Theme {
             // it has to fade out with the fill: at zero opacity the pill is gone
             // and an unscaled hairline is left floating on the taskbar as a
             // stray ring around nothing.
-            pill_border: overlay.with_alpha(PILL_BORDER_ALPHA * pill.a),
+            pill_border: hairline_tone.with_alpha(PILL_BORDER_ALPHA * pill.a),
             foreground,
             foreground_dim,
             accent,
             on_accent: Rgba::from_rgb(0xff, 0xff, 0xff),
-            hover: overlay.with_alpha(0.12),
+            hover: wash_tone.with_alpha(0.12),
             active: accent,
             spectrum: foreground,
             light,
@@ -212,9 +224,8 @@ mod tests {
     }
 
     #[test]
-    fn default_config_resolves_to_a_dark_pill_with_light_glyphs() {
+    fn the_default_bar_is_glyphs_on_the_taskbar() {
         let theme = Theme::resolve(&Config::default());
-        assert!(!theme.light, "the shipped default background is dark");
         assert!(
             theme.foreground.luminance() > 0.6,
             "the default theme is the dark one, so the glyphs are white"
@@ -226,6 +237,36 @@ mod tests {
         assert_eq!(
             theme.pill_border.a, 0.0,
             "nothing to outline when there is no fill"
+        );
+        // The hover wash has to be visible against whatever the bar is sitting
+        // on. Deriving it from the pill is what broke this: with no pill the
+        // composited pill lands on mid grey, the wash came out black, and a
+        // black wash on a dark taskbar is invisible.
+        assert!(
+            theme.hover.luminance() > 0.9,
+            "the default (dark) bar needs a light hover wash, got {}",
+            theme.hover.luminance()
+        );
+        assert!(theme.hover.a > 0.05, "and it has to be visible at all");
+    }
+
+    /// A light pill wants a dark hairline, whatever colour the glyphs are.
+    #[test]
+    fn the_hairline_contrasts_with_the_fill_not_the_glyphs() {
+        let mut cfg = Config::default();
+        cfg.widget.background = beautify_core::geometry::Color::rgb(0xF2, 0xF3, 0xF6);
+        cfg.widget.opacity = 0.95;
+        cfg.widget.color_mode = beautify_core::config::WidgetColorMode::Custom;
+        cfg.widget.foreground = beautify_core::geometry::Color::rgb(0xFF, 0xFF, 0xFF);
+        let theme = Theme::resolve(&cfg);
+        assert!(theme.light, "the fill is light");
+        assert!(
+            theme.pill_border.luminance() < 0.1,
+            "so its hairline is dark, even though the glyphs are white"
+        );
+        assert!(
+            theme.hover.luminance() > 0.9,
+            "and the wash still follows the glyphs"
         );
     }
 

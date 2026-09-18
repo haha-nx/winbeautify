@@ -418,10 +418,7 @@ impl WidgetAnchor {
     /// tray, which is the edge the pointer is already near; on a left-hand or
     /// centred bar it stays on the leading edge, where the bar starts.
     pub const fn flyout_button_trailing(self) -> bool {
-        matches!(
-            self,
-            WidgetAnchor::TaskbarRight | WidgetAnchor::BottomRight
-        )
+        matches!(self, WidgetAnchor::TaskbarRight | WidgetAnchor::BottomRight)
     }
 }
 
