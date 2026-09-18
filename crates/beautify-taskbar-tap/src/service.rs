@@ -331,8 +331,26 @@ fn set_appearance(cmd: &TapCommand) -> bool {
     let ok = unsafe {
         match brush {
             BrushKind::Solid => paint_fill(shape, || xaml::create_solid_brush(color)),
-            BrushKind::Acrylic => paint_fill(shape, || xaml::create_acrylic_brush(color)),
-            BrushKind::Blur => attach_blur(shape, color, blur_amount),
+            BrushKind::Acrylic => {
+                // The shell refuses to activate `AcrylicBrush` from inside a TAP
+                // (`ActivateInstance` returns E_NOTIMPL), so fall back to a tint
+                // rather than leaving the taskbar untouched: a translucent tint is
+                // what this mode looks like without the blur anyway.
+                let mut painted = paint_fill(shape, || xaml::create_acrylic_brush(color));
+                if !painted {
+                    debug_log("acrylic: no AcrylicBrush from the shell, using a solid tint");
+                    painted = paint_fill(shape, || xaml::create_solid_brush(color));
+                }
+                painted
+            }
+            BrushKind::Blur => {
+                let mut painted = attach_blur(shape, color, blur_amount);
+                if !painted {
+                    debug_log("blur: the composition graph failed, using a solid tint");
+                    painted = paint_fill(shape, || xaml::create_solid_brush(color));
+                }
+                painted
+            }
         }
     };
     debug_log(if ok { "appearance applied" } else { "appearance failed" });
