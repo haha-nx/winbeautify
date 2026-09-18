@@ -242,10 +242,6 @@ struct Applied {
     geometry: Option<Rect>,
     bars: usize,
     tap: bool,
-    /// Whether the TAP actually applied the command; a TAP that is connected but
-    /// has not claimed a taskbar yet reports `false`, and that has to look like a
-    /// change so the next evaluation tries again.
-    tap_applied: bool,
     primary: isize,
 }
 
@@ -582,6 +578,10 @@ unsafe extern "system" fn win_event_proc(
 thread_local! {
     // Last applied state, used to skip redundant DWM round-trips.
     static LAST: std::cell::RefCell<Option<Applied>> = const { std::cell::RefCell::new(None) };
+    // Whether the last apply actually reached the taskbar. A TAP that has not
+    // claimed one reports failure, and that has to be retried even when nothing
+    // else changed.
+    static LAST_DELIVERED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     // Cached applicator so the "touched windows" list survives evaluations.
     static APPLICATOR: std::cell::RefCell<AccentApplicator> =
         std::cell::RefCell::new(AccentApplicator::new());
@@ -626,49 +626,54 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
 
     let backdrop = Backdrop::new(effective_mode, desired.color, desired.opacity);
     let tap_window = Shared::resolve_tap(shared, primary);
-    // The TAP answers false while it has not claimed a taskbar yet — which
-    // happens when it connected after the shell built one. That has to be part
-    // of the state compared below, or the failure would look like "already
-    // applied" and never be retried.
-    let tap_applied = match tap_window {
-        Some(channel) => apply_via_tap(shared, channel, &bars, effective_mode, &desired),
-        None => false,
-    };
     let applied = Applied {
         backdrop,
         state,
         geometry,
         bars: bars.len(),
         tap: tap_window.is_some(),
-        tap_applied,
         primary: primary.map(|h| h.0 as isize).unwrap_or(0),
     };
 
+    // Apply when the desired state changed, or when the last TAP command was not
+    // applied — the TAP answers false until it has claimed a taskbar, which is how
+    // a taskbar that predates the injection looks. Skipping that retry would leave
+    // the taskbar untouched until something else changed.
     let unchanged = LAST.with(|slot| slot.borrow().as_ref() == Some(&applied));
-    if unchanged {
+    let retry = LAST_DELIVERED.with(|cell| !cell.get());
+    if unchanged && !retry {
         return;
     }
 
-    if !skip_apply && tap_window.is_none() {
-        let mica_ok = MICA_OK.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            *slot.get_or_insert_with(|| primary.map(AccentApplicator::probe_mica).unwrap_or(false))
-        });
+    let delivered = match tap_window {
+        Some(channel) => apply_via_tap(shared, channel, &bars, effective_mode, &desired),
+        None => {
+            if !skip_apply {
+                let mica_ok = MICA_OK.with(|cell| {
+                    let mut slot = cell.borrow_mut();
+                    *slot.get_or_insert_with(|| {
+                        primary.map(AccentApplicator::probe_mica).unwrap_or(false)
+                    })
+                });
 
-        APPLICATOR.with(|slot| {
-            let mut applicator = slot.borrow_mut();
-            applicator.prune();
-            for bar in &bars {
-                if effective_mode == TaskbarMode::Normal {
-                    applicator.reset(*bar);
-                } else {
-                    applicator.apply(*bar, &backdrop, dark, mica_ok);
-                }
+                APPLICATOR.with(|slot| {
+                    let mut applicator = slot.borrow_mut();
+                    applicator.prune();
+                    for bar in &bars {
+                        if effective_mode == TaskbarMode::Normal {
+                            applicator.reset(*bar);
+                        } else {
+                            applicator.apply(*bar, &backdrop, dark, mica_ok);
+                        }
+                    }
+                });
             }
-        });
-    }
+            true
+        }
+    };
 
     LAST.with(|slot| *slot.borrow_mut() = Some(applied.clone()));
+    LAST_DELIVERED.with(|cell| cell.set(delivered));
 
     if let Some(bus) = shared.bus.read().clone() {
         bus.publish(&Event::TaskbarChanged(Arc::new(TaskbarState {
