@@ -1209,13 +1209,6 @@ const ABOUT: &[Card] = &[
             },
         ],
     },
-    Card {
-        title: Some("最近操作"),
-        fields: &[hint(
-            info(InfoKey::LastAction, "结果"),
-            "任务栏效果通过 DWM 与合成 API 实现，不修改任何系统文件，退出时自动还原；全部模块按需加载，空闲时不轮询。",
-        )],
-    },
 ];
 
 /// Every section, in sidebar order.

@@ -545,6 +545,37 @@ impl TextEngine {
         chars[..low].iter().collect::<String>() + "…"
     }
 
+    /// Like [`Self::fit`], but keeps the *tail*: the longest suffix that fits,
+    /// headed by an ellipsis.
+    ///
+    /// For paths and other names whose interesting end is at the right —
+    /// `…\WinBeautify\config.toml` says more than `C:\Users\…` does.
+    pub fn fit_start(&self, text: &str, format: &IDWriteTextFormat, max_width: f32) -> String {
+        if text.is_empty() || max_width <= 0.0 {
+            return String::new();
+        }
+        if self.measure(text, format, 4096.0) <= max_width {
+            return text.to_string();
+        }
+
+        let chars: Vec<char> = text.chars().collect();
+        // Invariant: `low` always fits with a leading ellipsis, `high` never does.
+        let (mut low, mut high) = (0usize, chars.len());
+        while high - low > 1 {
+            let mid = (low + high) / 2;
+            let candidate: String = "…".to_string() + &chars[chars.len() - mid..].iter().collect::<String>();
+            if self.measure(&candidate, format, 4096.0) <= max_width {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        if low == 0 {
+            return String::new();
+        }
+        "…".to_string() + &chars[chars.len() - low..].iter().collect::<String>()
+    }
+
     /// Split `text` into lines that each fit `max_width`, at word boundaries
     /// where possible and mid-word where not.
     pub fn wrap(&self, text: &str, format: &IDWriteTextFormat, max_width: f32) -> Vec<String> {

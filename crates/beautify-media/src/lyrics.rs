@@ -338,6 +338,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The precision work is about exactly this: a GSMTC title full of source
+    /// decoration must still resolve, and resolve to the song — not to a
+    /// keyword-search noise hit. Hits the real NetEase endpoint.
+    #[test]
+    #[ignore = "requires network access"]
+    fn a_decorated_gmtc_title_still_resolves_to_the_song() {
+        let dir = std::env::temp_dir().join(format!("wb-lyr-noisy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let resolver = LyricsResolver::new(dir, LyricProvider::Netease, String::new());
+        let lyrics = resolver.resolve("Beyond", "海阔天空 (Official MV - Live)", "", 268_000);
+        assert!(!lyrics.is_empty(), "a decorated title must still resolve");
+        println!(
+            "decorated title: {} lines from {}",
+            lyrics.lines.len(),
+            lyrics.source
+        );
+        // The first line of the real song, so a karaoke/covers mix-up would
+        // fail this rather than passing on any LRC-shaped response.
+        let joined = lyrics
+            .lines
+            .iter()
+            .map(|line| line.text.replace(' ', ""))
+            .collect::<String>();
+        assert!(
+            joined.contains("今天我") || joined.contains("冷雨夜"),
+            "expected the real song's opening lines, got: {:?}",
+            lyrics.lines.first().map(|line| &line.text)
+        );
+    }
+
     /// Hits the real endpoints. Excluded from the default run because the suite
     /// must not need the network, but run it explicitly to check that a
     /// provider's protocol still matches the service:

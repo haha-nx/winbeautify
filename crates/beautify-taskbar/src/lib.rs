@@ -643,9 +643,13 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
     // applied — the TAP answers false until it has claimed a taskbar, which is how
     // a taskbar that predates the injection looks. Skipping that retry would leave
     // the taskbar untouched until something else changed.
+    //
+    // Acrylic is re-applied on every pass regardless: the shell occasionally
+    // drops a foreign brush (theme change, monitor wake), and the mod ecosystem
+    // around the taskbar works around it the same way — by re-applying.
     let unchanged = LAST.with(|slot| slot.borrow().as_ref() == Some(&applied));
     let retry = LAST_DELIVERED.with(|cell| !cell.get());
-    if unchanged && !retry {
+    if unchanged && !retry && effective_mode != TaskbarMode::Acrylic {
         return;
     }
 
@@ -797,10 +801,15 @@ fn apply_via_tap(
     }
 
     if !delivered {
-        // The channel is gone (explorer restarted mid-send, or the TAP
-        // refused everything); drop it so the next evaluation rediscovers or
-        // re-injects.
-        Shared::drop_tap(shared);
+        // A "not applied" answer from a living channel is transient — the TAP
+        // is still claiming the island and retries on the next evaluation —
+        // and re-injecting on top of it would stack a second TAP instance
+        // whose registry never fills. The channel is dropped only when it is
+        // really gone (explorer restarted mid-send), so the next evaluation
+        // rediscovers or re-injects.
+        if !inject::channel_alive(channel) {
+            Shared::drop_tap(shared);
+        }
     }
     delivered
 }

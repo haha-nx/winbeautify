@@ -51,6 +51,17 @@ pub const IID_IBRUSH: GUID = GUID::from_u128(0x8806a321_1e06_422c_a1cc_01696559e
 pub const IID_ISHAPE: GUID = GUID::from_u128(0x786f2b75_9aa0_454d_ae06_a2466e37c832);
 pub const IID_ISOLID_COLOR_BRUSH: GUID = GUID::from_u128(0x9d850850_66f3_48df_9a8f_824bd5e070af);
 pub const IID_IACRYLIC_BRUSH: GUID = GUID::from_u128(0x79bbcf4e_cd66_4f1b_a8b6_cd6d2977c18d);
+pub const IID_IBORDER: GUID = GUID::from_u128(0x797c4539_45bd_4633_a044_bfb02ef5170f);
+/// `IXamlReaderStatics` (Windows.UI.Xaml.Markup.XamlReader). XAML types cannot
+/// be default-activated (`IActivationFactory.ActivateInstance` answers
+/// E_NOTIMPL), so the only way to create an `AcrylicBrush` from inside the TAP
+/// is to parse it.
+pub const IID_IXAML_READER_STATICS: GUID =
+    GUID::from_u128(0x9891c6bd_534f_4955_b85a_8a8dc0dca602);
+/// `Windows.UI.Xaml.Controls.IControl` — the interface `Taskbar.TaskbarFrame`
+/// itself implements. Its `BorderBrush` with a top-only `BorderThickness` is
+/// the strongest candidate for what paints the taskbar's top hairline.
+pub const IID_ICONTROL: GUID = GUID::from_u128(0xa8912263_2951_4f58_a9c5_5a134eaa7f07);
 pub const IID_IVISUAL_TREE_HELPER_STATICS: GUID =
     GUID::from_u128(0xe75758c4_d25d_4b1d_971f_596f17f12baa);
 pub const IID_IELEMENT_COMPOSITION_PREVIEW_STATICS: GUID =
@@ -146,7 +157,9 @@ pub struct IFrameworkElementVtbl {
     pub get_name: unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut u16) -> HRESULT, // 33
 }
 
-/// Slots 6/7 of `IShape` (`get_Fill`/`put_Fill`).
+/// Slots 6-11 of `IShape`: `Fill`/`Fill`, then `Stroke`. The hairline
+/// rectangle is literally named `BackgroundStroke` — its line comes from the
+/// stroke brush on its top edge, while the fill reads as fully transparent.
 #[repr(C)]
 pub struct IShapeVtbl {
     pub winrt: WinRtSlots, // 0-5
@@ -154,6 +167,14 @@ pub struct IShapeVtbl {
         unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT, // 6
     pub put_fill:
         unsafe extern "system" fn(this: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> HRESULT, // 7
+    pub get_stroke:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT, // 8
+    pub put_stroke:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> HRESULT, // 9
+    /// `StrokeMiterLimit` is get-only.
+    pub get_stroke_miter_limit: usize, // 10
+    pub get_stroke_thickness:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut f64) -> HRESULT, // 11
 }
 
 /// Slots 6/7 of `ISolidColorBrush` (`get_Color`/`put_Color`).
@@ -173,6 +194,61 @@ pub struct IAcrylicBrushVtbl {
     pub put_background_source: unsafe extern "system" fn(this: *mut core::ffi::c_void, value: i32) -> HRESULT, // 7
     pub get_tint_color: usize,            // 8
     pub put_tint_color: unsafe extern "system" fn(this: *mut core::ffi::c_void, color: Color) -> HRESULT, // 9
+}
+
+/// Slots 6-11 of `IBorder`. The hairline along the taskbar's top edge is the
+/// `BorderBrush` of one of the island's `Border` elements, which is why this
+/// interface exists here: a brush no shape can reach.
+#[repr(C)]
+pub struct IBorderVtbl {
+    pub winrt: WinRtSlots, // 0-5
+    pub get_border_brush:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT, // 6
+    pub put_border_brush:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> HRESULT, // 7
+    /// `Thickness` is 32 bytes, so the WinRT ABI passes and returns it through a
+    /// hidden pointer rather than in registers.
+    pub get_border_thickness:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut Thickness) -> HRESULT, // 8
+    pub put_border_thickness:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, value: *const Thickness) -> HRESULT, // 9
+    pub get_background:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT, // 10
+    pub put_background:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> HRESULT, // 11
+}
+
+/// `IControl`: slots 6-29 are the font/tab properties (`FontSize` .. `TabNavigation`),
+/// then `Template`, `Padding`, the content alignments, and finally the
+/// background and border properties the taskbar frame's hairline comes through.
+#[repr(C)]
+pub struct IControlVtbl {
+    pub winrt: WinRtSlots,        // 0-5
+    pub before_padding: [usize; 24], // 6-29 FontSize .. TabNavigation, Template
+    pub get_padding: usize,       // 30
+    pub put_padding: usize,       // 31
+    pub before_background: [usize; 4], // 32-35 Horizontal/VerticalContentAlignment
+    pub get_background:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT, // 36
+    pub put_background:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> HRESULT, // 37
+    pub get_border_thickness:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut Thickness) -> HRESULT, // 38
+    pub put_border_thickness:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, value: *const Thickness) -> HRESULT, // 39
+    pub get_border_brush:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, out: *mut *mut core::ffi::c_void) -> HRESULT, // 40
+    pub put_border_brush:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> HRESULT, // 41
+}
+
+/// `IXamlReaderStatics`: `Load` is the first method of the interface.
+#[repr(C)]
+pub struct IXamlReaderStaticsVtbl {
+    pub winrt: WinRtSlots, // 0-5
+    pub load:
+        unsafe extern "system" fn(this: *mut core::ffi::c_void, xaml: *mut u16, out: *mut *mut core::ffi::c_void) -> HRESULT, // 6
+    pub load_with_initial_template_validation: usize, // 7
 }
 
 /// `IVisualTreeHelperStatics`. Method order: four `FindElementsInHostCoordinates`
@@ -286,6 +362,16 @@ pub struct FactoryVtbl {
         out: *mut *mut core::ffi::c_void,
     ) -> HRESULT,
     pub lock_server: unsafe extern "system" fn(this: *mut core::ffi::c_void, lock: i32) -> HRESULT,
+}
+
+/// `Windows.UI.Xaml.Thickness` ABI: four `f64` offsets, in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[repr(C)]
+pub struct Thickness {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
 }
 
 /// `Windows.UI.Color` ABI: four bytes, A first.
@@ -891,9 +977,14 @@ mod tests {
 
     #[test]
     fn brush_and_shape_slots() {
-        // Shapes.IShape: get_Fill, put_Fill.
+        // Shapes.IShape: get_Fill, put_Fill, get_Stroke, put_Stroke,
+        // get_StrokeMiterLimit (get-only), get_StrokeThickness.
         assert_eq!(at(6), offset_of!(IShapeVtbl, get_fill));
         assert_eq!(at(7), offset_of!(IShapeVtbl, put_fill));
+        assert_eq!(at(8), offset_of!(IShapeVtbl, get_stroke));
+        assert_eq!(at(9), offset_of!(IShapeVtbl, put_stroke));
+        assert_eq!(at(11), offset_of!(IShapeVtbl, get_stroke_thickness));
+        assert_eq!(at(12), size_of::<IShapeVtbl>());
         // Media.ISolidColorBrush: get_Color, put_Color.
         assert_eq!(at(7), offset_of!(ISolidColorBrushVtbl, put_color));
         // Media.IAcrylicBrush: BackgroundSource, TintColor, ...
@@ -903,6 +994,45 @@ mod tests {
         );
         assert_eq!(at(9), offset_of!(IAcrylicBrushVtbl, put_tint_color));
         assert_eq!(at(10), size_of::<IAcrylicBrushVtbl>());
+    }
+
+    #[test]
+    fn border_slots() {
+        // Controls.IBorder, from the Windows.UI.Xaml.winmd that ships with the
+        // OS (extracted from C:\Windows\System32\WinMetadata): BorderBrush,
+        // BorderThickness, Background, CornerRadius, Padding, Child, ...
+        assert_eq!(at(6), offset_of!(IBorderVtbl, get_border_brush));
+        assert_eq!(at(7), offset_of!(IBorderVtbl, put_border_brush));
+        assert_eq!(at(8), offset_of!(IBorderVtbl, get_border_thickness));
+        assert_eq!(at(9), offset_of!(IBorderVtbl, put_border_thickness));
+        assert_eq!(at(10), offset_of!(IBorderVtbl, get_background));
+        assert_eq!(at(11), offset_of!(IBorderVtbl, put_background));
+        assert_eq!(at(12), size_of::<IBorderVtbl>());
+    }
+
+    #[test]
+    fn control_slots() {
+        // Controls.IControl, from the OS's Windows.UI.Xaml.winmd: the font and
+        // tab properties occupy slots 6-29, then Template, Padding and the
+        // content alignments, and Background/BorderThickness/BorderBrush at
+        // 36-41. Cross-checked against IUIElement's known GUID with the same
+        // extraction script that produced these slot numbers.
+        assert_eq!(at(30), offset_of!(IControlVtbl, get_padding));
+        assert_eq!(at(36), offset_of!(IControlVtbl, get_background));
+        assert_eq!(at(38), offset_of!(IControlVtbl, get_border_thickness));
+        assert_eq!(at(39), offset_of!(IControlVtbl, put_border_thickness));
+        assert_eq!(at(40), offset_of!(IControlVtbl, get_border_brush));
+        assert_eq!(at(41), offset_of!(IControlVtbl, put_border_brush));
+        assert_eq!(at(42), size_of::<IControlVtbl>());
+    }
+
+    #[test]
+    fn xaml_reader_slots() {
+        // Markup.IXamlReaderStatics, from the OS winmd: Load, then
+        // LoadWithInitialTemplateValidation.
+        assert_eq!(at(6), offset_of!(IXamlReaderStaticsVtbl, load));
+        assert_eq!(at(7), offset_of!(IXamlReaderStaticsVtbl, load_with_initial_template_validation));
+        assert_eq!(at(8), size_of::<IXamlReaderStaticsVtbl>());
     }
 
     #[test]

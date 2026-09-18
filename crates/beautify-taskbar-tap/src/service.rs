@@ -7,13 +7,14 @@
 //! touching them safe.
 
 use crate::com::{self, Color};
-use crate::effects::{CompositeEffect, FloodEffect, GaussianBlurEffect};
+use crate::effects::GaussianBlurEffect;
 use crate::protocol::{
     BrushKind, CommandKind, TapCommand, COPYDATA_MAGIC, PROTOCOL_VERSION, TAP_WINDOW_CLASS,
 };
 use crate::xaml;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{IUnknown, Interface, PCWSTR};
@@ -32,13 +33,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW,
     GetClientRect, GetWindowThreadProcessId, RegisterClassExW, CreateWindowExW,
     PostMessageW, HMENU, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_COPYDATA, WM_NCDESTROY, WM_PAINT, WNDCLASSEXW,
+    WM_COPYDATA, WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDCLASSEXW,
 };
 use windows_numerics::Vector2;
 
 /// Posted by the worker-death watcher so the restore runs on the UI thread.
 const WM_APP_RESTORE_ALL: u32 = WM_APP + 4;
 const SUBCLASS_ID: usize = 0x5F42_5450;
+/// One-shot timer id for the delayed re-walk (see [`schedule_rewalk`]).
+const TIMER_REWALK: usize = 1;
+
+/// Gaussian radius for the acrylic material. The host does not send a blur
+/// amount for acrylic (the mode is defined by its material, not by a knob), so
+/// the TAP picks the wider radius its look needs.
+const ACRYLIC_BLUR_AMOUNT: f32 = 30.0;
 
 /// One of the two rectangles (`BackgroundFill`/`BackgroundStroke`) tracked per
 /// taskbar island. `original` is captured lazily on the first repaint command:
@@ -83,21 +91,101 @@ impl Drop for ControlInfo {
     }
 }
 
+/// Which property one hairline carrier paints through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarrierKind {
+    /// A `Shape`'s `Fill` — the thin `BackgroundStroke` rectangle's fill,
+    /// which reads as fully transparent on this build.
+    RectangleFill,
+    /// A `Shape`'s `Stroke` — the same rectangle's outline. The name says it:
+    /// the visible top hairline is this rectangle's stroke brush, which is
+    /// why clearing fills and border brushes alone changed nothing.
+    RectangleStroke,
+    /// A `Border`'s `BorderBrush`.
+    BorderBrush,
+    /// A `Control`'s `BorderBrush` — the `TaskbarFrame` itself, whose
+    /// template paints it along the frame's top edge.
+    ControlBorderBrush,
+}
+
+/// One element the shell may paint the top hairline with, plus its own brush
+/// for putting back. A raw COM pointer that may live inside the shared
+/// service state (which the static mutex requires to be `Send`). Ownership
+/// follows the usual one-reference rule: adopted at registration, released on
+/// drop.
+///
+/// `captured` means we hold the shell's real brush in `original`. A carrier
+/// whose brush has not been read yet is left alone: the shell paints some of
+/// these elements seconds after the claim, and clearing before that would
+/// either race its paint or, worse, record "no brush" and make *show*
+/// unrecoverable.
+struct HairlineCarrier {
+    kind: CarrierKind,
+    target: SendPtr,
+    /// The shell's own brush, captured before the first clear.
+    original: Option<SendPtr>,
+    captured: bool,
+}
+
+impl Drop for HairlineCarrier {
+    fn drop(&mut self) {
+        unsafe { com::release_raw(self.target.0) };
+        if let Some(original) = self.original.take() {
+            unsafe { com::release_raw(original.0) };
+        }
+    }
+}
+
+impl HairlineCarrier {
+    /// Read the shell's current brush (owned reference).
+    fn read(&self) -> Option<*mut core::ffi::c_void> {
+        Self::read_for(self.kind, self.target)
+    }
+
+    fn read_for(kind: CarrierKind, target: SendPtr) -> Option<*mut core::ffi::c_void> {
+        unsafe {
+            match kind {
+                CarrierKind::RectangleFill => xaml::fill_of(target.0),
+                CarrierKind::RectangleStroke => xaml::stroke_of(target.0),
+                CarrierKind::BorderBrush => xaml::border_brush_of(target.0),
+                CarrierKind::ControlBorderBrush => xaml::control_border_brush_of(target.0),
+            }
+        }
+    }
+
+
+    fn write_for(kind: CarrierKind, target: SendPtr, brush: *mut core::ffi::c_void) -> bool {
+        unsafe {
+            match kind {
+                CarrierKind::RectangleFill => xaml::set_fill(target.0, brush),
+                CarrierKind::RectangleStroke => xaml::set_stroke(target.0, brush),
+                CarrierKind::BorderBrush => xaml::set_border_brush(target.0, brush),
+                CarrierKind::ControlBorderBrush => {
+                    xaml::set_control_border_brush(target.0, brush)
+                }
+            }
+        }
+    }
+}
+
 struct Bar {
     /// The `Shell_TrayWnd`/`Shell_SecondaryTrayWnd` this island belongs to.
     /// Commands address a taskbar by that window, so the mapping is kept ready
     /// rather than derived from the island's host window on every command.
     taskbar: isize,
     background: ControlInfo,
-    border: ControlInfo,
     /// Whether the host wants the top hairline visible, once it has said.
     ///
-    /// Remembered rather than only acted on, because the host's command and the
-    /// shell's hairline rectangle are not synchronised: the rectangle turns up
-    /// from a visual tree callback, which can be after the command that wanted
-    /// it hidden. Nothing would ever ask again, so the state waits here until
-    /// there is something to apply it to.
+    /// Remembered rather than only acted on, because the host's command and
+    /// the shell's hairline elements are not synchronised: the elements turn
+    /// up from visual tree callbacks, which can be after the command that
+    /// wanted it hidden. Nothing would ever ask again, so the state waits here
+    /// until there is something to apply it to.
     hairline: Option<bool>,
+    /// Everything the shell may paint the top hairline with. Several carriers
+    /// register per taskbar — the thin rectangle, frame-sized borders, and the
+    /// frame's own control brush — and the state applies to all of them.
+    hairline_carriers: Vec<HairlineCarrier>,
     blur_attached: bool,
 }
 
@@ -110,6 +198,26 @@ struct Service {
 }
 
 static SERVICE: OnceLock<Mutex<Service>> = OnceLock::new();
+
+/// The command window handle, mirrored out of [`Service`] so the timer can be
+/// armed from paths that already hold the lock (a nested `with_service` would
+/// deadlock).
+static REWALK_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// How many times the delayed re-walk has armed itself. The shell paints the
+/// hairline elements seconds after the claim; a bounded number of retries
+/// covers that without an immortal timer.
+const REWALK_MAX_ATTEMPTS: u32 = 15;
+static REWALK_ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The sprite visual each blur graph mounted, keyed by its background
+/// rectangle. Detaching a visual whose brush samples the backdrop deadlocks
+/// the UI thread against the render thread — the brush is nulled first, which
+/// needs the sprite, which is what this table is for.
+static BLUR_SPRITES: OnceLock<Mutex<HashMap<usize, SendPtr>>> = OnceLock::new();
+
+fn blur_sprites() -> &'static Mutex<HashMap<usize, SendPtr>> {
+    BLUR_SPRITES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn service() -> &'static Mutex<Service> {
     SERVICE.get_or_init(|| Mutex::new(Service::default()))
@@ -135,12 +243,17 @@ pub fn register_taskbar(frame_handle: u64, taskbar: isize) {
         svc.bars.entry(frame_handle).or_insert_with(|| Bar {
             taskbar,
             background: ControlInfo::default(),
-            border: ControlInfo::default(),
             hairline: None,
+            hairline_carriers: Vec::new(),
             blur_attached: false,
         });
     });
     debug_log("registered taskbar frame");
+}
+
+/// The claimed `TaskbarFrame` handles, for the delayed re-walk.
+pub fn frame_handles() -> Vec<u64> {
+    with_service(|svc| svc.bars.keys().copied().collect())
 }
 
 /// Are any taskbars registered yet? The tree callback retries discovery while
@@ -159,28 +272,151 @@ pub fn register_taskbar_background(frame_handle: u64, shape: IUnknown) {
     debug_log("registered background rectangle");
 }
 
+/// Register one hairline carrier, or re-apply the pending hairline state to an
+/// already-registered one. Returns the plan, if the state is already known —
+/// the "command before element" race: the host may have asked for a hairline
+/// state while this element was still unknown, and nothing would ever ask
+/// again. Only a *first* sighting applies it: this runs inside a visual tree
+/// callback, and re-applying on every notification would repaint the element
+/// on each of the shell's many tree mutations.
+fn register_carrier(
+    svc: &mut Service,
+    frame_handle: u64,
+    kind: CarrierKind,
+    target: SendPtr,
+) -> Option<HairlinePlan> {
+    let bar = svc.bars.get_mut(&frame_handle)?;
+    let pending = bar.hairline.is_some();
+    let first_sighting = !bar
+        .hairline_carriers
+        .iter()
+        .any(|carrier| carrier.kind == kind && carrier.target == target);
+    if first_sighting {
+        bar.hairline_carriers.push(HairlineCarrier {
+            kind,
+            target,
+            original: None,
+            captured: false,
+        });
+    }
+    if pending && first_sighting {
+        let plan = plan_hairline(bar);
+        if plan.retry {
+            // The element is here but its paint is not; come back on the timer.
+            schedule_rewalk();
+        }
+        Some(plan)
+    } else {
+        None
+    }
+}
+
 /// Remember the taskbar's border rectangle (the hairline along its top edge).
+///
+/// The rectangle is registered through *both* of its paint channels: its fill
+/// (transparent on this build) and its stroke.
 pub fn register_taskbar_border(frame_handle: u64, shape: IUnknown) {
-    let shape = own(shape);
-    let write = with_service(|svc| {
-        let bar = svc.bars.get_mut(&frame_handle)?;
-        let first_sighting = bar.border.shape.is_none();
-        bar.border.shape = Some(shape);
-        // The host may have asked for a hairline state while this rectangle was
-        // still unknown — the two run on different schedules, and nothing would
-        // ever ask again. Applying it on the first sighting is what makes the
-        // switch reliable rather than a race.
-        //
-        // Only on the *first* sighting: this runs inside a visual tree callback,
-        // and re-applying on every notification would repaint the element on
-        // each of the shell's many tree mutations.
-        if first_sighting {
-            plan_hairline(bar)
-        } else {
-            None
+    let target = own(shape);
+    let plan = with_service(|svc| {
+        let fill = register_carrier(svc, frame_handle, CarrierKind::RectangleFill, target);
+        let stroke = register_carrier(svc, frame_handle, CarrierKind::RectangleStroke, target);
+        match (fill, stroke) {
+            (Some(mut a), Some(b)) => {
+                a.writes.extend(b.writes);
+                a.retry |= b.retry;
+                Some(a)
+            }
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
         }
     });
-    commit_hairline(write);
+    if let Some(plan) = plan {
+        commit_hairline(plan);
+    }
+}
+
+/// Remember a `Border` element whose `BorderBrush` may paint the hairline.
+pub fn register_taskbar_hairline_border(frame_handle: u64, border: IUnknown) {
+    let target = own(border);
+    let plan =
+        with_service(|svc| register_carrier(svc, frame_handle, CarrierKind::BorderBrush, target));
+    if let Some(plan) = plan {
+        commit_hairline(plan);
+    }
+}
+
+/// Remember the `TaskbarFrame` itself: a `Control`, whose template paints its
+/// `BorderBrush` along the frame's edges — the top one is the hairline.
+pub fn register_taskbar_frame_control(frame_handle: u64, frame: IUnknown) {
+    let target = own(frame);
+    let plan = with_service(|svc| {
+        let plan = register_carrier(svc, frame_handle, CarrierKind::ControlBorderBrush, target);
+        debug_log("registered frame control brush carrier");
+        plan
+    });
+    if let Some(plan) = plan {
+        commit_hairline(plan);
+    }
+}
+
+/// Remember a frame-wide `Border` discovered by the delayed re-walk, which
+/// has no frame handle. The border joins the carriers of every registered bar.
+pub fn register_frameless_hairline_border(border: IUnknown) {
+    let target = own(border);
+    let plan = with_service(|svc| {
+        let mut combined: Option<HairlinePlan> = None;
+        let bars = svc.bars.keys().copied().collect::<Vec<_>>();
+        for frame_handle in bars {
+            if let Some(part) = register_carrier(svc, frame_handle, CarrierKind::BorderBrush, target)
+            {
+                combined
+                    .get_or_insert_with(|| HairlinePlan {
+                        writes: Vec::new(),
+                        retry: false,
+                    })
+                    .writes
+                    .extend(part.writes);
+            }
+        }
+        if combined.is_some() {
+            debug_log("rewalk border carrier registered");
+        }
+        combined
+    });
+    if let Some(plan) = plan {
+        commit_hairline(plan);
+    }
+}
+
+/// Remember a thin full-width rectangle found by the delayed re-walk — the
+/// hairline painter, which had no size and no fill when the claim walk ran.
+pub fn register_frameless_hairline_rect(rect: IUnknown) {
+    let target = own(rect);
+    let plan = with_service(|svc| {
+        let mut combined: Option<HairlinePlan> = None;
+        let bars = svc.bars.keys().copied().collect::<Vec<_>>();
+        for frame_handle in bars {
+            for kind in [CarrierKind::RectangleFill, CarrierKind::RectangleStroke] {
+                if let Some(part) = register_carrier(svc, frame_handle, kind, target) {
+                    combined
+                        .get_or_insert_with(|| HairlinePlan {
+                            writes: Vec::new(),
+                            retry: false,
+                        })
+                        .writes
+                        .extend(part.writes);
+                }
+            }
+        }
+        if combined.is_some() {
+            debug_log("rewalk rectangle carrier registered");
+        }
+        combined
+    });
+    if let Some(plan) = plan {
+        commit_hairline(plan);
+    }
 }
 
 /// Drop a taskbar (its XAML island was torn down).
@@ -340,12 +576,18 @@ fn set_appearance(cmd: &TapCommand) -> bool {
             bar.background.captured = true;
             debug_log("appearance: captured the shell's own fill");
         }
-        if bar.border.shape.is_some() && !bar.border.captured {
-            let border_raw = bar.border.shape.as_ref().map(|s| s.0);
-            bar.border.original = border_raw
-                .and_then(|raw| unsafe { xaml::fill_of(raw) })
-                .map(SendPtr);
-            bar.border.captured = true;
+        // The same lazy capture for every hairline carrier: by the time the
+        // host paints, the shell has initialised its brushes. Only a *real*
+        // brush is captured — a brushless read means "not painted yet" and is
+        // left for the re-walk timer, or "show" would restore a null and the
+        // line could never come back.
+        for carrier in bar.hairline_carriers.iter_mut() {
+            if !carrier.captured {
+                if let Some(brush) = carrier.read() {
+                    carrier.original = Some(SendPtr(brush));
+                    carrier.captured = true;
+                }
+            }
         }
         true
     });
@@ -364,19 +606,31 @@ fn set_appearance(cmd: &TapCommand) -> bool {
         match brush {
             BrushKind::Solid => paint_fill(shape, || xaml::create_solid_brush(color)),
             BrushKind::Acrylic => {
-                // The shell refuses to activate `AcrylicBrush` from inside a TAP
-                // (`ActivateInstance` returns E_NOTIMPL), so fall back to a tint
-                // rather than leaving the taskbar untouched: a translucent tint is
-                // what this mode looks like without the blur anyway.
-                let mut painted = paint_fill(shape, || xaml::create_acrylic_brush(color));
-                if !painted {
-                    debug_log("acrylic: no AcrylicBrush from the shell, using a solid tint");
-                    painted = paint_fill(shape, || xaml::create_solid_brush(color));
+                // Acrylic = the blur visual (behind) + a translucent tint (in
+                // front). The child visual a blur graph mounts renders *below*
+                // the element's own `Fill` — the standard XAML acrylic
+                // pattern — so the tint is a plain translucent solid brush
+                // layered over the blur.
+                //
+                // The shell's own `AcrylicBrush` was tried here first: created
+                // through `XamlReader` (default activation answers
+                // E_NOTIMPL), it renders — and then crashes the taskbar about
+                // twenty seconds later, once or a hundred times applied. The
+                // blur-graph material stays.
+                if !attach_blur(shape, blur_amount.max(ACRYLIC_BLUR_AMOUNT)) {
+                    debug_log("acrylic: the composition graph failed, using a solid tint");
+                    paint_fill(shape, || xaml::create_solid_brush(color))
+                } else {
+                    // The host folds the user's opacity into the alpha byte; a
+                    // zero-alpha tint would leave the acrylic material
+                    // untinted, so it bottoms out at half strength.
+                    let mut tint = color;
+                    tint.a = tint.a.max(128);
+                    paint_fill_keep_visual(shape, || xaml::create_solid_brush(tint))
                 }
-                painted
             }
             BrushKind::Blur => {
-                let mut painted = attach_blur(shape, color, blur_amount);
+                let mut painted = attach_blur(shape, blur_amount);
                 if !painted {
                     debug_log("blur: the composition graph failed, using a solid tint");
                     painted = paint_fill(shape, || xaml::create_solid_brush(color));
@@ -389,14 +643,44 @@ fn set_appearance(cmd: &TapCommand) -> bool {
     ok
 }
 
+/// Replace the background fill without touching the mounted blur visual:
+/// the acrylic tint sits on top of the blur, and `paint_fill` would strip it.
+unsafe fn paint_fill_keep_visual(
+    shape: SendPtr,
+    create: impl FnOnce() -> Option<*mut core::ffi::c_void>,
+) -> bool {
+    let Some(brush) = create() else {
+        return false;
+    };
+    let ok = xaml::set_fill(shape.0, brush);
+    com::release_raw(brush);
+    ok
+}
+
 /// Replace the background fill with a freshly created XAML brush.
+/// Detach the blur child visual of `shape`, if one is mounted. Nulling the
+/// visual's brush *before* the detach is the whole point: a visual whose brush
+/// samples the backdrop deadlocks the UI thread against the render thread when
+/// it is torn down while still sampling.
+unsafe fn detach_blur_visual(shape: SendPtr) {
+    let sprite = blur_sprites().lock().unwrap_or_else(|p| p.into_inner()).remove(&(shape.0 as usize));
+    if let Some(sprite) = sprite {
+        if let Ok(unknown) = com::adopt(sprite.0) {
+            if let Ok(visual) = unknown.cast::<windows::UI::Composition::SpriteVisual>() {
+                let _ = visual.SetBrush(None::<&windows::UI::Composition::CompositionBrush>);
+            }
+        }
+    }
+    xaml::set_element_child_visual(shape.0, core::ptr::null_mut());
+}
+
 unsafe fn paint_fill(
     shape: SendPtr,
     create: impl FnOnce() -> Option<*mut core::ffi::c_void>,
 ) -> bool {
     // Any previous blur child visual must go: it would keep painting on top
     // of the new fill.
-    xaml::set_element_child_visual(shape.0, core::ptr::null_mut());
+    detach_blur_visual(shape);
     with_service(|svc| {
         for bar in svc.bars.values_mut() {
             if bar.background.shape == Some(shape) {
@@ -412,65 +696,88 @@ unsafe fn paint_fill(
     ok
 }
 
-/// Build the backdrop-blur effect graph and mount it as a child visual of the
-/// background rectangle; the rectangle's own fill is cleared because the
-/// visual paints the blur + tint instead.
-unsafe fn attach_blur(shape: SendPtr, color: Color, blur_amount: f32) -> bool {
+/// Build the backdrop-blur effect graph — a single Gaussian blur over the
+/// backdrop — and mount it as a child visual of the background rectangle. The
+/// rectangle's own fill is cleared: the child visual paints the blur instead,
+/// and stacking it on the shell's opaque fill would hide it entirely. A tint
+/// can be layered on top with the acrylic material; plain blur stays untinted.
+///
+/// Every step logs its failure: the graph involves six foreign COM calls whose
+/// failure modes are invisible from outside explorer, and "the composition
+/// graph failed" without a step made the first debugging session guesswork.
+unsafe fn attach_blur(shape: SendPtr, blur_amount: f32) -> bool {
     use windows::UI::Composition::CompositionEffectSourceParameter;
 
-    let Ok(compositor) = xaml::element_compositor(shape.0) else {
-        return false;
-    };
-    let Ok(parameter) =
-        CompositionEffectSourceParameter::Create(&windows::core::HSTRING::from("wb-backdrop"))
-    else {
-        return false;
-    };
-    let Ok(source) = parameter.cast::<windows::Graphics::Effects::IGraphicsEffectSource>() else {
-        return false;
-    };
+    macro_rules! fail {
+        ($step:expr, $result:expr) => {{
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    debug_log_fmt(format_args!("blur: {} failed {error:?}", $step));
+                    return false;
+                }
+            }
+        }};
+    }
+
+    let compositor = fail!("get element compositor", xaml::element_compositor(shape.0));
+    let parameter = fail!(
+        "create source parameter",
+        CompositionEffectSourceParameter::Create(&windows::core::HSTRING::from("backdrop"))
+    );
+    let source = fail!(
+        "cast parameter to IGraphicsEffectSource",
+        parameter.cast::<windows::Graphics::Effects::IGraphicsEffectSource>()
+    );
     let blur = GaussianBlurEffect::new(blur_amount, source);
-    let flood = FloodEffect::new([
-        color.r as f32 / 255.0,
-        color.g as f32 / 255.0,
-        color.b as f32 / 255.0,
-        color.a as f32 / 255.0,
-    ]);
-    let graph: windows::Graphics::Effects::IGraphicsEffect =
-        CompositeEffect::new(vec![blur.into(), flood.into()]).into();
-    let Ok(factory) = compositor.CreateEffectFactory(&graph) else {
-        return false;
-    };
-    let Ok(effect_brush) = factory.CreateBrush() else {
-        return false;
-    };
-    let Ok(backdrop_brush) = compositor.CreateBackdropBrush() else {
-        return false;
-    };
-    if effect_brush
-        .SetSourceParameter(&windows::core::HSTRING::from("wb-backdrop"), &backdrop_brush)
-        .is_err()
+    let graph: windows::Graphics::Effects::IGraphicsEffect = blur.into();
+    let factory = fail!("CreateEffectFactory", compositor.CreateEffectFactory(&graph));
+    let effect_brush = fail!("CreateBrush", factory.CreateBrush());
+    let backdrop_brush = fail!("CreateBackdropBrush", compositor.CreateBackdropBrush());
+    if let Err(error) =
+        effect_brush.SetSourceParameter(&windows::core::HSTRING::from("backdrop"), &backdrop_brush)
     {
+        debug_log_fmt(format_args!("blur: SetSourceParameter failed {error:?}"));
         return false;
     }
-    let Ok(sprite) = compositor.CreateSpriteVisual() else {
-        return false;
-    };
-    if sprite.SetBrush(&effect_brush).is_err() {
+    let sprite = fail!("CreateSpriteVisual", compositor.CreateSpriteVisual());
+    if let Err(error) = sprite.SetBrush(&effect_brush) {
+        debug_log_fmt(format_args!("blur: SetBrush failed {error:?}"));
         return false;
     }
     // A child visual does not inherit the element's size; size it to the
     // rectangle now and again on the next apply — the host re-sends on every
-    // geometry change, e.g. DPI switches.
-    if let Some((width, height)) = xaml::actual_size_of(shape.0) {
+    // geometry change, e.g. DPI switches. A visual of zero size renders
+    // nothing, which would look exactly like the effect having failed, so an
+    // unreadable size is a loud log line.
+    let size = xaml::actual_size_of(shape.0);
+    if let Some((width, height)) = size {
         let _ = sprite.SetSize(Vector2 {
             X: width as f32,
             Y: height as f32,
         });
+    } else {
+        debug_log("blur: the rectangle has no readable size; sprite stays unsized");
     }
     if !xaml::set_element_child_visual(shape.0, sprite.as_raw()) {
+        debug_log("blur: SetElementChildVisual failed");
         return false;
     }
+    debug_log_fmt(format_args!(
+        "blur: effect graph mounted (size {size:?})"
+    ));
+    // Remember the sprite so a later detach can null its brush first (see
+    // `detach_blur_visual`).
+    if let Ok(unknown) = sprite.cast::<windows::core::IUnknown>() {
+        blur_sprites()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(shape.0 as usize, own(unknown));
+    }
+    // The graph paints the background now. Clearing the shell's own fill makes
+    // the blur visible regardless of which of the element's contents render on
+    // top of the child visual, and `restore_bar` puts the captured fill back.
+    xaml::set_fill(shape.0, core::ptr::null_mut());
     with_service(|svc| {
         for bar in svc.bars.values_mut() {
             if bar.background.shape == Some(shape) {
@@ -483,10 +790,11 @@ unsafe fn attach_blur(shape: SendPtr, color: Color, blur_amount: f32) -> bool {
 
 /// Show or hide the hairline along the taskbar's top edge.
 ///
-/// The shell paints it as a thin `BackgroundStroke` rectangle, so hiding it is
-/// clearing that rectangle's fill and showing it is putting the shell's own
-/// brush back. `argb` carries the flag rather than a colour — see
-/// [`CommandKind::SetHairline`].
+/// The line reaches the screen through several carriers — the thin
+/// `BackgroundStroke` rectangle, frame-sized `Border`s, and the frame's own
+/// control brush — so hiding clears all registered carriers and showing puts
+/// their captured brushes back. `argb` carries the flag rather than a colour —
+/// see [`CommandKind::SetHairline`].
 fn set_hairline(taskbar: isize, visible: bool) -> bool {
     let Some(handle) = find_bar(taskbar) else {
         debug_log_fmt(format_args!(
@@ -495,59 +803,156 @@ fn set_hairline(taskbar: isize, visible: bool) -> bool {
         ));
         return false;
     };
-    let write = with_service(|svc| {
-        let bar = svc.bars.get_mut(&handle)?;
+    let (applied, retry) = with_service(|svc| {
+        let Some(bar) = svc.bars.get_mut(&handle) else {
+            return (false, false);
+        };
         bar.hairline = Some(visible);
-        plan_hairline(bar)
+        let plan = plan_hairline(bar);
+        let retry = plan.retry;
+        let applied = commit_hairline(plan);
+        (applied, retry)
     });
+    if retry {
+        // Some carriers have not been painted by the shell yet; the timer
+        // re-runs the apply until they show up or the retries run out.
+        schedule_rewalk();
+    }
     // "Nothing to write" is not a failure here: the wanted state stays in the
-    // registry and `register_taskbar_border` applies it the moment the rectangle
-    // turns up.
-    let applied = commit_hairline(write);
+    // registry and the carriers apply it the moment they are registered.
     debug_log(if applied {
         "hairline applied"
+    } else if retry {
+        "hairline: waiting for the shell to paint its carriers"
     } else {
         "hairline: nothing to apply yet"
     });
     applied
 }
 
-/// Work out the fill write that carries out the remembered hairline state.
-///
-/// Separated from performing it because the decision needs the registry lock and
-/// the write is a XAML call: holding the lock across one would deadlock if the
-/// shell re-entered our tree callback. `None` means there is nothing to do —
-/// either the host has not asked for anything yet, or the rectangle the shell
-/// paints the line with has not been seen.
-fn plan_hairline(bar: &mut Bar) -> Option<(SendPtr, SendPtr)> {
-    let wanted = bar.hairline?;
-    let shape = bar.border.shape?;
-    let brush = if wanted {
-        // Nothing has been read, so nothing was ever cleared either — and
-        // reading now could snapshot a fill the shell has not painted yet, which
-        // would turn "show" into "clear" the next time it was applied.
-        if !bar.border.captured {
-            return None;
-        }
-        bar.border.original
-    } else {
-        // Snapshot before the first change, so "show" has something to put back.
-        // A null fill is a value to restore to, not "not captured yet", which is
-        // why the flag is separate.
-        if !bar.border.captured {
-            bar.border.original = unsafe { xaml::fill_of(shape.0) }.map(SendPtr);
-            bar.border.captured = true;
-        }
-        None
-    };
-    Some((shape, brush.unwrap_or(SendPtr(core::ptr::null_mut()))))
+/// What [`plan_hairline`] decided. `retry` is set when the wanted state is
+/// "hide" but some carrier's brush has not appeared yet — the shell paints
+/// them seconds after the claim — and the apply should be re-run on a timer.
+struct HairlinePlan {
+    writes: Vec<(CarrierKind, SendPtr, SendPtr)>,
+    retry: bool,
 }
 
-/// Perform a write from [`plan_hairline`], outside the registry lock.
-fn commit_hairline(write: Option<(SendPtr, SendPtr)>) -> bool {
-    match write {
-        Some((shape, brush)) => unsafe { xaml::set_fill(shape.0, brush.0) },
-        None => false,
+/// Work out the writes that carry out the remembered hairline state.
+///
+/// Separated from performing them because the decision needs the registry lock
+/// and the writes are XAML calls: holding the lock across one would deadlock if
+/// the shell re-entered our tree callback.
+///
+/// Hiding captures each carrier's real brush the first time it can be read and
+/// clears it; showing puts a captured brush back (a carrier that was never
+/// cleared is already showing the shell's own state and is skipped). A carrier
+/// that reads as brushless while hiding leaves `retry` set — its paint has not
+/// happened yet, and capturing now would lose the brush forever.
+fn plan_hairline(bar: &mut Bar) -> HairlinePlan {
+    let mut plan = HairlinePlan {
+        writes: Vec::new(),
+        retry: false,
+    };
+    let Some(wanted) = bar.hairline else {
+        return plan;
+    };
+
+    for index in 0..bar.hairline_carriers.len() {
+        let carrier = &mut bar.hairline_carriers[index];
+        if wanted {
+            if !carrier.captured {
+                // Never cleared, so the shell's own state is showing.
+                continue;
+            }
+            let original = carrier
+                .original
+                .map(|original| original.0)
+                .unwrap_or(core::ptr::null_mut());
+            plan.writes.push((carrier.kind, carrier.target, SendPtr(original)));
+        } else if carrier.captured {
+            plan.writes.push((carrier.kind, carrier.target, SendPtr(core::ptr::null_mut())));
+        } else if let Some(brush) = carrier.read() {
+            carrier.original = Some(SendPtr(brush));
+            carrier.captured = true;
+            plan.writes.push((carrier.kind, carrier.target, SendPtr(core::ptr::null_mut())));
+        } else {
+            plan.retry = true;
+        }
+    }
+
+    plan
+}
+
+/// Perform writes from [`plan_hairline`], outside the registry lock.
+fn commit_hairline(plan: HairlinePlan) -> bool {
+    let mut any = false;
+    for (kind, target, brush) in plan.writes {
+        any |= HairlineCarrier::write_for(kind, target, brush.0);
+    }
+    any
+}
+
+/// The writes that hand one taskbar back to the shell, collected under the
+/// registry lock and performed outside it — a XAML write fires a synchronous
+/// tree callback, and performing one *under* the lock re-enters
+/// [`with_service`] on the same thread, which deadlocks a non-reentrant mutex.
+struct RestorePlan {
+    /// Background rectangles whose blur visual must be detached.
+    detach: Vec<SendPtr>,
+    /// Hairline carriers: (kind, target, the shell's brush to put back).
+    carriers: Vec<(CarrierKind, SendPtr, SendPtr)>,
+    /// Background fills: (shape, the shell's fill to put back).
+    fills: Vec<(SendPtr, SendPtr)>,
+}
+
+/// Collect [`RestorePlan`] for one bar, resetting the bar's live state.
+fn plan_restore(bar: &mut Bar, plan: &mut RestorePlan) {
+    if bar.blur_attached {
+        if let Some(shape) = bar.background.shape {
+            plan.detach.push(shape);
+        }
+        bar.blur_attached = false;
+    }
+    for carrier in bar.hairline_carriers.iter() {
+        // Only a brush this process actually read gets written back. Restoring
+        // a carrier that was never captured would clear a brush the shell had
+        // painted, which for the hairline means erasing it rather than leaving
+        // it alone — the exact opposite of "hand the taskbar back".
+        if !carrier.captured {
+            continue;
+        }
+        // A missing original is a value: the shell had no brush to begin with.
+        let original = carrier
+            .original
+            .map(|original| original.0)
+            .unwrap_or(core::ptr::null_mut());
+        plan.carriers.push((carrier.kind, carrier.target, SendPtr(original)));
+    }
+    // Only a fill this process actually read gets written back, for the same
+    // reason as the carriers above.
+    if bar.background.captured {
+        if let Some(shape) = bar.background.shape {
+            let original = bar
+                .background
+                .original
+                .map(|original| original.0)
+                .unwrap_or(core::ptr::null_mut());
+            plan.fills.push((shape, SendPtr(original)));
+        }
+    }
+}
+
+/// Perform a [`RestorePlan`] outside the registry lock.
+fn perform_restore(plan: RestorePlan) {
+    for shape in &plan.detach {
+        unsafe { detach_blur_visual(*shape) };
+    }
+    for (kind, target, brush) in &plan.carriers {
+        HairlineCarrier::write_for(*kind, *target, brush.0);
+    }
+    for (shape, brush) in &plan.fills {
+        unsafe { xaml::set_fill(shape.0, brush.0) };
     }
 }
 
@@ -556,52 +961,83 @@ fn restore_taskbar(taskbar: isize) -> bool {
     let Some(handle) = find_bar(taskbar) else {
         return false;
     };
-    with_service(|svc| {
-        match svc.bars.get_mut(&handle) {
-            Some(bar) => {
-                restore_bar(bar);
-                true
-            }
-            None => false,
+    let plan = with_service(|svc| {
+        let mut plan = RestorePlan {
+            detach: Vec::new(),
+            carriers: Vec::new(),
+            fills: Vec::new(),
+        };
+        if let Some(bar) = svc.bars.get_mut(&handle) {
+            plan_restore(bar, &mut plan);
         }
-    })
+        plan
+    });
+    perform_restore(plan);
+    true
 }
 
 /// Restore every registered island.
 fn restore_all() -> bool {
-    let restored = with_service(|svc| {
+    debug_log("restore_all: starting");
+    let (restored, plan) = with_service(|svc| {
+        let mut plan = RestorePlan {
+            detach: Vec::new(),
+            carriers: Vec::new(),
+            fills: Vec::new(),
+        };
         for bar in svc.bars.values_mut() {
-            restore_bar(bar);
+            plan_restore(bar, &mut plan);
         }
-        svc.bars.len()
+        (svc.bars.len(), plan)
     });
+    perform_restore(plan);
     debug_log_fmt(format_args!("restore_all: {restored} taskbars"));
     true
 }
 
-fn restore_bar(bar: &mut Bar) {
-    if bar.blur_attached {
-        if let Some(shape) = bar.background.shape.as_ref() {
-            unsafe { xaml::set_element_child_visual(shape.0, core::ptr::null_mut()) };
+/// Re-run the pending hairline state for every bar. `true` when some carrier
+/// is still waiting for the shell to paint it. The plans are collected under
+/// the lock and performed outside it — see [`RestorePlan`].
+pub fn retry_pending_hairline() -> bool {
+    let plans = with_service(|svc| {
+        let mut plans = Vec::new();
+        for bar in svc.bars.values_mut() {
+            if bar.hairline.is_none() {
+                continue;
+            }
+            plans.push(plan_hairline(bar));
         }
-        bar.blur_attached = false;
+        plans
+    });
+    let mut pending = false;
+    for plan in plans {
+        pending |= plan.retry;
+        commit_hairline(plan);
     }
-    for control in [&mut bar.background, &mut bar.border] {
-        // Only a fill this process actually read gets written back. Restoring a
-        // control that was never captured would clear a fill the shell had
-        // painted, which for the hairline means erasing it rather than leaving
-        // it alone — the exact opposite of "hand the taskbar back".
-        if !control.captured {
-            continue;
-        }
-        if let Some(shape) = &control.shape {
-            // A missing original is a value: the shell had no fill to begin with.
-            let original = control
-                .original
-                .map(|original| original.0)
-                .unwrap_or(core::ptr::null_mut());
-            unsafe { xaml::set_fill(shape.0, original) };
-        }
+    pending
+}
+
+/// Schedule the delayed re-walk: a one-shot timer on the command window, which
+/// lives on the XAML UI thread, so `watcher::rewalk` runs where XAML is safe
+/// to touch. Fired a few seconds after the claim, when the island's layout has
+/// settled, and re-armed while hairline carriers are still waiting for their
+/// paint.
+pub fn schedule_rewalk() {
+    let window = REWALK_WINDOW.load(Ordering::Acquire);
+    if window == 0 {
+        return;
+    }
+    let attempts = REWALK_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    if attempts >= REWALK_MAX_ATTEMPTS {
+        return;
+    }
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            Some(HWND(window as *mut core::ffi::c_void)),
+            TIMER_REWALK,
+            4000,
+            None,
+        );
     }
 }
 
@@ -702,6 +1138,7 @@ fn ensure_window() {
             Ok(hwnd) if !hwnd.is_invalid() => {
                 let raw = hwnd.0 as isize;
                 with_service(|svc| svc.window = raw);
+                REWALK_WINDOW.store(raw, Ordering::Release);
                 debug_log_fmt(format_args!("tap window ready: {raw:#x}"));
             }
             other => {
@@ -724,6 +1161,21 @@ unsafe extern "system" fn tap_wndproc(
     let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
         WM_COPYDATA => handle_copydata(wparam, lparam).map(|applied| LRESULT(applied as isize)),
         WM_APP_RESTORE_ALL => Some(LRESULT(restore_all() as isize)),
+        WM_TIMER if wparam.0 == TIMER_REWALK => {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                    Some(hwnd),
+                    TIMER_REWALK,
+                );
+            }
+            let rewrote = crate::watcher::rewalk();
+            let pending = retry_pending_hairline();
+            if pending {
+                // Carriers still waiting for their paint; try again.
+                schedule_rewalk();
+            }
+            Some(LRESULT((rewrote || pending) as isize))
+        }
         _ => None,
     }));
     match handled {

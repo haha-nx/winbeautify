@@ -149,6 +149,97 @@ fn search_term(track: &Track<'_>) -> String {
     }
 }
 
+/// The title with decoration stripped: every bracketed segment — `(Official
+/// Video)`, `[MV]`, `【字幕】` — and anything after a ` - ` tail like
+/// `- Official Music Video`.
+///
+/// Streaming sources hand GSMTC titles that carry this junk, and it breaks
+/// keyword search. Used for the *first* search attempt, with the raw title
+/// kept as the retry: the odd song that lives inside brackets loses nothing
+/// but one request.
+fn clean_title(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut depth = 0usize;
+    for c in title.chars() {
+        match c {
+            '(' | '[' | '（' | '【' | '〔' | '［' => depth += 1,
+            ')' | ']' | '）' | '】' | '〕' | '］' => {
+                depth = depth.saturating_sub(1);
+            }
+            c if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    // A ` - ` tail is usually a source annotation ("Song - Official MV"), not
+    // part of the title. Only a tail that carries one of the known annotation
+    // words is stripped, so a genuine two-part title survives; the raw-title
+    // retry catches whatever this misses.
+    const ANNOTATIONS: [&str; 16] = [
+        "mv", "official", "live", "remaster", "version", "lyrics", "lyric", "video", "audio",
+        "hd", "4k", "cover", "instrumental", "字幕", "伴奏", "翻唱",
+    ];
+    for dash in [" - ", " – ", " — ", " － "] {
+        if let Some((head, tail)) = out.split_once(dash) {
+            let tail_lower = tail.to_lowercase();
+            if ANNOTATIONS.iter().any(|kw| tail_lower.contains(kw)) {
+                out = head.to_string();
+            }
+        }
+    }
+    let cleaned = out.trim().trim_matches(['-', '–', '—', '－']).trim();
+    if cleaned.is_empty() {
+        // Degenerate: everything was decoration. The raw title still matches.
+        title.trim().to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+/// The artist string split into the individual names a provider list may
+/// match. GSMTC concatenates multiple artists with every separator in use.
+fn split_artists(artist: &str) -> Vec<String> {
+    artist
+        .split(['/', ';', ',', '&', '、', '，', '；', '&'])
+        .flat_map(|part| part.split_once(" feat.").map(|(head, _)| head).or(Some(part)))
+        .flat_map(|part| part.split_once(" ft.").map(|(head, _)| head).or(Some(part)))
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// How well a search candidate matches the track being looked up.
+///
+/// Providers rank by their own relevance, which mixes covers, live versions
+/// and karaoke tracks in with the original. A positive score means at least
+/// one piece of evidence (title, artist or duration) agrees; the caller picks
+/// the best and only falls back to unscored results when nothing matched.
+fn score_candidate(candidate_title: &str, candidate_artists: &[String], duration_ms: i64, track: &Track<'_>) -> i32 {
+    let mut score = 0;
+    if !track.title.trim().is_empty()
+        && names_match(candidate_title, &clean_title(track.title))
+    {
+        score += 4;
+    }
+    if !track.artist.trim().is_empty() {
+        let wanted = split_artists(track.artist);
+        if wanted
+            .iter()
+            .any(|name| candidate_artists.iter().any(|other| names_match(other, name)))
+        {
+            score += 3;
+        }
+    }
+    if track.duration_ms > 0 && duration_ms > 0 {
+        let delta = (duration_ms - track.duration_ms).abs();
+        if delta <= 3000 {
+            score += 2;
+        } else if delta <= 8000 {
+            score += 1;
+        }
+    }
+    score
+}
+
 /// Case-insensitive "do these two names refer to the same thing", ignoring
 /// punctuation and bracketed suffixes like `(Live)` or `【官方】`.
 fn names_match(a: &str, b: &str) -> bool {
@@ -173,15 +264,42 @@ fn from_lrc(text: &str) -> Option<Lyrics> {
 // ---------------------------------------------------------------------------
 
 fn netease(track: &Track<'_>) -> Option<Lyrics> {
-    if let Some(lyrics) = netease_search(&search_term(track), track.artist) {
-        return Some(lyrics);
+    // Three searches, in increasing desperation: the cleaned title with the
+    // artist (the usual hit), the raw title with the artist (titles that live
+    // inside brackets), and the cleaned title alone (artists GSMTC cannot
+    // spell the way the provider does). The scored pick below keeps a search
+    // that *did* return the song from grabbing a cover instead.
+    for term in netease_terms(track) {
+        if let Some(lyrics) = netease_search(&term, track) {
+            return Some(lyrics);
+        }
     }
-    // A featured artist in the search string often breaks the match; retrying
-    // with the title alone costs one request and rescues a lot of tracks.
-    netease_search(track.title.trim(), track.artist)
+    None
 }
 
-fn netease_search(term: &str, artist: &str) -> Option<Lyrics> {
+/// Search strings for NetEase, most specific first.
+fn netease_terms(track: &Track<'_>) -> Vec<String> {
+    let cleaned = clean_title(track.title);
+    let raw = track.title.trim();
+    let artist = track.artist.trim();
+    let mut terms = Vec::new();
+    if !cleaned.is_empty() && !artist.is_empty() {
+        terms.push(format!("{cleaned} {artist}"));
+    }
+    if !raw.is_empty() && !artist.is_empty() && raw != cleaned {
+        terms.push(format!("{raw} {artist}"));
+    }
+    if !cleaned.is_empty() {
+        terms.push(cleaned);
+    }
+    if !raw.is_empty() {
+        terms.push(raw.to_string());
+    }
+    terms.dedup();
+    terms
+}
+
+fn netease_search(term: &str, track: &Track<'_>) -> Option<Lyrics> {
     if term.trim().is_empty() {
         return None;
     }
@@ -198,12 +316,32 @@ fn netease_search(term: &str, artist: &str) -> Option<Lyrics> {
     let json = get_json(&url, None)?;
     let songs = json.get("result")?.get("songs")?.as_array()?;
 
-    // Prefer the candidate whose artist matches, falling back to the first hit
-    // — the endpoint ranks by its own relevance, which is usually right.
+    // Score every candidate and take the best: the endpoint ranks by its own
+    // relevance, which puts covers and live cuts on top more often than it
+    // should. A tie keeps the endpoint's own order.
+    let mut best: Option<(i32, usize)> = None;
+    for (index, song) in songs.iter().enumerate() {
+        let title = song.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let artists: Vec<String> = song
+            .get("artists")
+            .and_then(|a| a.as_array())
+            .map(|artists| {
+                artists
+                    .iter()
+                    .filter_map(|a| a.get("name").and_then(|n| n.as_str()))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let duration = song.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+        let score = score_candidate(title, &artists, duration, track);
+        if best.map(|(best_score, _)| score > best_score).unwrap_or(true) {
+            best = Some((score, index));
+        }
+    }
+    let index = best?.1;
     let song_id = songs
-        .iter()
-        .find(|song| song_artist_matches(song, artist))
-        .or_else(|| songs.first())?
+        .get(index)?
         .get("id")
         .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))?;
 
@@ -220,27 +358,17 @@ fn netease_search(term: &str, artist: &str) -> Option<Lyrics> {
     from_lrc(json.get("lrc")?.get("lyric")?.as_str()?)
 }
 
-fn song_artist_matches(song: &Value, artist: &str) -> bool {
-    song.get("artists")
-        .and_then(|a| a.as_array())
-        .map(|artists| {
-            artists
-                .iter()
-                .filter_map(|a| a.get("name").and_then(|n| n.as_str()))
-                .any(|name| names_match(name, artist))
-        })
-        .unwrap_or(false)
-}
-
 // ---------------------------------------------------------------------------
 // QQ Music
 // ---------------------------------------------------------------------------
 
 fn qq(track: &Track<'_>) -> Option<Lyrics> {
-    if let Some(lyrics) = qq_search(&search_term(track), track) {
-        return Some(lyrics);
+    for term in netease_terms(track) {
+        if let Some(lyrics) = qq_search(&term, track) {
+            return Some(lyrics);
+        }
     }
-    qq_search(track.title.trim(), track)
+    None
 }
 
 fn qq_search(term: &str, track: &Track<'_>) -> Option<Lyrics> {
@@ -263,32 +391,20 @@ fn qq_search(term: &str, track: &Track<'_>) -> Option<Lyrics> {
     // covers and live versions mixed in with the original.
     let mut best: Option<(i32, &Value)> = None;
     for song in list {
-        let mut score = 0;
-        if song
-            .get("songname")
-            .and_then(|v| v.as_str())
-            .is_some_and(|name| names_match(name, track.title))
-        {
-            score += 4;
-        }
-        if song
+        let title = song.get("songname").and_then(|v| v.as_str()).unwrap_or("");
+        let artists: Vec<String> = song
             .get("singer")
             .and_then(|v| v.as_array())
-            .is_some_and(|singers| {
+            .map(|singers| {
                 singers
                     .iter()
                     .filter_map(|s| s.get("name").and_then(|n| n.as_str()))
-                    .any(|name| names_match(name, track.artist))
+                    .map(str::to_string)
+                    .collect()
             })
-        {
-            score += 2;
-        }
-        if track.duration_ms > 0 {
-            let interval = song.get("interval").and_then(|v| v.as_i64()).unwrap_or(0) * 1000;
-            if interval > 0 && (interval - track.duration_ms).abs() <= 5000 {
-                score += 1;
-            }
-        }
+            .unwrap_or_default();
+        let interval = song.get("interval").and_then(|v| v.as_i64()).unwrap_or(0) * 1000;
+        let score = score_candidate(title, &artists, interval, track);
         if score > best.map(|(s, _)| s).unwrap_or(-1) {
             best = Some((score, song));
         }
@@ -317,18 +433,23 @@ fn qq_search(term: &str, track: &Track<'_>) -> Option<Lyrics> {
 // ---------------------------------------------------------------------------
 
 fn kugou(track: &Track<'_>) -> Option<Lyrics> {
-    let keyword = track.title.trim();
-    if keyword.is_empty() {
-        return None;
+    // Keyword search first: one request, but it frequently returns nothing at
+    // all — the endpoint answers 200 with an empty candidate list — so the
+    // hash route below is not a rare fallback, it is the usual path. The
+    // cleaned title goes first for the same reason as everywhere else.
+    let raw = track.title.trim();
+    let cleaned = clean_title(track.title);
+    let mut keywords = Vec::new();
+    if !raw.is_empty() && raw != cleaned {
+        keywords.push(raw.to_string());
     }
-
-    // Keyword search first. It is one request, but it frequently returns
-    // nothing at all — the endpoint answers 200 with an empty candidate list —
-    // so the hash route below is not a rare fallback, it is the usual path.
-    if let Some(lyrics) = kugou_search_by_keyword(keyword, track.duration_ms) {
-        return Some(lyrics);
+    keywords.push(cleaned.clone());
+    for keyword in keywords {
+        if let Some(lyrics) = kugou_search_by_keyword(&keyword, track.duration_ms) {
+            return Some(lyrics);
+        }
     }
-    kugou_search_by_hash(keyword, track)
+    kugou_search_by_hash(&cleaned, track)
 }
 
 fn kugou_candidates(url: &str) -> Option<Vec<Value>> {
@@ -360,7 +481,23 @@ fn kugou_search_by_keyword(keyword: &str, duration_ms: i64) -> Option<Lyrics> {
         ])
     );
     let candidates = kugou_candidates(&url)?;
-    kugou_download(candidates.first()?)
+    // The lyric index lists every transcription of the song it has; the first
+    // entry is the one its ranker liked, which is not always the one that
+    // matches the track's duration. Candidates carry `duration` in ms, so the
+    // closest one wins when the track duration is known.
+    let mut best: Option<(i64, &Value)> = None;
+    for candidate in &candidates {
+        let candidate_duration = candidate.get("duration").and_then(|v| v.as_i64()).unwrap_or(0);
+        let delta = if duration_ms > 0 && candidate_duration > 0 {
+            (candidate_duration - duration_ms).abs()
+        } else {
+            i64::MAX
+        };
+        if best.map(|(best_delta, _)| delta < best_delta).unwrap_or(true) {
+            best = Some((delta, candidate));
+        }
+    }
+    kugou_download(best?.1)
 }
 
 /// Resolve the lyric through the song-search index instead of the lyric index.
@@ -390,23 +527,18 @@ fn kugou_search_by_hash(keyword: &str, track: &Track<'_>) -> Option<Lyrics> {
     let lists = json.get("data").and_then(|d| d.get("lists")).and_then(|l| l.as_array())?;
     tracing::debug!(count = lists.len(), "kugou: song search hits");
 
+    // Same shared scoring as the other providers: the song index also mixes
+    // covers and live versions in, and `Duration` here is whole seconds.
     let mut best: Option<(i32, &Value)> = None;
     for song in lists {
-        let mut score = 0;
-        if song
-            .get("SongName")
-            .and_then(|v| v.as_str())
-            .is_some_and(|name| names_match(name, track.title))
-        {
-            score += 4;
-        }
-        if song
+        let title = song.get("SongName").and_then(|v| v.as_str()).unwrap_or("");
+        let artists: Vec<String> = song
             .get("SingerName")
             .and_then(|v| v.as_str())
-            .is_some_and(|name| names_match(name, track.artist))
-        {
-            score += 2;
-        }
+            .map(split_artists)
+            .unwrap_or_default();
+        let duration = song.get("Duration").and_then(|v| v.as_i64()).unwrap_or(0) * 1000;
+        let score = score_candidate(title, &artists, duration, track);
         if score > best.map(|(s, _)| s).unwrap_or(-1) {
             best = Some((score, song));
         }
@@ -460,27 +592,53 @@ fn lrclib(track: &Track<'_>) -> Option<Lyrics> {
     if track.title.trim().is_empty() {
         return None;
     }
-    let mut params = vec![("track_name", track.title.trim().to_string())];
-    if !track.artist.trim().is_empty() {
-        params.push(("artist_name", track.artist.trim().to_string()));
-    }
-    if track.duration_ms > 0 {
-        params.push(("duration", (track.duration_ms / 1000).to_string()));
-    }
-    let url = format!("https://lrclib.net/api/get?{}", query(&params));
-    if let Some(lyrics) = get_json(&url, None)
-        .and_then(|json| json.get("syncedLyrics").and_then(|v| v.as_str()).map(str::to_string))
-        .and_then(|text| from_lrc(&text))
-    {
-        return Some(lyrics);
+    // `/get` is an exact-match endpoint. The cleaned title goes first for the
+    // same reason as the keyword searches; the raw title retries.
+    let cleaned = clean_title(track.title);
+    for title in [cleaned.as_str(), track.title.trim()] {
+        if title.is_empty() {
+            continue;
+        }
+        let mut params = vec![("track_name", title.to_string())];
+        if !track.artist.trim().is_empty() {
+            params.push(("artist_name", track.artist.trim().to_string()));
+        }
+        if track.duration_ms > 0 {
+            params.push(("duration", (track.duration_ms / 1000).to_string()));
+        }
+        let url = format!("https://lrclib.net/api/get?{}", query(&params));
+        if let Some(lyrics) = get_json(&url, None)
+            .and_then(|json| json.get("syncedLyrics").and_then(|v| v.as_str()).map(str::to_string))
+            .and_then(|text| from_lrc(&text))
+        {
+            return Some(lyrics);
+        }
     }
 
-    // `/get` is an exact-match endpoint; `/search` is fuzzy.
+    // `/search` is fuzzy. Score what comes back — the list is unordered with
+    // respect to covers, and entries carry the names and duration needed to
+    // tell the original apart.
     let url = format!("https://lrclib.net/api/search?{}", query(&[("q", search_term(track))]));
     let json = get_json(&url, None)?;
-    json.as_array()?
-        .iter()
-        .find_map(|entry| entry.get("syncedLyrics")?.as_str().and_then(from_lrc))
+    let entries = json.as_array()?;
+    let mut best: Option<(i32, String)> = None;
+    for entry in entries {
+        let Some(text) = entry.get("syncedLyrics").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let title = entry.get("track_name").and_then(|v| v.as_str()).unwrap_or("");
+        let artists: Vec<String> = entry
+            .get("artist_name")
+            .and_then(|v| v.as_str())
+            .map(split_artists)
+            .unwrap_or_default();
+        let duration = entry.get("duration").and_then(|v| v.as_i64()).unwrap_or(0) * 1000;
+        let score = score_candidate(title, &artists, duration, track);
+        if score > best.as_ref().map(|(s, _)| *s).unwrap_or(-1) {
+            best = Some((score, text.to_string()));
+        }
+    }
+    best.and_then(|(_, text)| from_lrc(&text))
 }
 
 #[cfg(test)]
@@ -494,6 +652,62 @@ mod tests {
         assert!(names_match("Song (Live)", "song"));
         assert!(!names_match("Song A", "Song B"));
         assert!(!names_match("", "anything"));
+    }
+
+    #[test]
+    fn clean_title_strips_decoration_but_not_real_titles() {
+        assert_eq!(clean_title("晴天 (Official MV)"), "晴天");
+        assert_eq!(clean_title("Song [HD Lyrics]"), "Song");
+        assert_eq!(clean_title("夜曲【字幕版】"), "夜曲");
+        assert_eq!(clean_title("Song - Official Music Video"), "Song");
+        // An annotation is stripped only when the tail carries one of the
+        // known words — a genuine two-part title keeps its tail.
+        assert_eq!(clean_title("爱 - Love"), "爱 - Love");
+        // Everything stripped degenerates back to the raw title.
+        assert_eq!(clean_title("(())"), "(())");
+    }
+
+    #[test]
+    fn split_artists_covers_the_separators_gmtc_uses() {
+        assert_eq!(
+            split_artists("周杰伦 / 费玉清"),
+            vec!["周杰伦", "费玉清"]
+        );
+        assert_eq!(split_artists("A、B，C"), vec!["A", "B", "C"]);
+        assert_eq!(split_artists("D feat. E"), vec!["D"]);
+        assert_eq!(split_artists("Solo"), vec!["Solo"]);
+    }
+
+    #[test]
+    fn scoring_prefers_the_original_over_covers_and_live_cuts() {
+        let track = Track {
+            title: "海阔天空 (Live)",
+            artist: "Beyond",
+            album: "",
+            duration_ms: 326_000,
+        };
+
+        let original = score_candidate("海阔天空", &["Beyond".into()], 325_000, &track);
+        let cover = score_candidate("海阔天空", &["Someone Else".into()], 325_000, &track);
+        let live_by_original = score_candidate("海阔天空 (Live)", &["Beyond".into()], 400_000, &track);
+        assert!(original >= 6, "title + artist + duration: {original}");
+        assert!(cover < original, "a cover must not outrank the original");
+        assert!(
+            live_by_original < original,
+            "a live cut at a different length must not outrank the studio take"
+        );
+    }
+
+    #[test]
+    fn scoring_needs_no_duration_when_the_track_has_none() {
+        let track = Track {
+            title: "Song",
+            artist: "",
+            album: "",
+            duration_ms: 0,
+        };
+        let scored = score_candidate("Song", &["Anyone".into()], 0, &track);
+        assert_eq!(scored, 4);
     }
 
     #[test]
@@ -527,6 +741,22 @@ mod tests {
             ..track
         };
         assert_eq!(search_term(&track), "Song Artist");
+    }
+
+    #[test]
+    fn search_terms_put_the_cleaned_title_first_and_keep_the_raw_one() {
+        let track = Track {
+            title: "晴天 (Official MV)",
+            artist: "周杰伦",
+            album: "",
+            duration_ms: 0,
+        };
+        let terms = netease_terms(&track);
+        assert_eq!(terms.first().map(String::as_str), Some("晴天 周杰伦"));
+        assert!(
+            terms.iter().any(|term| term.contains("晴天 (Official MV)")),
+            "the raw title must be retried: {terms:?}"
+        );
     }
 
     #[test]

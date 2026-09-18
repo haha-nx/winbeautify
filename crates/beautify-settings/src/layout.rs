@@ -61,11 +61,6 @@ impl Metrics {
         self.px(2.0)
     }
 
-    /// Gap before the 关于 entry, which sits at the bottom of the sidebar.
-    pub fn nav_spacer_height(&self) -> f32 {
-        self.px(10.0)
-    }
-
     pub fn section_title_size(&self) -> f32 {
         self.px(19.0)
     }
@@ -268,8 +263,6 @@ pub struct NavItem {
 #[derive(Debug, Clone)]
 pub struct Layout {
     pub nav: Vec<NavItem>,
-    /// Gap that pushes 关于 to the bottom of the sidebar.
-    pub nav_spacer: Rect,
     pub sidebar: Rect,
     pub titlebar: Rect,
     /// The part of the window the page scrolls inside.
@@ -338,7 +331,6 @@ pub fn layout(
     );
 
     let nav = layout_nav(sidebar, metrics, section);
-    let nav_spacer = spacer_between(&nav);
     let content = layout_content(viewport, metrics, section, config, scroll, measure_hint);
 
     let scroll_max = (content.height - viewport.height()).max(0.0);
@@ -358,7 +350,6 @@ pub fn layout(
 
     Layout {
         nav,
-        nav_spacer,
         sidebar,
         titlebar,
         viewport,
@@ -369,7 +360,9 @@ pub fn layout(
     }
 }
 
-/// Sidebar entries, stacked from the top with 关于 pinned to the bottom.
+/// Sidebar entries, stacked from the top with the same spacing throughout —
+/// the 关于 entry used to be pinned to the bottom by a spacer, which made its
+/// gap to the entry above look like a different, unexplained rule.
 fn layout_nav(sidebar: Rect, metrics: &Metrics, active: &Section) -> Vec<NavItem> {
     let height = metrics.nav_item_height();
     let gap = metrics.nav_item_gap();
@@ -378,11 +371,6 @@ fn layout_nav(sidebar: Rect, metrics: &Metrics, active: &Section) -> Vec<NavItem
     SECTIONS
         .iter()
         .map(|section| {
-            // The spacer is inserted before 关于, so everything after it is
-            // pushed down; simplest is to account for it when reaching that item.
-            if section.is_about {
-                top += metrics.nav_spacer_height();
-            }
             let rect = Rect::new(
                 sidebar.left + metrics.content_padding() * 0.5,
                 top,
@@ -401,22 +389,6 @@ fn layout_nav(sidebar: Rect, metrics: &Metrics, active: &Section) -> Vec<NavItem
             }
         })
         .collect()
-}
-
-/// The gap that pushes 关于 to the bottom, derived from what was laid out so
-/// the two cannot drift apart.
-fn spacer_between(nav: &[NavItem]) -> Rect {
-    let last_form = nav.iter().rev().find(|item| !item.section.is_about);
-    let about = nav.iter().find(|item| item.section.is_about);
-    match (last_form, about) {
-        (Some(above), Some(below)) if below.rect.top > above.rect.bottom => Rect::new(
-            above.rect.left,
-            above.rect.bottom,
-            above.rect.right,
-            below.rect.top,
-        ),
-        _ => Rect::EMPTY,
-    }
 }
 
 /// The page itself, laid out at `scroll`.
@@ -561,6 +533,25 @@ fn layout_row(
     let (label, control) = match field.kind {
         Kind::Status(_) => (Rect::EMPTY, Rect::new(left + padding_h, rect.top + padding_v, right - padding_h, rect.bottom - padding_v)),
         Kind::Action(_) => (Rect::EMPTY, Rect::new(left + padding_h, rect.top + padding_v, right - padding_h, rect.bottom - padding_v)),
+        // A read-only value gets the whole span between its label and the row's
+        // right edge. The control column would clip long values — the config
+        // path runs about a column and a half — and the painter right-aligns
+        // whatever lands here, so the value still ends where every other
+        // control ends.
+        Kind::Info(_) => (
+            Rect::new(
+                left + padding_h,
+                rect.top + padding_v,
+                left + padding_h + label_width,
+                rect.top + padding_v + label_line,
+            ),
+            Rect::new(
+                left + padding_h + label_width + metrics.control_gap() * 0.5,
+                rect.top + padding_v,
+                right - padding_h,
+                rect.bottom - padding_v,
+            ),
+        ),
         _ => {
             let label = Rect::new(
                 left + padding_h,
@@ -687,19 +678,17 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_keeps_the_about_entry_at_the_bottom() {
+    fn the_sidebar_spaces_every_entry_alike() {
         let layout = build("appearance", &Config::default(), 0.0);
-        let about = layout
-            .nav
-            .iter()
-            .find(|item| item.section.is_about)
-            .expect("about entry");
-        let others: Vec<&NavItem> = layout.nav.iter().filter(|i| !i.section.is_about).collect();
-        assert!(
-            others.iter().all(|item| item.rect.bottom < about.rect.top),
-            "关于 should sit below the spacer, not inline with the rest"
-        );
-        assert!(!layout.nav_spacer.is_empty(), "the spacer should have height");
+        for pair in layout.nav.windows(2) {
+            assert_eq!(
+                pair[1].rect.top - pair[0].rect.bottom,
+                Metrics::new(96).nav_item_gap(),
+                "the gap between {:?} and {:?} differs from the common one",
+                pair[0].section.id,
+                pair[1].section.id
+            );
+        }
     }
 
     #[test]

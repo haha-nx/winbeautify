@@ -11,10 +11,6 @@ use windows::core::{GUID, IUnknown, Interface, Result as WResult, PCWSTR};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_FLAGS};
 use windows::Win32::System::WinRT::{IActivationFactory, RoGetActivationFactory};
 
-/// `AcrylicBackgroundSource.Backdrop`: sample what is behind the window
-/// instead of inside the XAML island.
-const ACRYLIC_BACKDROP: i32 = 0;
-
 /// Default-activate a runtime class and QI it to a flat interface from
 /// [`crate::com`]. The returned raw pointer carries one reference.
 unsafe fn activate_as(class: &str, iid: &GUID) -> WResult<*mut core::ffi::c_void> {
@@ -193,6 +189,168 @@ pub unsafe fn set_fill(shape: *mut core::ffi::c_void, brush: *mut core::ffi::c_v
     ok
 }
 
+/// `IShape.Stroke`, as an owned raw brush pointer (one reference).
+pub unsafe fn stroke_of(shape: *mut core::ffi::c_void) -> Option<*mut core::ffi::c_void> {
+    let typed = com::qi_from_raw(shape, &com::IID_ISHAPE)?;
+    let brush = match com::vtbl_of::<com::IShapeVtbl>(typed) {
+        Ok(vtbl) => {
+            let mut out: *mut core::ffi::c_void = core::ptr::null_mut();
+            if (vtbl.get_stroke)(typed, &mut out).is_ok() && !out.is_null() {
+                Some(out)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    com::release_raw(typed);
+    brush
+}
+
+/// `IShape.Stroke = brush` (null clears).
+pub unsafe fn set_stroke(shape: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> bool {
+    let Some(typed) = com::qi_from_raw(shape, &com::IID_ISHAPE) else {
+        return false;
+    };
+    let ok = match com::vtbl_of::<com::IShapeVtbl>(typed) {
+        Ok(vtbl) => (vtbl.put_stroke)(typed, brush).is_ok(),
+        Err(_) => false,
+    };
+    com::release_raw(typed);
+    ok
+}
+
+/// `IShape.StrokeThickness`, in DIPs.
+pub unsafe fn stroke_thickness_of(shape: *mut core::ffi::c_void) -> Option<f64> {
+    let typed = com::qi_from_raw(shape, &com::IID_ISHAPE)?;
+    let thickness = match com::vtbl_of::<com::IShapeVtbl>(typed) {
+        Ok(vtbl) => {
+            let mut out = 0.0f64;
+            (vtbl.get_stroke_thickness)(typed, &mut out).is_ok().then_some(out)
+        }
+        Err(_) => None,
+    };
+    com::release_raw(typed);
+    thickness
+}
+
+/// `IBorder.BorderBrush`, as an owned raw brush pointer (one reference).
+pub unsafe fn border_brush_of(border: *mut core::ffi::c_void) -> Option<*mut core::ffi::c_void> {
+    let typed = com::qi_from_raw(border, &com::IID_IBORDER)?;
+    let brush = match com::vtbl_of::<com::IBorderVtbl>(typed) {
+        Ok(vtbl) => {
+            let mut out: *mut core::ffi::c_void = core::ptr::null_mut();
+            if (vtbl.get_border_brush)(typed, &mut out).is_ok() && !out.is_null() {
+                Some(out)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    com::release_raw(typed);
+    brush
+}
+
+/// `IBorder.BorderBrush = brush` (null clears).
+pub unsafe fn set_border_brush(border: *mut core::ffi::c_void, brush: *mut core::ffi::c_void) -> bool {
+    let Some(typed) = com::qi_from_raw(border, &com::IID_IBORDER) else {
+        return false;
+    };
+    let ok = match com::vtbl_of::<com::IBorderVtbl>(typed) {
+        Ok(vtbl) => (vtbl.put_border_brush)(typed, brush).is_ok(),
+        Err(_) => false,
+    };
+    com::release_raw(typed);
+    ok
+}
+
+/// `IBorder.BorderThickness`, in DIPs.
+pub unsafe fn border_thickness_of(border: *mut core::ffi::c_void) -> Option<com::Thickness> {
+    let typed = com::qi_from_raw(border, &com::IID_IBORDER)?;
+    let thickness = match com::vtbl_of::<com::IBorderVtbl>(typed) {
+        Ok(vtbl) => {
+            let mut out = com::Thickness::default();
+            (vtbl.get_border_thickness)(typed, &mut out).is_ok().then_some(out)
+        }
+        Err(_) => None,
+    };
+    com::release_raw(typed);
+    thickness
+}
+
+/// `IControl.BorderThickness`, in DIPs.
+pub unsafe fn control_border_thickness_of(
+    control: *mut core::ffi::c_void,
+) -> Option<com::Thickness> {
+    let typed = com::qi_from_raw(control, &com::IID_ICONTROL)?;
+    let thickness = match com::vtbl_of::<com::IControlVtbl>(typed) {
+        Ok(vtbl) => {
+            let mut out = com::Thickness::default();
+            (vtbl.get_border_thickness)(typed, &mut out).is_ok().then_some(out)
+        }
+        Err(_) => None,
+    };
+    com::release_raw(typed);
+    thickness
+}
+
+/// `IControl.BorderBrush`, as an owned raw brush pointer (one reference).
+pub unsafe fn control_border_brush_of(
+    control: *mut core::ffi::c_void,
+) -> Option<*mut core::ffi::c_void> {
+    let typed = com::qi_from_raw(control, &com::IID_ICONTROL)?;
+    let brush = match com::vtbl_of::<com::IControlVtbl>(typed) {
+        Ok(vtbl) => {
+            let mut out: *mut core::ffi::c_void = core::ptr::null_mut();
+            if (vtbl.get_border_brush)(typed, &mut out).is_ok() && !out.is_null() {
+                Some(out)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    com::release_raw(typed);
+    brush
+}
+
+/// `IControl.BorderBrush = brush` (null clears).
+pub unsafe fn set_control_border_brush(
+    control: *mut core::ffi::c_void,
+    brush: *mut core::ffi::c_void,
+) -> bool {
+    let Some(typed) = com::qi_from_raw(control, &com::IID_ICONTROL) else {
+        return false;
+    };
+    let ok = match com::vtbl_of::<com::IControlVtbl>(typed) {
+        Ok(vtbl) => (vtbl.put_border_brush)(typed, brush).is_ok(),
+        Err(_) => false,
+    };
+    com::release_raw(typed);
+    ok
+}
+
+/// `IBorder.Background`, as an owned raw brush pointer (one reference). Read
+/// only for diagnostics: the hairline hiding must never touch a border's
+/// background, which on the frame-sized borders is the backdrop itself.
+pub unsafe fn border_background_of(border: *mut core::ffi::c_void) -> Option<*mut core::ffi::c_void> {
+    let typed = com::qi_from_raw(border, &com::IID_IBORDER)?;
+    let brush = match com::vtbl_of::<com::IBorderVtbl>(typed) {
+        Ok(vtbl) => {
+            let mut out: *mut core::ffi::c_void = core::ptr::null_mut();
+            if (vtbl.get_background)(typed, &mut out).is_ok() && !out.is_null() {
+                Some(out)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    com::release_raw(typed);
+    brush
+}
+
 /// `IDesktopWindowXamlSource.Content`, as an owned raw pointer.
 pub unsafe fn source_content(source: *mut core::ffi::c_void) -> Option<*mut core::ffi::c_void> {
     let typed = com::qi_from_raw(source, &com::IID_IDESKTOP_WINDOW_XAML_SOURCE)?;
@@ -235,32 +393,37 @@ pub unsafe fn create_solid_brush(color: Color) -> Option<*mut core::ffi::c_void>
     }
 }
 
-/// `AcrylicBrush` with a backdrop source and the given tint, as an owned raw
-/// brush.
-pub unsafe fn create_acrylic_brush(color: Color) -> Option<*mut core::ffi::c_void> {
-    let brush = match activate_as("Windows.UI.Xaml.Media.AcrylicBrush", &com::IID_IACRYLIC_BRUSH) {
-        Ok(brush) => brush,
-        Err(error) => {
-            crate::logging::debug_log_fmt(format_args!("acrylic: activation failed {error:?}"));
-            return None;
+/// `XamlReader.Load`: parse a XAML snippet into an object.
+///
+/// XAML types cannot be default-activated from a TAP — `ActivateInstance`
+/// answers E_NOTIMPL for the whole framework — but the XAML reader constructs
+/// them fine, which is how the acrylic brush for the taskbar material is
+/// created. The returned pointer carries one reference.
+pub unsafe fn load_xaml(xaml: &str) -> Option<*mut core::ffi::c_void> {
+    let factory = get_statics(
+        "Windows.UI.Xaml.Markup.XamlReader",
+        &com::IID_IXAML_READER_STATICS,
+    )
+    .ok()?;
+    let out = match com::vtbl_of::<com::IXamlReaderStaticsVtbl>(factory) {
+        Ok(vtbl) => {
+            let hstring = windows::core::HSTRING::from(xaml);
+            let mut result: *mut core::ffi::c_void = core::ptr::null_mut();
+            if (vtbl.load)(factory, hstring.as_ptr() as *mut u16, &mut result).is_ok()
+                && !result.is_null()
+            {
+                Some(result)
+            } else {
+                None
+            }
         }
+        Err(_) => None,
     };
-    let Ok(vtbl) = com::vtbl_of::<com::IAcrylicBrushVtbl>(brush) else {
-        crate::logging::debug_log("acrylic: no IAcrylicBrush vtable");
-        com::release_raw(brush);
-        return None;
-    };
-    let source = (vtbl.put_background_source)(brush, ACRYLIC_BACKDROP);
-    let tint = (vtbl.put_tint_color)(brush, color);
-    if source.is_ok() && tint.is_ok() {
-        Some(brush)
-    } else {
-        crate::logging::debug_log_fmt(format_args!(
-            "acrylic: put_BackgroundSource {source:?}, put_TintColor {tint:?}"
-        ));
-        com::release_raw(brush);
-        None
+    com::release_raw(factory);
+    if out.is_none() {
+        crate::logging::debug_log("load_xaml: the reader rejected the snippet");
     }
+    out
 }
 
 /// `ElementCompositionPreview.GetElementVisual` plus the `ICompositionObject`

@@ -23,7 +23,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextFormat, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_TRAILING,
 };
 
 use beautify_widget::canvas::{Canvas, TextEngine};
@@ -274,6 +274,39 @@ impl Painter {
         canvas.text(text, format, rect, colour, offset);
     }
 
+    /// `text` shortened to `max_width` with a trailing ellipsis, or unchanged
+    /// when it already fits.
+    ///
+    /// Single-line runs are drawn with `D2D1_DRAW_TEXT_OPTIONS_CLIP`, so a run
+    /// wider than its rectangle is cut mid-glyph. Every single-line call site
+    /// goes through here (or [`Self::fitted_start`]) so what the user sees is
+    /// an ellipsis instead of half a character.
+    fn fitted(
+        &self,
+        text: &str,
+        format: &IDWriteTextFormat,
+        max_width: f32,
+    ) -> String {
+        if max_width <= 0.0 {
+            return String::new();
+        }
+        self.text.fit(text, format, max_width)
+    }
+
+    /// [`Self::fitted`], but keeps the tail of the text — the right end is the
+    /// part that identifies a path.
+    fn fitted_start(
+        &self,
+        text: &str,
+        format: &IDWriteTextFormat,
+        max_width: f32,
+    ) -> String {
+        if max_width <= 0.0 {
+            return String::new();
+        }
+        self.text.fit_start(text, format, max_width)
+    }
+
     /// The text being typed into `row`, when it is the focused one.
     fn typing<'a>(&self, interaction: &'a Interaction, row: usize) -> Option<&'a str> {
         (interaction.focused_row == Some(row)).then_some(interaction.editing.as_str())
@@ -299,17 +332,18 @@ impl Painter {
         typing: Option<&str>,
     ) {
         let inner = rect.inset_by(metrics.px(9.0), 0.0);
-        let (text, colour) = match typing {
+        let (raw, colour) = match typing {
             Some(typed) => (typed, palette.text),
             None if stored.is_empty() => (placeholder, palette.text_faint),
             None => (stored, palette.text),
         };
-        self.text_in(canvas, inner, text, format, colour);
+        let text = self.fitted(raw, format, inner.width());
+        self.text_in(canvas, inner, &text, format, colour);
 
         if typing.is_none() {
             return;
         }
-        let typed = self.text.measure(text, format, inner.width()).min(inner.width());
+        let typed = self.text.measure(&text, format, inner.width()).min(inner.width());
         let x = (inner.left + typed).min(inner.right - metrics.px(1.0));
         canvas.fill_rect(
             Rect::new(
@@ -355,7 +389,8 @@ impl Painter {
                 rect.right - metrics.px(6.0),
                 rect.bottom,
             );
-            self.text_in(canvas, text_rect, item.section.title, &format, colour);
+            let title = self.fitted(item.section.title, &format, text_rect.width());
+            self.text_in(canvas, text_rect, &title, &format, colour);
         }
         Ok(())
     }
@@ -450,10 +485,15 @@ impl Painter {
         let label_format = self.text.format(metrics.label_size(), LABEL_WEIGHT)?;
         let small_format = self.text.format(metrics.hint_size(), LABEL_WEIGHT)?;
         // Text that sits inside a drawn box is centred in it; text in a column
-        // (labels, values, list entries) is left-aligned.
+        // (labels, values, list entries) is left-aligned. Read-only values are
+        // right-aligned: they end where every other control ends, and their
+        // interesting half (a file name, a build number) is at the right.
         let box_format = self
             .text
             .format_aligned(metrics.hint_size(), LABEL_WEIGHT, DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        let right_format = self
+            .text
+            .format_aligned(metrics.hint_size(), LABEL_WEIGHT, DWRITE_TEXT_ALIGNMENT_TRAILING)?;
 
         // The section's own heading, where the layout put it — which is a little
         // below the top of the page, not on it. This used to be recomputed here
@@ -506,7 +546,8 @@ impl Painter {
 
                 let hovered = interaction.hover_row == Some(current);
                 if !row.label.is_empty() {
-                    self.text_in(canvas, row.label, row.field.label, &label_format, palette.text);
+                    let label = self.fitted(row.field.label, &label_format, row.label.width());
+                    self.text_in(canvas, row.label, &label, &label_format, palette.text);
                 }
                 if !row.hint.is_empty() {
                     if let Some(hint) = row.field.hint {
@@ -533,6 +574,7 @@ impl Painter {
                     &small_format,
                     &box_format,
                     &label_format,
+                    &right_format,
                 )?;
             }
         }
@@ -583,6 +625,7 @@ impl Painter {
         small: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         centred: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         label: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+        right: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     ) -> Result<()> {
         let parts = controls::parts(row.field, row.control, metrics);
         let value = if row.field.path.is_empty() {
@@ -659,10 +702,11 @@ impl Painter {
                 canvas.stroke_rounded(knob_rect, knob * 0.5, palette.card, 1.5);
 
                 let readout = parts.boxes[0];
-                let text = slider.format.render(current);
+                let readout_rect = readout.inset_by(metrics.px(6.0), 0.0);
+                let text = self.fitted(&slider.format.render(current), small, readout_rect.width());
                 self.text_in(
                     canvas,
-                    readout.inset_by(metrics.px(6.0), 0.0),
+                    readout_rect,
                     &text,
                     small,
                     palette.text_dim,
@@ -684,7 +728,8 @@ impl Painter {
                     rect.right - metrics.px(20.0),
                     rect.bottom,
                 );
-                self.text_in(canvas, text_rect, label_text, small, palette.text);
+                let text = self.fitted(label_text, small, text_rect.width());
+                self.text_in(canvas, text_rect, &text, small, palette.text);
                 // Chevron.
                 let size = metrics.px(4.0);
                 let cx = rect.right - metrics.px(11.0);
@@ -771,16 +816,19 @@ impl Painter {
                     Tone::Warn => palette.warn,
                     Tone::Off => palette.text_dim,
                 };
-                // Sized to the text, but never wider than its slot.
+                // Sized to the text, but never wider than its slot; the text
+                // itself is shortened with an ellipsis when even the full slot
+                // cannot hold it.
+                let text = self.fitted(text, small, (slot.width() - metrics.px(20.0)).max(0.0));
                 let width = (self
                     .text
-                    .measure(text, small, slot.width())
+                    .measure(&text, small, 4096.0)
                     .max(0.0)
                     + metrics.px(20.0))
                 .min(slot.width());
                 let pill = Rect::new(slot.left, slot.top, slot.left + width, slot.bottom);
                 canvas.fill_rounded(pill, pill.height() * 0.5, colour.with_alpha(0.16));
-                self.text_in(canvas, pill, text, centred, colour);
+                self.text_in(canvas, pill, &text, centred, colour);
             }
             Kind::Hotkey => {
                 let rect = parts.boxes[0];
@@ -806,13 +854,19 @@ impl Painter {
                 } else {
                     (stored, palette.text)
                 };
-                self.text_in(canvas, rect.inset_by(metrics.px(9.0), 0.0), text, small, colour);
+                let hotkey_rect = rect.inset_by(metrics.px(9.0), 0.0);
+                let text = self.fitted(text, small, hotkey_rect.width());
+                self.text_in(canvas, hotkey_rect, &text, small, colour);
             }
             // A read-only value. The label column already says what it is, so
             // this is just the text, and it is deliberately not styled like a
-            // control: nothing here can be clicked or typed into.
+            // control: nothing here can be clicked or typed into. The value is
+            // right-aligned and keeps its *tail* when too long — the end of a
+            // path is the part that says which file it is.
             Kind::Info(key) => {
-                self.text_in(canvas, row.control, status.info(key), small, palette.text_dim);
+                let value = status.info(key);
+                let text = self.fitted_start(value, small, row.control.width());
+                self.text_in(canvas, row.control, &text, right, palette.text_dim);
             }
             Kind::Action(buttons) => {
                 for (index, button) in buttons.iter().enumerate() {
@@ -830,7 +884,8 @@ impl Painter {
                         metrics.px(5.0),
                         colour.with_alpha(if lit { 0.24 } else { 0.14 }),
                     );
-                    self.text_in(canvas, rect, button.label, centred, colour);
+                    let text = self.fitted(button.label, centred, rect.width() - metrics.px(8.0));
+                    self.text_in(canvas, rect, &text, centred, colour);
                 }
             }
         }
@@ -945,10 +1000,12 @@ impl Painter {
                     palette.accent.with_alpha(0.10),
                 );
             }
+            let entry_rect = entry.inset_by(metrics.px(10.0), 0.0);
+            let text = self.fitted(choice.label, &small, entry_rect.width() - metrics.px(18.0));
             self.text_in(
                 canvas,
-                entry.inset_by(metrics.px(10.0), 0.0),
-                choice.label,
+                entry_rect,
+                &text,
                 &small,
                 if chosen { palette.accent } else { palette.text },
             );
