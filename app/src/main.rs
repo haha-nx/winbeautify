@@ -2,6 +2,8 @@
 //!
 //! Startup order matters:
 //!
+//! 0. Take the session's single-instance mutex. A launch that finds one already
+//!    held asks the running copy to show itself and exits — see [`instance`].
 //! 1. Load (or repair) the configuration, then install logging at the level it
 //!    asks for.
 //! 2. Build the module graph and start the enabled modules. Each one owns its
@@ -27,6 +29,7 @@ mod autostart;
 mod commands;
 mod flyout;
 mod hotkeys;
+mod instance;
 mod settings;
 mod snip;
 mod state;
@@ -45,6 +48,17 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 fn main() {
+    // Before anything else, and before a single shared resource is touched: one
+    // copy per session. The tray icon, the clipboard hook and the taskbar
+    // composition are all process-global, so a second copy fights the first
+    // rather than running beside it. A launch that finds one already running
+    // asks it for the settings window — which is what a second launch almost
+    // always means — and exits.
+    if !instance::claim() {
+        instance::activate_running();
+        return;
+    }
+
     let config_path = paths::config_path();
     if let Err(e) = paths::ensure_dirs() {
         eprintln!("{APP_NAME}: cannot create {}: {e}", paths::data_dir().display());
@@ -124,6 +138,9 @@ fn main() {
             if let Err(e) = tray::install(&handle) {
                 tracing::error!("tray icon unavailable: {e}");
             }
+            // This copy owns the single-instance objects, so it is the one that
+            // answers a later launch.
+            instance::watch(&handle);
             crate::sync_side_effects(&handle, &manager.get());
 
             // Overwrite the registry state from reality rather than trusting

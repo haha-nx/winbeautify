@@ -31,7 +31,7 @@
 //! caret is drawn by the painter, because with no child control there is no
 //! system caret.
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Arc;
 
 use windows::core::{w, PCWSTR};
@@ -52,9 +52,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
-    IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor,
-    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, CW_USEDEFAULT,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    GetMessageW, IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, CW_USEDEFAULT,
     HTCLIENT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
     HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, MINMAXINFO, MSG, NCCALCSIZE_PARAMS, SWP_NOZORDER,
     SW_SHOW, SW_SHOWMINIMIZED, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DPICHANGED, WM_DESTROY,
@@ -130,6 +130,14 @@ pub struct SettingsWindow {
     /// Shared with the window's own thread, which is the only writer: the window
     /// is created and destroyed there, and the host thread only reads it.
     hwnd: Arc<AtomicIsize>,
+    /// Set from the moment a window thread is started until it has published the
+    /// handle — and cleared again when that thread gives up without one.
+    ///
+    /// Without it, two `open` calls that arrive inside the same instant both
+    /// find `hwnd` at zero and both start a window: creating one costs a
+    /// `CreateWindowExW`, a Direct2D target and a full first paint, and a tray
+    /// double-click delivers its two clicks in the middle of all that.
+    starting: Arc<AtomicBool>,
     host: Arc<dyn Host>,
 }
 
@@ -137,43 +145,72 @@ impl SettingsWindow {
     pub fn new(host: Arc<dyn Host>) -> Self {
         Self {
             hwnd: Arc::new(AtomicIsize::new(0)),
+            starting: Arc::new(AtomicBool::new(false)),
             host,
         }
     }
 
     /// Bring the window up, or focus it if it is already open.
+    ///
+    /// Safe to call from any thread, and from several at once.
     pub fn open(&self) {
-        let existing = self.hwnd.load(Ordering::Acquire);
-        if existing != 0 {
-            let hwnd = HWND(existing as *mut core::ffi::c_void);
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_SHOW);
-                let _ = SetForegroundWindow(hwnd);
-                let _ = PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0));
-            }
+        if let Some(hwnd) = self.live_window() {
+            self.raise(hwnd);
+            return;
+        }
+        // Whoever claims the startup owns it; a caller that loses the race
+        // leaves the window to the winner rather than starting a second one.
+        // The winner shows the window and takes the foreground itself, so there
+        // is nothing for the loser to do but return.
+        if self
+            .starting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
 
         let host = Arc::clone(&self.host);
         let slot = Arc::clone(&self.hwnd);
-        std::thread::Builder::new()
+        let starting = Arc::clone(&self.starting);
+        let spawned = std::thread::Builder::new()
             .name("wb-settings".into())
             .spawn(move || {
-                if let Err(e) = run(host, slot) {
+                if let Err(e) = run(host, slot, Arc::clone(&starting)) {
                     tracing::error!("settings window exited: {e}");
                 }
-            })
-            .ok();
+                // Released here as well as inside `run`, so a thread that never
+                // got as far as creating a window still lets the next `open`
+                // try again.
+                starting.store(false, Ordering::Release);
+            });
+        if let Err(e) = spawned {
+            tracing::error!("could not start the settings window thread: {e}");
+            self.starting.store(false, Ordering::Release);
+        }
+    }
+
+    /// The window handle, if one is up.
+    fn live_window(&self) -> Option<HWND> {
+        let raw = self.hwnd.load(Ordering::Acquire);
+        (raw != 0).then_some(HWND(raw as *mut core::ffi::c_void))
+    }
+
+    /// Show a window that already exists and put it in front.
+    fn raise(&self, hwnd: HWND) {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0));
+        }
     }
 
     /// Ask the window to close. Returns immediately; the window is destroyed on
     /// its own thread.
     pub fn close(&self) {
-        let raw = self.hwnd.load(Ordering::Acquire);
-        if raw == 0 {
+        let Some(hwnd) = self.live_window() else {
             return;
-        }
-        let hwnd = HWND(raw as *mut core::ffi::c_void);
+        };
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_APP_CLOSE, WPARAM(0), LPARAM(0));
         }
@@ -184,11 +221,9 @@ impl SettingsWindow {
     /// For changes made outside the window — a hand-edited `config.toml`, the
     /// tray's "reload" — which the window cannot know about.
     pub fn refresh(&self) {
-        let raw = self.hwnd.load(Ordering::Acquire);
-        if raw == 0 {
+        let Some(hwnd) = self.live_window() else {
             return;
-        }
-        let hwnd = HWND(raw as *mut core::ffi::c_void);
+        };
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0));
         }
@@ -196,16 +231,14 @@ impl SettingsWindow {
 
     /// Is the window up right now?
     pub fn is_open(&self) -> bool {
-        self.hwnd.load(Ordering::Acquire) != 0
+        self.live_window().is_some()
     }
 
     /// Minimise the window, if it is open.
     pub fn minimize(&self) {
-        let raw = self.hwnd.load(Ordering::Acquire);
-        if raw == 0 {
+        let Some(hwnd) = self.live_window() else {
             return;
-        }
-        let hwnd = HWND(raw as *mut core::ffi::c_void);
+        };
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWMINIMIZED);
         }
@@ -1306,7 +1339,15 @@ impl Window {
 }
 
 /// Create the window and pump its messages until it closes. Blocks the caller.
-fn run(host: Arc<dyn Host>, slot: Arc<AtomicIsize>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///
+/// `starting` is the flag that keeps a second `open` from racing this one; it is
+/// cleared in the same breath as the handle, so the window is either there or
+/// free to be created again.
+fn run(
+    host: Arc<dyn Host>,
+    slot: Arc<AtomicIsize>,
+    starting: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     unsafe {
         // Per-monitor v2 so the metrics below are the real ones. The widget bar
         // usually sets this process-wide already, and the "already set" failure
@@ -1396,7 +1437,11 @@ fn run(host: Arc<dyn Host>, slot: Arc<AtomicIsize>) -> Result<(), Box<dyn std::e
     }
 
     PUMP.with(|pump| *pump.borrow_mut() = None);
+    // The handle and the startup flag move together: a caller that arrives
+    // between the two must not see "no window, nobody starting one" while this
+    // thread is still on its way out.
     slot.store(0, Ordering::Release);
+    starting.store(false, Ordering::Release);
     tracing::debug!("settings window closed");
     Ok(())
 }
@@ -1533,6 +1578,7 @@ unsafe extern "system" fn window_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowExW;
 
     /// A host that answers with the defaults and does nothing.
     struct Stub;
@@ -1568,6 +1614,23 @@ mod tests {
         false
     }
 
+    /// How many settings windows exist on the desktop right now.
+    fn settings_windows() -> usize {
+        let mut count = 0;
+        let mut previous = HWND::default();
+        loop {
+            let next =
+                unsafe { FindWindowExW(None, Some(previous), CLASS_NAME, PCWSTR::null()) };
+            match next {
+                Ok(hwnd) if !hwnd.0.is_null() => {
+                    count += 1;
+                    previous = hwnd;
+                }
+                _ => return count,
+            }
+        }
+    }
+
     /// Open, close, open again — on a real desktop.
     ///
     /// This is the test that would have caught the crash that made closing the
@@ -1576,18 +1639,28 @@ mod tests {
     /// entry into the message procedure hit an already-borrowed `RefCell`.
     /// Reopening is in here too, because the class is registered once per
     /// process and the second window has to cope with that failing.
+    ///
+    /// The second `open` before the window exists is the tray double-click: both
+    /// clicks land before the window thread has published its handle, and each
+    /// used to start a window of its own — the first then being orphaned, since
+    /// only the second one's handle was kept.
     #[test]
     #[ignore = "opens real windows; run with --ignored on a desktop session"]
     fn the_window_opens_closes_and_reopens() {
         let window = SettingsWindow::new(Arc::new(Stub));
         window.open();
+        window.open();
         assert!(wait_for_open(&window, true), "the window never appeared");
+        // Long enough for a second window, had one been started, to show up.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(settings_windows(), 1, "a second settings window was created");
 
         window.close();
         assert!(
             wait_for_open(&window, false),
             "the window did not go away when asked"
         );
+        assert_eq!(settings_windows(), 0, "the window was left on screen");
 
         window.open();
         assert!(

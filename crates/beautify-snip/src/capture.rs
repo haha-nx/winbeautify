@@ -102,28 +102,63 @@ impl Shot {
         }
     }
 
-    /// Nearest-neighbour scale, used by the pin window's zoom.
+    /// Nearest-neighbour scale into `bits`, a top-down BGRA buffer `width`
+    /// pixels across and `height` rows tall.
+    ///
+    /// Written by hand rather than through `StretchDIBits`, for the reason
+    /// recorded at `overlay::copy_rows`: measured on this machine, GDI's scaler
+    /// reads a source DIB as large as a screen capture from the wrong
+    /// scanlines. A pinned image is exactly that — a whole capture stretched to
+    /// whatever zoom the wheel has reached — so it takes the same route, and
+    /// this one is testable without a desktop.
     ///
     /// Nearest rather than a filter: the source is pixel art as often as it is a
     /// photograph, and a pixel that is a copy of its neighbour is what the user
     /// expects when they zoom into a screenshot to read small text.
+    ///
+    /// Integer arithmetic spreads the samples evenly over the source: a float
+    /// factor would let rounding drift the last rows off the bottom of the
+    /// image. A buffer too small for the request is left untouched rather than
+    /// panicking — this runs inside a window procedure, where a panic cannot
+    /// unwind.
+    pub fn scale_into(&self, width: i32, height: i32, bits: &mut [u8]) {
+        let (width, height) = (width.max(1), height.max(1));
+        let stride = self.stride();
+        let (source_width, source_height) = (self.width as usize, self.height as usize);
+        if source_width == 0
+            || source_height == 0
+            || self.bgra.len() < stride * source_height
+            || bits.len() < width as usize * 4 * height as usize
+        {
+            return;
+        }
+
+        let target_stride = width as usize * 4;
+        for row in 0..height as usize {
+            // Clamped, so a slight downscale cannot read past the last row.
+            let source_row = (row * source_height / height as usize).min(source_height - 1);
+            let source_base = source_row * stride;
+            let target_base = row * target_stride;
+            for column in 0..width as usize {
+                let source_column =
+                    (column * source_width / width as usize).min(source_width - 1);
+                let from = source_base + source_column * 4;
+                let to = target_base + column * 4;
+                bits[to..to + 4].copy_from_slice(&self.bgra[from..from + 4]);
+            }
+        }
+    }
+
+    /// Nearest-neighbour scale by a factor, as a new image.
+    ///
+    /// The allocating form of [`Shot::scale_into`], for callers that want the
+    /// scaled pixels to keep rather than a buffer to fill.
     pub fn scaled(&self, factor: f32) -> Shot {
         let factor = factor.max(0.05);
         let width = ((self.width as f32 * factor).round() as i32).max(1);
         let height = ((self.height as f32 * factor).round() as i32).max(1);
-        let stride = self.stride();
         let mut bgra = vec![0u8; width as usize * height as usize * 4];
-
-        for row in 0..height {
-            // Clamp so a slight downscale cannot read past the last row.
-            let src_y = ((row as f32 / factor) as usize).min(self.height as usize - 1);
-            for column in 0..width {
-                let src_x = ((column as f32 / factor) as usize).min(self.width as usize - 1);
-                let src = src_y * stride + src_x * 4;
-                let dst = (row as usize * width as usize + column as usize) * 4;
-                bgra[dst..dst + 4].copy_from_slice(&self.bgra[src..src + 4]);
-            }
-        }
+        self.scale_into(width, height, &mut bgra);
         Shot { width, height, bgra }
     }
 
@@ -477,6 +512,54 @@ mod tests {
     fn scaling_never_produces_an_empty_image() {
         let scaled = shot(10, 10, 1).scaled(0.01);
         assert!(scaled.width >= 1 && scaled.height >= 1);
+    }
+
+    /// Every destination pixel of a scaled frame comes from the source pixel it
+    /// is nearest to — the check for the pin's zoom, which used to ask GDI to do
+    /// this and got scanlines from elsewhere in the capture.
+    #[test]
+    fn a_scaled_frame_samples_the_source_pixels_it_should() {
+        // Each pixel carries its source column in blue and its row in green, so
+        // the mapping can be read straight off the result.
+        const W: i32 = 4;
+        const H: i32 = 10;
+        let mut source = Shot {
+            width: W,
+            height: H,
+            bgra: vec![0; (W * H * 4) as usize],
+        };
+        for y in 0..H {
+            for x in 0..W {
+                let at = ((y * W + x) * 4) as usize;
+                source.bgra[at] = x as u8;
+                source.bgra[at + 1] = y as u8;
+            }
+        }
+
+        // Zoomed in: the pixel under the pointer stays put and repeats.
+        let mut up = vec![0u8; (8 * 20 * 4) as usize];
+        source.scale_into(8, 20, &mut up);
+        let at = |x: usize, y: usize| (up[(y * 8 + x) * 4], up[(y * 8 + x) * 4 + 1]);
+        assert_eq!(at(0, 0), (0, 0));
+        assert_eq!(at(1, 1), (0, 0), "nearest neighbour repeats the source pixel");
+        assert_eq!(at(2, 2), (1, 1));
+        assert_eq!(at(7, 19), (3, 9), "the last destination pixel is the last source one");
+
+        // Zoomed out: the rows are spread evenly rather than drifting with a
+        // float factor, which is what keeps the bottom of the picture at the
+        // bottom of the window.
+        let mut down = vec![0u8; (2 * 3 * 4) as usize];
+        source.scale_into(2, 3, &mut down);
+        let row = |y: usize| down[y * 2 * 4 + 1];
+        assert_eq!((row(0), row(1), row(2)), (0, 3, 6));
+    }
+
+    #[test]
+    fn scaling_into_a_buffer_that_is_too_small_does_nothing() {
+        let source = shot(4, 4, 0xAA);
+        let mut bits = vec![0u8; 16];
+        source.scale_into(4, 4, &mut bits);
+        assert!(bits.iter().all(|byte| *byte == 0), "not even a partial frame");
     }
 
     #[test]

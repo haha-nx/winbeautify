@@ -37,6 +37,9 @@ parking_lot.workspace = true
 workspace = true
 features = [
     "Win32_Foundation",
+    # The single-instance guard names a mutex and an event, and both of those
+    # take a `SECURITY_ATTRIBUTES` parameter.
+    "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",

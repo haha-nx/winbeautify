@@ -16,21 +16,27 @@
 //!
 //! # Zooming
 //!
-//! `StretchDIBits` scales straight out of the original capture, so zooming never
-//! reallocates or resamples a buffer: only the window changes size. The stretch
-//! mode is `COLORONCOLOR` (nearest neighbour), which is what a screenshot tool
-//! wants — a magnified screenshot should show the pixel grid it actually has,
-//! not a smoothed guess at it.
+//! The window changes size and the picture is scaled to fill it, nearest
+//! neighbour, by [`Shot::scale_into`] — so a magnified screenshot shows the
+//! pixel grid it actually has rather than a smoothed guess at it, and the
+//! capture itself is never resampled or copied.
+//!
+//! The scaling is done on the frame buffer's own memory rather than by
+//! `StretchDIBits`. GDI's scaler was measured on this machine reading a source
+//! DIB as large as a screen capture from the wrong scanlines — which showed the
+//! wrong part of the image at the wrong size, and only while zoomed, since a
+//! 1:1 stretch was the one case it got right. The overlay composes its own
+//! pixels for the same reason.
 
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateSolidBrush,
+    BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreatePen, CreateSolidBrush,
     DeleteDC, DeleteObject, EndPaint, FillRect, FrameRect, InvalidateRect, LineTo, MoveToEx,
-    SelectObject, SetStretchBltMode, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    COLORONCOLOR, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, PAINTSTRUCT, PS_SOLID, SRCCOPY,
+    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    PAINTSTRUCT, PS_SOLID, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -228,6 +234,7 @@ fn run(shot: Shot, at: Option<(i32, i32)>) -> Result<(), String> {
         scale: 1.0,
         frame: None,
         frame_size: (0, 0),
+        image_drawn: false,
         dragging: None,
         hover_close: false,
     }));
@@ -271,17 +278,90 @@ fn cursor_position() -> (i32, i32) {
     (point.x, point.y)
 }
 
+/// A memory DC with a top-down DIB selected into it.
+///
+/// Top-down to match how [`Shot`] stores its rows, and a DIB section rather than
+/// a compatible bitmap because the scaled picture is written into `bits`
+/// directly — see [`Shot::scale_into`]. It is the same arrangement the capture
+/// overlay composes into, for the same reason.
+struct Frame {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    /// Base of the pixel buffer. Valid until the frame is dropped, and only ever
+    /// written on the pin's own thread, between messages.
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+}
+
+impl Frame {
+    fn new(window: HDC, width: i32, height: i32) -> Option<Self> {
+        let (width, height) = (width.max(1), height.max(1));
+        let dc = unsafe { CreateCompatibleDC(Some(window)) };
+        if dc.is_invalid() {
+            return None;
+        }
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bitmap = match unsafe {
+            CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+        } {
+            Ok(bitmap) if !bits.is_null() => bitmap,
+            _ => {
+                unsafe { let _ = DeleteDC(dc); };
+                return None;
+            }
+        };
+        let previous = unsafe { SelectObject(dc, bitmap.into()) };
+        Some(Self {
+            dc,
+            bitmap,
+            previous,
+            bits: bits as *mut u8,
+            width,
+            height,
+        })
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            let _ = DeleteObject(self.bitmap.into());
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
 /// Everything one pinned image owns.
 struct Pin {
     hwnd: HWND,
-    /// The capture at its original size. Scaling happens inside
-    /// `StretchDIBits`, so this buffer is never resampled or copied.
+    /// The capture at its original size. Zooming only ever reads it.
     shot: Shot,
     scale: f32,
     /// Cached backing store, rebuilt only when the window changes size.
-    frame: Option<(HDC, HBITMAP, HGDIOBJ)>,
-    /// The client size `frame` was built for.
+    frame: Option<Frame>,
+    /// The client size the frame was built for.
     frame_size: (i32, i32),
+    /// Whether `frame` holds the picture at the current zoom.
+    ///
+    /// The scaler is the expensive part of a frame and the close button's hover
+    /// only changes the corner of it, so the picture is drawn once per zoom or
+    /// resize rather than once per repaint.
+    image_drawn: bool,
     /// Where inside the window the drag started, in client coordinates.
     dragging: Option<(i32, i32)>,
     /// Is the pointer over the close button? Drives its colour.
@@ -297,38 +377,26 @@ impl Pin {
         )
     }
 
-    /// Make sure the backing store matches the client area, and return it.
-    fn frame(&mut self, window: HDC) -> Option<(HDC, HBITMAP)> {
+    /// Make sure the backing store matches the client area, and hand back the
+    /// pieces the painter works with.
+    ///
+    /// Raw parts rather than a borrow of the frame: the painter also needs the
+    /// capture, and a `&mut Frame` would keep it from reaching it.
+    fn frame(&mut self, window: HDC) -> Option<(HDC, *mut u8, i32, i32)> {
         let mut client = RECT::default();
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut client);
         }
         let size = (client.right.max(1), client.bottom.max(1));
-        if self.frame.is_none() || self.frame_size != size {
-            if let Some((dc, bitmap, previous)) = self.frame.take() {
-                unsafe {
-                    SelectObject(dc, previous);
-                    let _ = DeleteObject(bitmap.into());
-                    let _ = DeleteDC(dc);
-                }
-            }
-            let dc = unsafe { CreateCompatibleDC(Some(window)) };
-            if dc.is_invalid() {
-                return None;
-            }
-            let bitmap = unsafe { CreateCompatibleBitmap(window, size.0, size.1) };
-            if bitmap.0.is_null() {
-                unsafe { let _ = DeleteDC(dc); };
-                return None;
-            }
-            let previous = unsafe { SelectObject(dc, bitmap.into()) };
-            // Nearest neighbour: a magnified screenshot should show the pixels
-            // it actually has rather than a smoothed guess.
-            unsafe { SetStretchBltMode(dc, COLORONCOLOR) };
-            self.frame = Some((dc, bitmap, previous));
-            self.frame_size = size;
+        if self.frame.as_ref().map(|frame| (frame.width, frame.height)) != Some(size) {
+            self.frame = Frame::new(window, size.0, size.1);
+            // A fresh buffer holds nothing, so the picture has to go in again.
+            self.image_drawn = false;
         }
-        self.frame.as_ref().map(|(dc, bitmap, _)| (*dc, *bitmap))
+        self.frame_size = size;
+        self.frame
+            .as_ref()
+            .map(|frame| (frame.dc, frame.bits, frame.width, frame.height))
     }
 
     /// Rescale about a point in client coordinates.
@@ -350,6 +418,9 @@ impl Pin {
 
         let (origin_x, origin_y) = self.origin();
         self.scale = next;
+        // The window is about to be a different size; the picture in the frame
+        // is at the old zoom until it is drawn again.
+        self.image_drawn = false;
         let (width, height) = self.wanted_size();
         let x = origin_x + focus_x - (image_x * next).round() as i32;
         let y = origin_y + focus_y - (image_y * next).round() as i32;
@@ -407,53 +478,24 @@ impl Pin {
     }
 }
 
-impl Drop for Pin {
-    fn drop(&mut self) {
-        if let Some((dc, bitmap, previous)) = self.frame.take() {
-            unsafe {
-                SelectObject(dc, previous);
-                let _ = DeleteObject(bitmap.into());
-                let _ = DeleteDC(dc);
-            }
-        }
-    }
-}
-
 /// Draw the image and its border into the backing store, then blit the invalid
 /// part across.
 fn paint(pin: &mut Pin, paint_struct: &PAINTSTRUCT) {
-    let Some((memory, _bitmap)) = pin.frame(paint_struct.hdc) else {
+    let Some((memory, bits, width, height)) = pin.frame(paint_struct.hdc) else {
         return;
     };
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: pin.shot.width,
-            biHeight: -pin.shot.height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let (width, height) = pin.frame_size;
+
+    // The picture is scaled into the frame's own pixels, which is the one way
+    // to be sure of what lands on screen — see the module header.
+    if !pin.image_drawn {
+        let pixels = unsafe {
+            std::slice::from_raw_parts_mut(bits, (width as usize * height as usize) * 4)
+        };
+        pin.shot.scale_into(width, height, pixels);
+        pin.image_drawn = true;
+    }
+
     unsafe {
-        StretchDIBits(
-            memory,
-            0,
-            0,
-            width,
-            height,
-            0,
-            0,
-            pin.shot.width,
-            pin.shot.height,
-            Some(pin.shot.bgra.as_ptr() as *const core::ffi::c_void),
-            &bmi,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        );
         // The border has to sit *inside* the client area, or it would be part of
         // the window frame and resize the image by two pixels.
         let bounds = RECT {
@@ -699,6 +741,7 @@ mod tests {
             scale,
             frame: None,
             frame_size: (0, 0),
+            image_drawn: false,
             dragging: None,
             hover_close: false,
         }
