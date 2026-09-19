@@ -80,9 +80,11 @@ pub struct Watcher {
     /// `TaskbarFrame`, so the two are matched up from this set.
     pending_sources: Mutex<HashSet<u64>>,
     /// How often we went looking for taskbars that predate us (see
-    /// `claim_taskbars`): the walk is expensive and only the first few tree
-    /// events are worth trying it on.
+    /// `claim_is_due`): the walk is expensive, so it runs at most once per
+    /// interval and only while a taskbar of this session is unclaimed.
     claim_attempts: AtomicU32,
+    /// When that walk last ran, for the interval above.
+    last_claim: Mutex<Option<std::time::Instant>>,
     ref_count: AtomicU32,
 }
 
@@ -325,6 +327,45 @@ fn self_register_border(border: IUnknown) {
     service::register_frameless_hairline_border(border);
 }
 
+/// The taskbar window that owns `window` — normally the island bridge's direct
+/// parent, and the only attribution that survives two monitors of the same
+/// size.
+///
+/// The answer is checked against this session's taskbar windows instead of
+/// being taken on faith: a bridge that hangs somewhere else would otherwise
+/// have its grandparent, or the desktop, registered as a taskbar, and every
+/// command addressed to it would be delivered to a window that has no island —
+/// which looks exactly like the taskbar never being painted at all.
+fn taskbar_owner(window: isize) -> Option<isize> {
+    if window == 0 {
+        return None;
+    }
+    let bars = service::taskbar_windows();
+    if bars.contains(&window) {
+        return Some(window);
+    }
+    let mut current = window;
+    for _ in 0..4 {
+        current = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetAncestor(
+                windows::Win32::Foundation::HWND(current as *mut core::ffi::c_void),
+                windows::Win32::UI::WindowsAndMessaging::GA_PARENT,
+            )
+            .0 as isize
+        };
+        if current == 0 {
+            return None;
+        }
+        if bars.contains(&current) {
+            return Some(current);
+        }
+    }
+    crate::service::debug_log_fmt(format_args!(
+        "island window {window:#x} is not under any taskbar window"
+    ));
+    None
+}
+
 impl Watcher {
     /// Build the watcher and start advising. The framework calls `SetSite`
     /// with an `IXamlDiagnostics`; from then on our callback receives every
@@ -349,6 +390,7 @@ impl Watcher {
             ready_event: ReadyEvent(ready_event),
             pending_sources: Mutex::new(HashSet::new()),
             claim_attempts: AtomicU32::new(0),
+            last_claim: Mutex::new(None),
             ref_count: AtomicU32::new(1),
         });
         // The caller (`TapSite::set_site`) runs inside `com::guard`, so a panic
@@ -418,10 +460,52 @@ impl Watcher {
         // before we connected. Any element of its island is a way in, and the
         // taskbar's own elements keep mutating (buttons, clock, hover), so walk
         // up from each one until the frame turns up.
-        if !service::has_bars() && mutation == VISUAL_MUTATION_ADD {
+        //
+        // The gate is "a taskbar of this session is still unclaimed", not "none
+        // has been claimed": with more than one monitor, the first island
+        // claimed used to turn the search off, and the other monitors were
+        // never beautified. Rate-limited, because the walk is far too expensive
+        // to run on every mutation.
+        if mutation == VISUAL_MUTATION_ADD && self.claim_is_due() {
             let attempt = self.claim_attempts.fetch_add(1, Ordering::Relaxed);
             self.claim_from(element.handle, attempt < 3);
         }
+    }
+
+    /// Is it worth walking the tree looking for an unclaimed taskbar?
+    ///
+    /// The framework replays a handful of tree events when we connect, and those
+    /// are the best chance of finding a taskbar that predates us — so the first
+    /// few are all tried. After that the events are rare and mostly belong to a
+    /// taskbar that was claimed long ago, so the walk is rate-limited, and it
+    /// stops altogether once every taskbar of the session is registered.
+    fn claim_is_due(&self) -> bool {
+        /// Events at the start that are all worth a walk.
+        const BURST: u32 = 30;
+        /// How often the walk may run once the burst is over.
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        /// A taskbar that cannot be claimed must not keep the walk alive for
+        /// ever; the islands that need this path exist at connect time, so if
+        /// they have not turned up by now they are not going to.
+        const GIVE_UP_AFTER: u32 = 60;
+
+        let attempts = self.claim_attempts.load(Ordering::Relaxed);
+        if attempts >= GIVE_UP_AFTER {
+            return false;
+        }
+        if attempts >= BURST {
+            let Ok(mut last) = self.last_claim.lock() else {
+                return false;
+            };
+            let now = std::time::Instant::now();
+            if last.is_some_and(|last| now.duration_since(last) < INTERVAL) {
+                return false;
+            }
+            *last = Some(now);
+        }
+        // Nothing claimed yet counts too: that is the start-up case, where the
+        // window enumeration would say the same thing but has not been asked.
+        service::has_unclaimed_taskbar() || !service::has_bars()
     }
 
     /// Walk up from an element looking for the `TaskbarFrame` that contains it,
@@ -447,17 +531,25 @@ impl Watcher {
                 let Some(frame_handle) = self.handle_of(&element) else {
                     return;
                 };
+                // Already claimed: this element belongs to a taskbar we know, so
+                // there is nothing to do — and re-registering would re-run the
+                // frame walk and arm the re-walk timer on every attempt.
+                if service::is_registered(frame_handle) {
+                    return;
+                }
                 match self.taskbar_for_frame(&element) {
                     Some(taskbar) => {
                         service::register_taskbar(frame_handle, taskbar);
                         self.register_frame_control(frame_handle);
                         self.register_frame_children(frame_handle);
                         service::schedule_rewalk();
-                        crate::service::debug_log("claimed an existing taskbar");
+                        crate::service::debug_log_fmt(format_args!(
+                            "claimed an existing taskbar: frame {frame_handle:x} -> taskbar {taskbar:#x}"
+                        ));
                     }
-                    None => crate::service::debug_log(
-                        "claim: found a frame, but no taskbar window matches its size",
-                    ),
+                    None => crate::service::debug_log_fmt(format_args!(
+                        "claim: frame {frame_handle:x} could not be attributed to a taskbar window"
+                    )),
                 }
                 return;
             }
@@ -483,17 +575,15 @@ impl Watcher {
             // the sources we have seen to find this island's window, and take
             // the taskbar it hangs under from that window's parent.
             if let Some(source_hwnd) = self.find_source_for(relation.parent) {
-                let taskbar = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::GetAncestor(
-                        windows::Win32::Foundation::HWND(source_hwnd as *mut core::ffi::c_void),
-                        windows::Win32::UI::WindowsAndMessaging::GA_PARENT,
-                    )
-                    .0 as isize
-                };
-                if taskbar != 0 {
-                    service::register_taskbar(handle, taskbar);
-                    self.register_frame_control(handle);
-                    service::schedule_rewalk();
+                match taskbar_owner(source_hwnd) {
+                    Some(taskbar) => {
+                        service::register_taskbar(handle, taskbar);
+                        self.register_frame_control(handle);
+                        service::schedule_rewalk();
+                    }
+                    None => crate::service::debug_log(
+                        "on_added: the island's window is not under a taskbar",
+                    ),
                 }
             }
         } else if type_name == RECTANGLE_TYPE {
@@ -518,9 +608,63 @@ impl Watcher {
         }
     }
 
+    /// Which taskbar window a claimed `TaskbarFrame` belongs to.
+    ///
+    /// Taken from the island's own window wherever possible — the only route
+    /// that can tell two monitors of the same size apart — and otherwise from
+    /// the frame's size, which is ambiguous between identical monitors and is
+    /// therefore trusted only when one candidate is left.
     fn taskbar_for_frame(&self, frame: &IUnknown) -> Option<isize> {
+        if let Some(taskbar) = self.taskbar_of_island(frame) {
+            return Some(taskbar);
+        }
+        // Fallback for a tree that does not expose the source above the frame:
+        // match the frame's size against the taskbars — but only when a single
+        // taskbar fits. Two monitors of the same size are indistinguishable
+        // that way, and guessing mapped one monitor's island onto the other's
+        // taskbar, which is what left the second monitor unpainted.
+        self.taskbar_by_size(frame)
+    }
+
+    /// The taskbar window hosting this frame's island, via the island's window.
+    ///
+    /// The `DesktopWindowXamlSource` is not a visual ancestor — `GetParent`
+    /// stops at the island's root, which is where the walk-up in the old
+    /// version of this ended, so it never found a source and every frame fell
+    /// through to the size guess. The source is reachable the other way round:
+    /// its `Content` *is* that root, which is what the "frame was just added"
+    /// path matches against. Doing the same comparison against the frame's
+    /// ancestry finds the island of a frame that was never announced.
+    fn taskbar_of_island(&self, frame: &IUnknown) -> Option<isize> {
+        let mut element = frame.clone();
+        for _ in 0..64 {
+            if let Some(handle) = self.handle_of(&element) {
+                if let Some(window) = self.find_source_for(handle) {
+                    return taskbar_owner(window);
+                }
+            }
+            match unsafe { xaml::parent_of(element.as_raw()) } {
+                Some(parent) => element = parent,
+                None => break,
+            }
+        }
+        None
+    }
+
+    /// The taskbar whose island is the size of this frame, when that is a single
+    /// candidate.
+    ///
+    /// Two monitors of the same size are indistinguishable by size alone, and
+    /// the first match used to win — which mapped the second monitor's island
+    /// onto the first monitor's taskbar, so one island was never resolved and
+    /// only one taskbar was ever painted. When more than one taskbar matches,
+    /// the frame is attributed by elimination: if exactly one of them still has
+    /// no island, the frame is that one's. That is the case this recovery path
+    /// exists for — the second monitor's island arriving after the first was
+    /// claimed. Nothing is claimed when even that cannot tell them apart.
+    fn taskbar_by_size(&self, frame: &IUnknown) -> Option<isize> {
         let (width_dip, height_dip) = unsafe { xaml::actual_size_of(frame.as_raw()) }?;
-        let mut best: Option<(isize, f64)> = None;
+        let mut matched: Vec<isize> = Vec::new();
         for taskbar in service::taskbar_windows() {
             let dpi = unsafe {
                 windows::Win32::UI::HiDpi::GetDpiForWindow(windows::Win32::Foundation::HWND(
@@ -530,19 +674,43 @@ impl Watcher {
             let dpi = if dpi == 0 { 96 } else { dpi };
             let width_px = width_dip * dpi as f64 / 96.0;
             let height_px = height_dip * dpi as f64 / 96.0;
-            for child in service::child_windows(taskbar) {
+            let fits = service::child_windows(taskbar).into_iter().any(|child| {
                 let Some(rect) = service::window_rect(child) else {
-                    continue;
+                    return false;
                 };
                 let width = (rect.right - rect.left) as f64;
                 let height = (rect.bottom - rect.top) as f64;
-                let delta = (width - width_px).abs() + (height - height_px).abs();
-                if delta <= 8.0 && best.map(|(_, best)| delta < best).unwrap_or(true) {
-                    best = Some((taskbar, delta));
-                }
+                (width - width_px).abs() + (height - height_px).abs() <= 8.0
+            });
+            if fits && !matched.contains(&taskbar) {
+                matched.push(taskbar);
             }
         }
-        best.map(|(taskbar, _)| taskbar)
+
+        if matched.len() == 1 {
+            return matched.first().copied();
+        }
+        if matched.len() > 1 {
+            let claimed = service::claimed_taskbars();
+            let free: Vec<isize> = matched
+                .iter()
+                .copied()
+                .filter(|taskbar| !claimed.contains(taskbar))
+                .collect();
+            if let [only] = free.as_slice() {
+                return Some(*only);
+            }
+            // Every candidate is claimed, or none is: two monitors of the same
+            // size cannot be told apart by size alone. Taking the first is the
+            // behaviour that painted the primary, and it is what keeps a
+            // taskbar working when the island's own window cannot be read —
+            // refusing here would leave every monitor unpainted.
+            crate::service::debug_log(
+                "claim: two taskbars are the same size; taking the first",
+            );
+            return matched.first().copied();
+        }
+        None
     }
 
     /// Find the `BackgroundFill`/`BackgroundStroke` rectangles of a frame by

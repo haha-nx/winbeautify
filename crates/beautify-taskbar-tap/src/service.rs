@@ -28,7 +28,7 @@ use windows::Win32::System::Threading::{
     OpenProcess, WaitForSingleObject, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
     INFINITE,
 };
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW,
     GetClientRect, GetWindowThreadProcessId, RegisterClassExW, CreateWindowExW,
@@ -260,6 +260,33 @@ pub fn frame_handles() -> Vec<u64> {
 /// this is false, and stops once a frame has been claimed.
 pub fn has_bars() -> bool {
     with_service(|svc| !svc.bars.is_empty())
+}
+
+/// Has this frame already been claimed?
+///
+/// The recovery walk runs on tree mutations, and nearly all of them belong to a
+/// taskbar that was claimed long ago; this is what keeps those cheap.
+pub fn is_registered(frame_handle: u64) -> bool {
+    with_service(|svc| svc.bars.contains_key(&frame_handle))
+}
+
+/// The taskbar windows that have an island registered against them.
+pub fn claimed_taskbars() -> Vec<isize> {
+    with_service(|svc| svc.bars.values().map(|bar| bar.taskbar).collect())
+}
+
+/// Is a taskbar of this session still missing from the registry?
+///
+/// The recovery walk exists for the taskbars that were already there when we
+/// were injected: they never announce a frame, so they have to be looked for.
+/// It is gated on this rather than on "nothing has been claimed yet", which is
+/// what left every monitor but the primary untouched — the first island claimed
+/// turned the old gate off, and the rest were never looked for again.
+pub fn has_unclaimed_taskbar() -> bool {
+    let claimed = claimed_taskbars();
+    taskbar_windows()
+        .into_iter()
+        .any(|window| !claimed.contains(&window))
 }
 
 /// Remember one of the taskbar's background rectangles.
@@ -542,10 +569,10 @@ fn describe_bars() -> String {
 }
 
 fn set_appearance(cmd: &TapCommand) -> bool {
-    let Some(handle) = find_bar(cmd.taskbar as isize) else {
+    let taskbar = cmd.taskbar as isize;
+    let Some(handle) = find_bar(taskbar) else {
         debug_log_fmt(format_args!(
-            "appearance: no taskbar registered for {:#x}; have [{}]",
-            cmd.taskbar,
+            "appearance: no island registered for {taskbar:#x}; have [{}]",
             describe_bars()
         ));
         return false;
@@ -595,7 +622,7 @@ fn set_appearance(cmd: &TapCommand) -> bool {
         return false;
     }
 
-    ensure_subclass(cmd.taskbar as isize);
+    ensure_subclass(taskbar);
 
     let shape = with_service(|svc| svc.bars.get(&handle).and_then(|bar| bar.background.shape));
     let Some(shape) = shape else {
@@ -958,6 +985,9 @@ fn perform_restore(plan: RestorePlan) {
 /// Hand a taskbar back to the shell's own brushes.
 fn restore_taskbar(taskbar: isize) -> bool {
     let Some(handle) = find_bar(taskbar) else {
+        // Nothing of ours is on this island, but its window surface may still be
+        // zeroed from an earlier apply, so hand the window back as well.
+        drop_subclass(taskbar);
         return false;
     };
     let plan = with_service(|svc| {
@@ -972,6 +1002,7 @@ fn restore_taskbar(taskbar: isize) -> bool {
         plan
     });
     perform_restore(plan);
+    drop_subclass(taskbar);
     true
 }
 
@@ -990,6 +1021,14 @@ fn restore_all() -> bool {
         (svc.bars.len(), plan)
     });
     perform_restore(plan);
+    // Every taskbar we ever zeroed, not just the ones with an island: the
+    // surface zeroing is what makes a taskbar transparent, and leaving it in
+    // place would keep the shell's own surface invisible after the module is
+    // stopped or the host has exited.
+    let subclassed = with_service(|svc| svc.subclassed.iter().copied().collect::<Vec<_>>());
+    for taskbar in subclassed {
+        drop_subclass(taskbar);
+    }
     debug_log_fmt(format_args!("restore_all: {restored} taskbars"));
     true
 }
@@ -1240,8 +1279,8 @@ unsafe extern "system" fn taskbar_subclass(
 }
 
 fn ensure_subclass(taskbar: isize) {
-    let already = with_service(|svc| !svc.subclassed.insert(taskbar));
-    if !already {
+    let installed = with_service(|svc| svc.subclassed.insert(taskbar));
+    if installed {
         let ok = unsafe {
             SetWindowSubclass(HWND(taskbar as *mut _), Some(taskbar_subclass), SUBCLASS_ID, 0)
         };
@@ -1256,9 +1295,31 @@ fn ensure_subclass(taskbar: isize) {
     // something asks it to paint; a translucent XAML brush on top of an opaque
     // surface still looks opaque. Force one paint so the subclass below can
     // zero the surface out.
+    unsafe { force_repaint(HWND(taskbar as *mut core::ffi::c_void)) };
+}
+
+/// Undo the surface zeroing: remove the subclass and let the shell paint its
+/// own surface again.
+///
+/// Without this the taskbar stays transparent after the module hands it back —
+/// both "跟随系统" and a host that has exited would leave the shell's opaque
+/// surface with nothing to repaint it, and the taskbar would stay see-through
+/// until Explorer restarts.
+fn drop_subclass(taskbar: isize) {
+    let was_subclassed = with_service(|svc| svc.subclassed.remove(&taskbar));
+    if !was_subclassed {
+        return;
+    }
     unsafe {
         let hwnd = HWND(taskbar as *mut core::ffi::c_void);
-        debug_log("appearance: forcing a taskbar repaint");
+        let _ = RemoveWindowSubclass(hwnd, Some(taskbar_subclass), SUBCLASS_ID);
+        force_repaint(hwnd);
+    }
+}
+
+/// Ask the window to paint itself, now.
+unsafe fn force_repaint(hwnd: HWND) {
+    unsafe {
         let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
         let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
     }

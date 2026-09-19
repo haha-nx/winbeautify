@@ -236,15 +236,28 @@ impl Shared {
     }
 }
 
+/// What one taskbar should look like right now.
+///
+/// Kept per taskbar rather than per evaluation: the fullscreen guard and
+/// dynamic mode are properties of the monitor a taskbar sits on, so on a
+/// two-screen setup the primary's state has nothing to say about the other
+/// taskbar.
+#[derive(Debug, Clone, PartialEq)]
+struct BarPlan {
+    bar: HWND,
+    mode: TaskbarMode,
+    state: TaskbarVisualState,
+    /// Auto-hidden and retracted: report the state, but leave the window alone.
+    skip_apply: bool,
+}
+
 /// What the module decided for a given moment, kept so the safety timer can
 /// skip work when nothing moved. `primary` is part of the key so an explorer
 /// restart (same geometry, new windows) is never mistaken for "unchanged".
 #[derive(Debug, Clone, PartialEq)]
 struct Applied {
-    backdrop: Backdrop,
-    state: TaskbarVisualState,
+    plans: Vec<BarPlan>,
     geometry: Option<Rect>,
-    bars: usize,
     tap: bool,
     primary: isize,
 }
@@ -593,6 +606,45 @@ thread_local! {
     static MICA_OK: std::cell::RefCell<Option<bool>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Resolve what one taskbar should look like, judged against its own monitor.
+///
+/// The fullscreen guard and dynamic mode are per-monitor questions: a game on
+/// the second screen must not restore the first screen's taskbar, and a window
+/// maximised on the first must not push the second into the dynamic material.
+fn plan_for(bar: HWND, desired: &Desired, autohide: bool) -> BarPlan {
+    let geometry = shell::window_rect(bar);
+    let monitor = shell::monitor_rect_of(bar).unwrap_or(Rect::new(0, 0, 0, 0));
+
+    let (mode, state, skip_apply) = if !desired.enabled {
+        (TaskbarMode::Normal, TaskbarVisualState::Disabled, false)
+    } else if desired.hide_on_fullscreen
+        && !monitor.is_empty()
+        && shell::is_fullscreen_foreground(monitor)
+    {
+        (TaskbarMode::Normal, TaskbarVisualState::Fullscreen, false)
+    } else if autohide
+        && geometry
+            .map(|r| r.top >= monitor.bottom)
+            .unwrap_or(false)
+    {
+        // Retracted. Reapplying the accent now would be visible as a flash when
+        // the taskbar slides back out, so leave the window alone — but still
+        // report the geometry, because the widget bar needs to hide itself.
+        (desired.mode, TaskbarVisualState::Hidden, true)
+    } else if desired.dynamic_mode && !monitor.is_empty() && shell::any_maximized_on(monitor) {
+        (desired.dynamic_override, TaskbarVisualState::Dynamic, false)
+    } else {
+        (desired.mode, TaskbarVisualState::Applied, false)
+    };
+
+    BarPlan {
+        bar,
+        mode,
+        state,
+        skip_apply,
+    }
+}
+
 /// Recompute the desired visual state and push it to the taskbars.
 fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
     let desired = shared.desired.read().clone();
@@ -608,33 +660,19 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
     let primary = bars.first().copied();
     let geometry = primary.and_then(shell::window_rect);
     let autohide = shell::is_autohide_enabled();
-    let monitor = primary.and_then(shell::monitor_rect_of).unwrap_or(Rect::new(0, 0, 0, 0));
 
-    // Resolve the effective mode first: dynamic mode and the fullscreen guard
-    // both override whatever the user picked.
-    let (effective_mode, state, skip_apply) = if !desired.enabled {
-        (TaskbarMode::Normal, TaskbarVisualState::Disabled, false)
-    } else if desired.hide_on_fullscreen && !monitor.is_empty() && shell::is_fullscreen_foreground(monitor)
-    {
-        (TaskbarMode::Normal, TaskbarVisualState::Fullscreen, false)
-    } else if autohide && geometry.map(|r| r.top >= monitor.bottom).unwrap_or(false) {
-        // Retracted. Reapplying the accent now would be visible as a flash when
-        // the taskbar slides back out, so leave the window alone — but still
-        // report the geometry, because the widget bar needs to hide itself.
-        (desired.mode, TaskbarVisualState::Hidden, true)
-    } else if desired.dynamic_mode && !monitor.is_empty() && shell::any_maximized_on(monitor) {
-        (desired.dynamic_override, TaskbarVisualState::Dynamic, false)
-    } else {
-        (desired.mode, TaskbarVisualState::Applied, false)
-    };
+    // Each taskbar is judged against its own monitor, and every one of them is
+    // planned on every pass: a state that belongs to one monitor's taskbar must
+    // not be written to the other's.
+    let plans: Vec<BarPlan> = bars
+        .iter()
+        .map(|bar| plan_for(*bar, &desired, autohide))
+        .collect();
 
-    let backdrop = Backdrop::new(effective_mode, desired.color, desired.opacity);
     let tap_window = Shared::resolve_tap(shared, primary);
     let applied = Applied {
-        backdrop,
-        state,
+        plans: plans.clone(),
         geometry,
-        bars: bars.len(),
         tap: tap_window.is_some(),
         primary: primary.map(|h| h.0 as isize).unwrap_or(0),
     };
@@ -649,7 +687,10 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
     // around the taskbar works around it the same way — by re-applying.
     let unchanged = LAST.with(|slot| slot.borrow().as_ref() == Some(&applied));
     let retry = LAST_DELIVERED.with(|cell| !cell.get());
-    if unchanged && !retry && effective_mode != TaskbarMode::Acrylic {
+    let acrylic = plans
+        .iter()
+        .any(|plan| plan.mode == TaskbarMode::Acrylic && !plan.skip_apply);
+    if unchanged && !retry && !acrylic {
         return;
     }
 
@@ -661,20 +702,18 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
             // reveals the window's own black. So ask for a transparent window
             // accent as well: the same DWM accent the pre-22H2 path uses, with
             // nothing in it. The tint itself comes from the XAML fill.
-            if !skip_apply {
-                let clear_backdrop = Backdrop::new(TaskbarMode::Clear, desired.color, 0.0);
-                APPLICATOR.with(|slot| {
-                    let mut applicator = slot.borrow_mut();
-                    applicator.prune();
-                    for bar in &bars {
-                        applicator.apply(*bar, &clear_backdrop, dark, false);
-                    }
-                });
-            }
-            apply_via_tap(shared, channel, &bars, effective_mode, &desired)
+            let clear_backdrop = Backdrop::new(TaskbarMode::Clear, desired.color, 0.0);
+            APPLICATOR.with(|slot| {
+                let mut applicator = slot.borrow_mut();
+                applicator.prune();
+                for plan in plans.iter().filter(|plan| !plan.skip_apply) {
+                    applicator.apply(plan.bar, &clear_backdrop, dark, false);
+                }
+            });
+            apply_via_tap(shared, channel, &plans, &desired)
         }
         None => {
-            if !skip_apply {
+            if !plans.iter().all(|plan| plan.skip_apply) {
                 let mica_ok = MICA_OK.with(|cell| {
                     let mut slot = cell.borrow_mut();
                     *slot.get_or_insert_with(|| {
@@ -685,11 +724,13 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
                 APPLICATOR.with(|slot| {
                     let mut applicator = slot.borrow_mut();
                     applicator.prune();
-                    for bar in &bars {
-                        if effective_mode == TaskbarMode::Normal {
-                            applicator.reset(*bar);
+                    for plan in plans.iter().filter(|plan| !plan.skip_apply) {
+                        if plan.mode == TaskbarMode::Normal {
+                            applicator.reset(plan.bar);
                         } else {
-                            applicator.apply(*bar, &backdrop, dark, mica_ok);
+                            let backdrop =
+                                Backdrop::new(plan.mode, desired.color, desired.opacity);
+                            applicator.apply(plan.bar, &backdrop, dark, mica_ok);
                         }
                     }
                 });
@@ -702,6 +743,12 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
     LAST_DELIVERED.with(|cell| cell.set(delivered));
 
     if let Some(bus) = shared.bus.read().clone() {
+        // The reported state is the primary taskbar's: the settings page shows
+        // one status line, and the primary is the one every setup has.
+        let (state, effective_mode) = plans
+            .first()
+            .map(|plan| (plan.state, plan.mode))
+            .unwrap_or((TaskbarVisualState::Disabled, TaskbarMode::Normal));
         bus.publish(&Event::TaskbarChanged(Arc::new(TaskbarState {
             state,
             mode: effective_mode.id().to_string(),
@@ -712,19 +759,28 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
                 && winver::taskbar_ignores_composition_requests(),
         })));
     }
-    warn_if_ignored(effective_mode, tap_window.is_some());
+    warn_if_ignored(
+        plans.first().map(|plan| plan.mode).unwrap_or(TaskbarMode::Normal),
+        tap_window.is_some(),
+    );
     let _ = hwnd;
     tracing::debug!(
-        mode = effective_mode.id(),
-        state = ?state,
         bars = bars.len(),
         tap = tap_window.is_some(),
+        plans = ?plans
+            .iter()
+            .map(|plan| (plan.bar.0 as isize, plan.mode.id(), plan.state))
+            .collect::<Vec<_>>(),
         dpi = primary.map(|h| unsafe { GetDpiForWindow(h) }).unwrap_or(0),
         "taskbar backdrop applied"
     );
 }
 
 /// Push the resolved visual state through the injected TAP.
+///
+/// One command per taskbar, each carrying that taskbar's own mode: the plans
+/// are per monitor, so two taskbars can legitimately want different materials
+/// at the same moment.
 ///
 /// Clear keeps the configured tint with zero alpha (fully transparent over
 /// the zeroed window surface), Opaque forces full alpha, Acrylic and Blur
@@ -734,8 +790,7 @@ fn evaluate_and_apply(shared: &Arc<Shared>, hwnd: HWND) {
 fn apply_via_tap(
     shared: &Arc<Shared>,
     channel: HWND,
-    bars: &[HWND],
-    mode: TaskbarMode,
+    plans: &[BarPlan],
     desired: &Desired,
 ) -> bool {
     let alpha = (desired.opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -744,8 +799,9 @@ fn apply_via_tap(
         | u32::from(desired.color.b);
 
     let mut delivered = true;
-    for bar in bars {
-        let mut cmd = match mode {
+    for plan in plans.iter().filter(|plan| !plan.skip_apply) {
+        let bar = plan.bar;
+        let mut cmd = match plan.mode {
             TaskbarMode::Normal => TapCommand::new(CommandKind::Restore),
             TaskbarMode::Clear => {
                 let mut cmd = TapCommand::new(CommandKind::Set);
