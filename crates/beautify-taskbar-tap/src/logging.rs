@@ -157,6 +157,15 @@ pub fn debug_log_fmt_sync(args: core::fmt::Arguments) {
 /// connects to the framework: from then on every COM entry point is allocation-
 /// and IO-free, and anything logged before this call is dropped.
 pub fn start() {
+    // Once per process: a failed install is retried by the next injection (see
+    // `install_thread`), and each of those calls this, which would otherwise
+    // leave a logger thread behind every time.
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let mut started = false;
+    STARTED.call_once(|| started = true);
+    if !started {
+        return;
+    }
     let Some(dir) = module_dir() else {
         return;
     };

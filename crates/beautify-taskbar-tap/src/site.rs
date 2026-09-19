@@ -285,6 +285,14 @@ fn install_thread(module: isize) {
     if !ok {
         // Signal the host so it does not wait out its whole timeout.
         signal_ready();
+        // Let a later injection try again. The framework's diagnostics endpoints
+        // do not exist yet while Explorer is still starting: an injection that
+        // lands in the first second after the taskbar appears fails every one of
+        // its 60 attempts with `ERROR_NOT_FOUND` (measured), and the host retries
+        // every 30 s — but the boot latch turned that into a permanent failure
+        // for the whole Explorer session, so the taskbar stayed unbeautified
+        // until the shell was restarted a second time.
+        INSTALL_STARTED.store(false, Ordering::SeqCst);
     }
 }
 
