@@ -32,6 +32,9 @@
       "icons/128x128.png",
       "icons/icon.ico"
     ],
+    "resources": {
+      "../target/release/beautify_taskbar_tap.dll": "beautify_taskbar_tap.dll"
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",
