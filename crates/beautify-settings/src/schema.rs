@@ -170,10 +170,7 @@ impl Kind {
     /// Status and info rows only report, and action rows only run something, so
     /// none of them has a path — which is what the schema tests rely on.
     pub fn holds_value(&self) -> bool {
-        !matches!(
-            self,
-            Kind::Status(_) | Kind::Info(_) | Kind::Action(_)
-        )
+        !matches!(self, Kind::Status(_) | Kind::Info(_) | Kind::Action(_))
     }
 
     /// Is this control something the pointer can act on?
@@ -426,8 +423,7 @@ fn taskbar_on(c: &Config) -> bool {
 /// does not lose it, but they are defined by their material rather than by a
 /// colour.
 fn taskbar_tint(c: &Config) -> bool {
-    c.taskbar.enabled
-        && matches!(c.taskbar.mode, TaskbarMode::Opaque | TaskbarMode::Acrylic)
+    c.taskbar.enabled && matches!(c.taskbar.mode, TaskbarMode::Opaque | TaskbarMode::Acrylic)
 }
 fn taskbar_dynamic(c: &Config) -> bool {
     c.taskbar.enabled && c.taskbar.dynamic_mode
@@ -597,17 +593,22 @@ const APPEARANCE: &[Card] = &[
         title: None,
         fields: &[
             select("ui.theme", "主题", THEMES),
-            hint(
-                color("ui.accent", "强调色"),
-                "用于选中项、开关与焦点框。",
-            ),
+            hint(color("ui.accent", "强调色"), "用于选中项、开关与焦点框。"),
         ],
     },
     Card {
         title: Some("小组件"),
         fields: &[
             color("widget.background", "背景色"),
-            slider("widget.opacity", "背景不透明度", Some("0 表示不画背景，只留文字与图标。"), 0.0, 1.0, 0.01, Format::Percent),
+            slider(
+                "widget.opacity",
+                "背景不透明度",
+                Some("0 表示不画背景，只留文字与图标。"),
+                0.0,
+                1.0,
+                0.01,
+                Format::Percent,
+            ),
             hint(
                 select("widget.color_mode", "前景颜色", WIDGET_COLOR_MODES),
                 "跟随主题时随深浅色切换。",
@@ -661,11 +662,11 @@ const TASKBAR: &[Card] = &[
             when(
                 hint(
                     select("taskbar.mode", "背景模式", MODES),
-                    "「纯色」与「亚克力」可指定着色；透明与模糊由材质决定。",
+                    "「纯色」与「亚克力」可指定主题色；透明与模糊由材质决定。",
                 ),
                 taskbar_on,
             ),
-            when(color("taskbar.color", "着色"), taskbar_tint),
+            when(color("taskbar.color", "主题色"), taskbar_on),
             when(
                 switch_hint(
                     "taskbar.show_hairline",
@@ -692,7 +693,7 @@ const TASKBAR: &[Card] = &[
                 taskbar_on,
             ),
             when(
-                select("taskbar.dynamic_mode_override", "最大化时使用", MODES),
+                select("taskbar.dynamic_mode_override", "窗口最大化时使用", MODES),
                 taskbar_dynamic,
             ),
             when(
@@ -740,8 +741,14 @@ const WIDGET: &[Card] = &[
                 ),
                 widget_on,
             ),
-            when(number("widget.offset_x", "水平偏移", -400, 400, "px"), widget_on),
-            when(number("widget.offset_y", "垂直偏移", -60, 60, "px"), widget_on),
+            when(
+                number("widget.offset_x", "水平偏移", -400, 400, "px"),
+                widget_on,
+            ),
+            when(
+                number("widget.offset_y", "垂直偏移", -60, 60, "px"),
+                widget_on,
+            ),
             when(
                 hint(
                     number("widget.margin", "边距", 0, 40, "px"),
@@ -754,19 +761,43 @@ const WIDGET: &[Card] = &[
     Card {
         title: Some("音频组件宽度"),
         fields: &[
-            when(number("widget.audio_min_width", "最小宽度", 96, 900, "px"), widget_on),
-            when(number("widget.audio_max_width", "最大宽度", 96, 1600, "px"), widget_on),
-            when(number("widget.lyric_min_width", "歌词最小宽度", 0, 1200, "px"), widget_lyrics),
-            when(number("widget.lyric_max_width", "歌词最大宽度", 0, 1600, "px"), widget_lyrics),
+            when(
+                number("widget.audio_min_width", "最小宽度", 96, 900, "px"),
+                widget_on,
+            ),
+            when(
+                number("widget.audio_max_width", "最大宽度", 96, 1600, "px"),
+                widget_on,
+            ),
+            when(
+                number("widget.lyric_min_width", "歌词最小宽度", 0, 1200, "px"),
+                widget_lyrics,
+            ),
+            when(
+                number("widget.lyric_max_width", "歌词最大宽度", 0, 1600, "px"),
+                widget_lyrics,
+            ),
         ],
     },
     Card {
         title: Some("Flyout"),
         fields: &[
-            when(number("widget.flyout_width", "宽度", 260, 900, "px"), widget_on),
-            when(number("widget.flyout_height", "高度", 240, 1200, "px"), widget_on),
-            when(switch("widget.flyout_flip", "空间不足时向上展开"), widget_on),
-            when(switch("widget.remember_tab", "记住上次打开的标签页"), widget_on),
+            when(
+                number("widget.flyout_width", "宽度", 260, 900, "px"),
+                widget_on,
+            ),
+            when(
+                number("widget.flyout_height", "高度", 240, 1200, "px"),
+                widget_on,
+            ),
+            when(
+                switch("widget.flyout_flip", "空间不足时向上展开"),
+                widget_on,
+            ),
+            when(
+                switch("widget.remember_tab", "记住上次打开的标签页"),
+                widget_on,
+            ),
         ],
     },
 ];
@@ -893,11 +924,7 @@ const MEDIA: &[Card] = &[
         title: Some("预览"),
         fields: &[
             when(
-                switch_hint(
-                    "media.demo_mode",
-                    "预览模式",
-                    "播放演示曲目、歌词与频谱。",
-                ),
+                switch_hint("media.demo_mode", "预览模式", "播放演示曲目、歌词与频谱。"),
                 media_on,
             ),
             Field {
@@ -949,7 +976,13 @@ const CLIPBOARD: &[Card] = &[
             when(switch("clipboard.capture_images", "保存图片"), clipboard_on),
             when(
                 hint(
-                    number("clipboard.max_image_bytes", "图片大小上限", 0, 67108864, "字节"),
+                    number(
+                        "clipboard.max_image_bytes",
+                        "图片大小上限",
+                        0,
+                        67108864,
+                        "字节",
+                    ),
                     "超过上限的图片会被忽略。0 表示不限制。",
                 ),
                 clipboard_images,
@@ -992,7 +1025,7 @@ const TODO: &[Card] = &[
         title: None,
         fields: &[
             switch("todo.enabled", "启用任务清单"),
-            when(switch("todo.show_badge", "在启动器上显示未完成数量"), todo_on),
+            when(switch("todo.show_badge", "显示未完成数量角标"), todo_on),
             when(
                 switch_hint(
                     "todo.carry_over",
@@ -1045,7 +1078,11 @@ const SYSTEM: &[Card] = &[
                 "贴图快捷键",
                 "贴出剪贴板图片，再按一次收起。",
             ),
-            hotkey("todo.hotkey", "任务清单快捷键", "打开任务清单。留空则不注册。"),
+            hotkey(
+                "todo.hotkey",
+                "任务清单快捷键",
+                "打开任务清单。留空则不注册。",
+            ),
         ],
     },
     Card {
@@ -1145,7 +1182,15 @@ const SNIP: &[Card] = &[
             ),
             when(
                 hint(
-                    slider("snip.dim", "选区外遮罩", None, 0.0, 0.85, 0.05, Format::Percent),
+                    slider(
+                        "snip.dim",
+                        "选区外遮罩",
+                        None,
+                        0.0,
+                        0.85,
+                        0.05,
+                        Format::Percent,
+                    ),
                     "遮罩越深，选区越突出。",
                 ),
                 snip_on,
@@ -1180,7 +1225,10 @@ const ABOUT: &[Card] = &[
     Card {
         title: Some("位置"),
         fields: &[
-            hint(info(InfoKey::ConfigPath, "配置文件"), "可以直接用文本编辑器修改。"),
+            hint(
+                info(InfoKey::ConfigPath, "配置文件"),
+                "可以直接用文本编辑器修改。",
+            ),
             info(InfoKey::DataDir, "数据目录"),
             info(InfoKey::LogsDir, "日志目录"),
             Field {
@@ -1393,7 +1441,11 @@ mod tests {
                 }
             }
         }
-        assert!(seen.len() > 45, "expected the full page, found {}", seen.len());
+        assert!(
+            seen.len() > 45,
+            "expected the full page, found {}",
+            seen.len()
+        );
     }
 
     #[test]
@@ -1406,7 +1458,11 @@ mod tests {
             for card in section.cards {
                 assert!(!card.fields.is_empty(), "empty card in {}", section.id);
                 for field in card.fields {
-                    assert!(!field.label.is_empty(), "unlabelled field in {}", section.id);
+                    assert!(
+                        !field.label.is_empty(),
+                        "unlabelled field in {}",
+                        section.id
+                    );
                 }
             }
         }
@@ -1523,11 +1579,17 @@ mod tests {
         let mut config = Config::default();
         config.snip.enabled = true;
         let section = section("snip").unwrap();
-        let expanded: Vec<&str> = section.visible_fields(&config).map(|(_, f)| f.label).collect();
+        let expanded: Vec<&str> = section
+            .visible_fields(&config)
+            .map(|(_, f)| f.label)
+            .collect();
         assert!(expanded.len() >= 5, "the feature's rows should be visible");
 
         config.snip.enabled = false;
-        let collapsed: Vec<&str> = section.visible_fields(&config).map(|(_, f)| f.label).collect();
+        let collapsed: Vec<&str> = section
+            .visible_fields(&config)
+            .map(|(_, f)| f.label)
+            .collect();
         assert!(
             collapsed.contains(&"启用截图"),
             "the switch that turns it back on must never hide itself"
