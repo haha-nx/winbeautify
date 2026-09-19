@@ -7,10 +7,10 @@
 //! drifts when it is duplicated.
 
 use windows::core::{w, Interface, Result};
-use windows_numerics::Vector2;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
+use windows_numerics::Vector2;
 
 use crate::layout::Rect;
 use crate::theme::Rgba;
@@ -80,7 +80,10 @@ impl<'a> Canvas<'a> {
 
     pub fn fill_rounded(&self, rect: Rect, radius: f32, color: Rgba) {
         self.set(color);
-        unsafe { self.target.FillRoundedRectangle(&rounded(rect, radius), &self.brush) };
+        unsafe {
+            self.target
+                .FillRoundedRectangle(&rounded(rect, radius), &self.brush)
+        };
     }
 
     pub fn stroke_rounded(&self, rect: Rect, radius: f32, color: Rgba, width: f32) {
@@ -131,7 +134,10 @@ impl<'a> Canvas<'a> {
     /// Used for the scrolling list bodies, which must not paint over the tab
     /// strip or the footer.
     pub fn clipped<R>(&self, rect: Rect, f: impl FnOnce() -> R) -> R {
-        unsafe { self.target.PushAxisAlignedClip(&rect_f(rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE) };
+        unsafe {
+            self.target
+                .PushAxisAlignedClip(&rect_f(rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE)
+        };
         let result = f();
         unsafe { self.target.PopAxisAlignedClip() };
         result
@@ -188,6 +194,24 @@ impl<'a> Canvas<'a> {
         Ok(())
     }
 
+    /// Several closed contours filled as one path, translated by `offset`.
+    ///
+    /// The fill rule is alternate, so a contour drawn inside another becomes
+    /// a hole: this is how an outline-style glyph — a ring, a hollow pin —
+    /// is filled in one operation.
+    pub fn fill_polygons(
+        &self,
+        factory: &ID2D1Factory,
+        contours: &[&[(f32, f32)]],
+        offset: (f32, f32),
+        color: Rgba,
+    ) -> Result<()> {
+        let geometry = build_contours_path(factory, contours, offset)?;
+        self.set(color);
+        unsafe { self.target.FillGeometry(&geometry, &self.brush, None) };
+        Ok(())
+    }
+
     /// An outlined polygon, for the small "no artwork" style glyphs.
     pub fn stroke_polyline(
         &self,
@@ -213,24 +237,39 @@ pub fn build_path(
     points: &[(f32, f32)],
     offset: (f32, f32),
 ) -> Result<ID2D1PathGeometry> {
+    build_contours_path(factory, &[points], offset)
+}
+
+/// Build one closed figure per contour, with each point offset by `(dx, dy)`.
+///
+/// The fill mode is stated rather than relied on: alternate is what turns a
+/// contour inside another into a hole.
+fn build_contours_path(
+    factory: &ID2D1Factory,
+    contours: &[&[(f32, f32)]],
+    offset: (f32, f32),
+) -> Result<ID2D1PathGeometry> {
     unsafe {
         let geometry = factory.CreatePathGeometry()?;
         let sink = geometry.Open()?;
-        if let Some(((x, y), rest)) = points.split_first() {
-            sink.BeginFigure(
-                Vector2 {
-                    X: x + offset.0,
-                    Y: y + offset.1,
-                },
-                D2D1_FIGURE_BEGIN_FILLED,
-            );
-            for (x, y) in rest {
-                sink.AddLine(Vector2 {
-                    X: x + offset.0,
-                    Y: y + offset.1,
-                });
+        sink.SetFillMode(D2D1_FILL_MODE_ALTERNATE);
+        for points in contours {
+            if let Some(((x, y), rest)) = points.split_first() {
+                sink.BeginFigure(
+                    Vector2 {
+                        X: x + offset.0,
+                        Y: y + offset.1,
+                    },
+                    D2D1_FIGURE_BEGIN_FILLED,
+                );
+                for (x, y) in rest {
+                    sink.AddLine(Vector2 {
+                        X: x + offset.0,
+                        Y: y + offset.1,
+                    });
+                }
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
             }
-            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
         }
         sink.Close()?;
         Ok(geometry)
@@ -245,12 +284,12 @@ pub fn build_path(
 /// `None` when there is nothing to draw into.
 pub fn render_probe_ink(format: &IDWriteTextFormat, width: u32, height: u32) -> Option<(f32, f32)> {
     use windows::Win32::Graphics::Direct2D::{
-        ID2D1Factory, D2D1CreateFactory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        D2D1CreateFactory, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
         D2D1_RENDER_TARGET_PROPERTIES,
     };
     use windows::Win32::Graphics::Imaging::{
-        IWICBitmap, IWICBitmapLock, WICBitmapCacheOnLoad, WICBitmapLockRead,
-        GUID_WICPixelFormat32bppPBGRA,
+        GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICBitmapLock, WICBitmapCacheOnLoad,
+        WICBitmapLockRead,
     };
 
     let factory: ID2D1Factory =
@@ -563,7 +602,8 @@ impl TextEngine {
         let (mut low, mut high) = (0usize, chars.len());
         while high - low > 1 {
             let mid = (low + high) / 2;
-            let candidate: String = "…".to_string() + &chars[chars.len() - mid..].iter().collect::<String>();
+            let candidate: String =
+                "…".to_string() + &chars[chars.len() - mid..].iter().collect::<String>();
             if self.measure(&candidate, format, 4096.0) <= max_width {
                 low = mid;
             } else {
@@ -587,7 +627,8 @@ impl TextEngine {
             let mut current = String::new();
             for word in paragraph.split_inclusive(' ') {
                 let candidate = format!("{current}{word}");
-                if current.is_empty() || self.measure(candidate.trim_end(), format, 4096.0) <= max_width
+                if current.is_empty()
+                    || self.measure(candidate.trim_end(), format, 4096.0) <= max_width
                 {
                     current = candidate;
                 } else {
@@ -618,7 +659,6 @@ mod tests {
         assert_eq!(rounded(Rect::new(0.0, 0.0, 10.0, 10.0), -4.0).radiusX, 0.0);
     }
 
-
     /// Give this thread an apartment, once per test.
     fn init_com() {
         unsafe {
@@ -639,12 +679,12 @@ mod tests {
     /// claims to place in the middle.
     fn ink_centre(text: &str, px: f32, width: u32, height: u32) -> (f32, f32, f32) {
         use windows::Win32::Graphics::Direct2D::{
-            ID2D1Factory, D2D1CreateFactory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+            D2D1CreateFactory, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
             D2D1_RENDER_TARGET_PROPERTIES,
         };
         use windows::Win32::Graphics::Imaging::{
-            IWICBitmap, IWICBitmapLock, WICBitmapCacheOnLoad, WICBitmapLockRead,
-            GUID_WICPixelFormat32bppPBGRA,
+            GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICBitmapLock, WICBitmapCacheOnLoad,
+            WICBitmapLockRead,
         };
 
         // WIC wants an apartment. `format()` now measures its correction by
@@ -655,7 +695,12 @@ mod tests {
                 .expect("Direct2D is available");
         let wic = crate::images::create_wic_factory().expect("a WIC factory");
         let bitmap: IWICBitmap = unsafe {
-            wic.CreateBitmap(width, height, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad)
+            wic.CreateBitmap(
+                width,
+                height,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapCacheOnLoad,
+            )
         }
         .expect("a bitmap");
         let properties = D2D1_RENDER_TARGET_PROPERTIES {
@@ -709,7 +754,6 @@ mod tests {
             "the ink spans {top}..{bottom}, centre {centre}, box centre 30"
         );
     }
-
 
     /// Every size the app draws text at, in pixels.
     const UI_SIZES: [f32; 5] = [9.0, 10.5, 11.0, 12.5, 20.0];

@@ -851,36 +851,39 @@ impl Painter {
     ) -> Result<()> {
         let centre = ((rect.left + rect.right) * 0.5, rect.center_y());
         let arm = metrics.px(6.0);
-        let thin = metrics.px(1.5);
+        let thin = metrics.px(1.15);
         match icon {
-            Icon::Delete => self.draw_cross(canvas, rect, colour, metrics.px(5.0), thin)?,
+            // √2 × (arm + half the thickness) is the cross's ink: 7.7 puts
+            // it at the 12 logical pixels the star and the pin are drawn to.
+            Icon::Delete => self.draw_cross(canvas, rect, colour, metrics.px(6.0), thin)?,
             Icon::Star => {
                 let points = star_points(centre, arm, arm * 0.42);
+                // Filled draws fill *and* stroke over the same path, so the
+                // silhouette is exactly the outlined one's: the stroke is
+                // what puts thin/2 outside the path, and a bare fill loses
+                // it — the star visibly shrank the moment it was pressed.
                 if filled {
                     canvas.fill_polygon(&self.factory, &points, (0.0, 0.0), colour)?;
-                } else {
-                    canvas.stroke_polyline(&self.factory, &points, (0.0, 0.0), colour, thin)?;
                 }
+                canvas.stroke_polyline(&self.factory, &points, (0.0, 0.0), colour, thin)?;
             }
             Icon::Pin => {
-                // A ball on a stem, leaning the way a pin leans.
-                let head_radius = arm * 0.42;
-                let head = Rect::new(
-                    centre.0 - head_radius,
-                    centre.1 - arm * 0.9,
-                    centre.0 + head_radius,
-                    centre.1 - arm * 0.9 + head_radius * 2.0,
-                );
-                canvas.fill_rounded(head, head_radius, colour);
-                canvas.fill_rect(
-                    Rect::new(
-                        centre.0 - thin * 0.5,
-                        head.bottom - thin * 0.5,
-                        centre.0 + thin * 0.5,
-                        centre.1 + arm * 0.8,
-                    ),
-                    colour,
-                );
+                // The source glyph is outline-style: filled it draws as the
+                // solid pin, unfilled the inner contour hollows it into the
+                // ring the SVG shows.
+                let outer: Vec<(f32, f32)> = PIN_OUTER
+                    .iter()
+                    .map(|(x, y)| (centre.0 + x * arm, centre.1 + y * arm))
+                    .collect();
+                if filled {
+                    canvas.fill_polygon(&self.factory, &outer, (0.0, 0.0), colour)?;
+                } else {
+                    let hole: Vec<(f32, f32)> = PIN_HOLE
+                        .iter()
+                        .map(|(x, y)| (centre.0 + x * arm, centre.1 + y * arm))
+                        .collect();
+                    canvas.fill_polygons(&self.factory, &[&outer, &hole], (0.0, 0.0), colour)?;
+                }
             }
             Icon::Kind(kind) => self.draw_kind(canvas, kind, rect, colour, metrics)?,
         }
@@ -1092,6 +1095,146 @@ fn star_points(centre: (f32, f32), outer: f32, inner: f32) -> Vec<(f32, f32)> {
     }
     points
 }
+
+/// A pushpin glyph, flattened from its source SVG path into straight runs.
+///
+/// Two contours in arm units around the glyph's centre: the outer edge, and
+/// the inner one that hollows it into the outline look. The bounding box
+/// spans 2.0 — 12 logical pixels at the usual arm — the ink the star and
+/// the delete cross are measured to as well, so the three row buttons read
+/// as one size. The needle points to the bottom left, the way a pin leans
+/// when it is stuck into the page.
+const PIN_OUTER: [(f32, f32); 88] = [
+    (0.9742, -0.3184),
+    (0.3188, -0.9729),
+    (0.3097, -0.9808),
+    (0.2999, -0.9873),
+    (0.2895, -0.9923),
+    (0.2787, -0.9958),
+    (0.2676, -0.998),
+    (0.2563, -0.9987),
+    (0.245, -0.998),
+    (0.2338, -0.9958),
+    (0.223, -0.9923),
+    (0.2126, -0.9873),
+    (0.2029, -0.9808),
+    (0.1939, -0.9729),
+    (-0.2346, -0.5448),
+    (-0.2509, -0.5465),
+    (-0.2672, -0.5478),
+    (-0.2835, -0.5489),
+    (-0.2998, -0.5496),
+    (-0.3162, -0.55),
+    (-0.3325, -0.5501),
+    (-0.4297, -0.5448),
+    (-0.5259, -0.5288),
+    (-0.6202, -0.5022),
+    (-0.7116, -0.4649),
+    (-0.7992, -0.4169),
+    (-0.8818, -0.3582),
+    (-0.8992, -0.3398),
+    (-0.9102, -0.318),
+    (-0.9148, -0.2943),
+    (-0.9128, -0.2703),
+    (-0.9043, -0.2474),
+    (-0.8891, -0.227),
+    (-0.4058, 0.2555),
+    (-0.9788, 0.8275),
+    (-0.9821, 0.8311),
+    (-0.9849, 0.8351),
+    (-0.9872, 0.8394),
+    (-0.989, 0.8439),
+    (-0.9903, 0.8486),
+    (-0.9911, 0.8535),
+    (-1.0, 0.9524),
+    (-0.9994, 0.9645),
+    (-0.9956, 0.9755),
+    (-0.989, 0.9849),
+    (-0.9802, 0.9922),
+    (-0.9696, 0.997),
+    (-0.9578, 0.9987),
+    (-0.9571, 0.9987),
+    (-0.9564, 0.9986),
+    (-0.9558, 0.9986),
+    (-0.9551, 0.9986),
+    (-0.9544, 0.9985),
+    (-0.9537, 0.9984),
+    (-0.8548, 0.9895),
+    (-0.85, 0.9888),
+    (-0.8452, 0.9875),
+    (-0.8407, 0.9857),
+    (-0.8365, 0.9833),
+    (-0.8325, 0.9805),
+    (-0.8288, 0.9772),
+    (-0.2559, 0.405),
+    (0.2274, 0.8875),
+    (0.2365, 0.8954),
+    (0.2462, 0.9019),
+    (0.2566, 0.9069),
+    (0.2674, 0.9105),
+    (0.2785, 0.9126),
+    (0.2898, 0.9133),
+    (0.3027, 0.9124),
+    (0.3153, 0.9096),
+    (0.3274, 0.905),
+    (0.3388, 0.8986),
+    (0.3494, 0.8903),
+    (0.3588, 0.8803),
+    (0.4264, 0.7833),
+    (0.4794, 0.6799),
+    (0.5178, 0.5718),
+    (0.5416, 0.4603),
+    (0.5508, 0.3472),
+    (0.5454, 0.2338),
+    (0.9739, -0.194),
+    (0.9884, -0.2127),
+    (0.9971, -0.2338),
+    (1.0, -0.2561),
+    (0.9971, -0.2784),
+    (0.9885, -0.2996),
+    (0.9742, -0.3184),
+];
+
+const PIN_HOLE: [(f32, f32); 38] = [
+    (0.4102, 0.099),
+    (0.345, 0.1641),
+    (0.3552, 0.2555),
+    (0.3587, 0.3002),
+    (0.3594, 0.3447),
+    (0.3572, 0.389),
+    (0.3521, 0.4331),
+    (0.3442, 0.4769),
+    (0.3335, 0.5202),
+    (0.3258, 0.5453),
+    (0.3173, 0.5699),
+    (0.3079, 0.5941),
+    (0.2976, 0.6179),
+    (0.2865, 0.6413),
+    (0.2744, 0.6642),
+    (-0.6651, -0.274),
+    (-0.6478, -0.2832),
+    (-0.6303, -0.2919),
+    (-0.6126, -0.3001),
+    (-0.5946, -0.3077),
+    (-0.5763, -0.3149),
+    (-0.5578, -0.3216),
+    (-0.5213, -0.333),
+    (-0.4844, -0.3424),
+    (-0.447, -0.3496),
+    (-0.4091, -0.3548),
+    (-0.371, -0.3579),
+    (-0.3325, -0.3589),
+    (-0.3197, -0.3588),
+    (-0.3069, -0.3585),
+    (-0.2941, -0.3579),
+    (-0.2812, -0.3571),
+    (-0.2684, -0.356),
+    (-0.2556, -0.3546),
+    (-0.1642, -0.3445),
+    (0.2566, -0.7648),
+    (0.7658, -0.2562),
+    (0.4102, 0.099),
+];
 
 /// The four corners of a thin bar through `centre`, tilted by `tilt`.
 fn bar_points(centre: (f32, f32), arm: f32, thickness: f32, tilt: f32) -> [(f32, f32); 4] {
