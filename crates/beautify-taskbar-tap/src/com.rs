@@ -505,6 +505,22 @@ pub unsafe extern "system" fn com_query_interface<T: ComObj>(
         return S_OK;
     }
 
+    // The multiple-window tree callback: answering it is what makes the
+    // framework replay *every* XAML island's tree as "added" elements instead of
+    // reporting mutations only. Without it the taskbar islands that already
+    // existed when we connected never announce a `TaskbarFrame`, which is why
+    // only the primary taskbar could ever be claimed. It is safe here only
+    // because this object also answers `IAgileObject`: the crash that made an
+    // earlier build refuse this interface was the framework marshalling a
+    // non-agile callback (see `ComObj::AGILE_CALLBACK`).
+    if *requested == IID_IVISUAL_TREE_SERVICE_CALLBACK2 {
+        let cell = com_cell::<T>(this);
+        cell.ref_count().fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        unsafe { *out = this };
+        trace_query(requested, "multiple-window callback");
+        return S_OK;
+    }
+
     if !known {
         trace_query(requested, "E_NOINTERFACE");
         return E_NOINTERFACE;

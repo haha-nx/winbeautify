@@ -40,12 +40,19 @@ const BORDER_LOG_LIMIT: usize = 40;
 
 const SUPPORTED: &[windows::core::GUID] = &[
     com::IID_IVISUAL_TREE_SERVICE_CALLBACK,
-    // `IVisualTreeServiceCallback2` is deliberately *not* answered. Answering it
-    // switches the framework into its "multiple window support" path, which on
-    // this build calls a null function pointer inside Windows.UI.Xaml and the
-    // shell dies with FAST_FAIL_GUARD_ICALL_CHECK_FAILURE. The only thing
-    // Callback2 adds is `OnElementStateChanged`, which the reference TAP
-    // implements as a no-op, so nothing is lost by staying on the v1 callback.
+    // Answering the second callback puts the framework in its multiple-window
+    // mode, and that is what makes it replay every island's tree — including the
+    // taskbars that already existed when we connected, whose frames are
+    // otherwise never announced (measured: two `DesktopWindowXamlSource` and two
+    // `TaskbarFrame` "added" events within 130 ms of connecting, both taskbars
+    // claimed with no other trigger).
+    //
+    // It has to be agile to be safe: an earlier build answered this interface
+    // with a non-agile callback and the shell died in
+    // `FAST_FAIL_GUARD_ICALL_CHECK_FAILURE`, because the framework then marshals
+    // the callback and there is no registered proxy for this interface. See
+    // `ComObj::AGILE_CALLBACK`.
+    com::IID_IVISUAL_TREE_SERVICE_CALLBACK2,
 ];
 
 /// Keep the raw Win32 event handle alive without a wrapper type.
