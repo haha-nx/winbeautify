@@ -15,6 +15,12 @@
 //! modules — which is what restores the taskbar — and only then let the
 //! process exit.
 
+// Release builds are a GUI binary: without this the linker emits a console
+// subsystem image, and Windows puts a black console window on screen next to
+// the tray icon for as long as the daemon runs. Debug builds keep the console,
+// so `cargo run` still prints to the terminal it was launched from.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 // The app links against `windows` for the shell helpers, so a crate-root
 // module named `windows` would shadow it; `win` is the window manager.
 mod autostart;

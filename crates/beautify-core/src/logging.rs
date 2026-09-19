@@ -22,13 +22,6 @@ const QUIET: [&str; 8] = [
     "mio",
 ];
 
-/// Install the global subscriber.
-///
-///
-/// Console output is always on (the app is normally launched from Explorer, so
-/// this is harmless); the rotating file sink is opt-in because writing a log
-/// every few seconds would burn through SSD writes for no benefit on a healthy
-/// install.
 /// The default filter directives for `level`.
 pub fn directives(level: &str) -> String {
     let mut directives = level.to_string();
@@ -38,6 +31,13 @@ pub fn directives(level: &str) -> String {
     directives
 }
 
+/// Install the global subscriber.
+///
+/// The console layer is unconditional but only reaches a screen in debug builds,
+/// where the host keeps the console subsystem; the release binary is a GUI image
+/// with no console to write to, so `file_logging` is how a release build gets a
+/// log at all. The file sink stays opt-in because writing a log every few
+/// seconds would burn through SSD writes for no benefit on a healthy install.
 pub fn init(level: &str, to_file: bool) {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
