@@ -40,7 +40,9 @@ use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL;
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -52,18 +54,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    GetMessageW, IsZoomed, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, CW_USEDEFAULT,
-    HTCLIENT, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, MINMAXINFO, MSG, NCCALCSIZE_PARAMS, SWP_NOZORDER,
-    SW_SHOW, SW_SHOWMINIMIZED, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_DPICHANGED, WM_DESTROY,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE, WM_CHAR,
-    WNDCLASSEXW, WINDOW_EX_STYLE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
+    IsZoomed, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TranslateMessage, CW_USEDEFAULT,
+    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
+    HTTOPRIGHT, IDC_ARROW, IDC_HAND, MINMAXINFO, MSG, NCCALCSIZE_PARAMS, SWP_NOZORDER, SW_SHOW,
+    SW_SHOWMINIMIZED, WINDOW_EX_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SIZE,
+    WM_TIMER, WNDCLASSEXW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
 };
 
 use beautify_core::config::Config;
+use beautify_widget::scrollbar::ScrollDrag;
 
 use crate::access::{self, Value};
 use crate::controls;
@@ -91,6 +94,9 @@ const MIN_WIDTH: i32 = 620;
 const MIN_HEIGHT: i32 = 420;
 const DEFAULT_WIDTH: i32 = 880;
 const DEFAULT_HEIGHT: i32 = 620;
+
+/// The id of the timer that beats a scrollbar glide after a fast release.
+const SCROLL_TIMER_ID: usize = 1;
 
 /// Everything the window needs from the application.
 ///
@@ -254,8 +260,13 @@ enum Hit {
     Window(WindowButton),
     /// A sidebar entry, by section id.
     Section(&'static str),
-    /// A click on the scrollbar track, as a `0..1` fraction of it.
-    Scrollbar(f32),
+    /// A press on the scrollbar. `on_thumb` says whether it landed on the
+    /// thumb, which grabs and drags, or on the track, which jumps the thumb
+    /// to the press and then grabs it there.
+    Scrollbar {
+        y: f32,
+        on_thumb: bool,
+    },
     DropdownChoice {
         row: usize,
         value: &'static str,
@@ -292,6 +303,8 @@ struct Window {
     active: &'static Section,
     interaction: Interaction,
     scroll: f32,
+    /// The scrollbar thumb drag, and the glide a fast release starts.
+    scroll_drag: ScrollDrag,
     status: StatusText,
     /// Set while the left button is down on a slider.
     drag_row: Option<usize>,
@@ -314,6 +327,7 @@ impl Window {
             active: &SECTIONS[0],
             interaction: Interaction::default(),
             scroll: 0.0,
+            scroll_drag: ScrollDrag::default(),
             status: StatusText::default(),
             drag_row: None,
             tracking_leave: false,
@@ -446,6 +460,7 @@ impl Window {
             self.interaction.hover_window,
             self.interaction.dropdown_highlight,
             self.interaction.color_highlight,
+            self.interaction.hover_scrollbar,
         );
 
         // The title-bar buttons are above the page and belong to no row, so
@@ -492,6 +507,16 @@ impl Window {
         self.interaction.hover_part = part;
         self.interaction.hover_nav = nav;
 
+        // The scrollbar thumb lights up under the pointer like everything
+        // else does. It is outside the viewport, so the row search above can
+        // never have claimed it.
+        self.interaction.hover_scrollbar = inside
+            && window_button.is_none()
+            && self
+                .layout
+                .as_ref()
+                .is_some_and(|layout| layout.scroll_max > 0.0 && layout.scrollbar.contains(x, y));
+
         // Highlight whichever entry of an open dropdown is under the pointer.
         // This has to be part of the "did anything move" answer below, or the
         // highlight index changes with no repaint to show it — the highlight
@@ -531,6 +556,7 @@ impl Window {
                 self.interaction.hover_window,
                 self.interaction.dropdown_highlight,
                 self.interaction.color_highlight,
+                self.interaction.hover_scrollbar,
             )
     }
 
@@ -612,14 +638,21 @@ impl Window {
             return Hit::Section(item.section.id);
         }
 
-        // Scrollbar: a click on the track jumps proportionally.
-        if layout.scroll_max > 0.0 && layout.scrollbar.contains(x, y) {
-            let fraction = clamp(
-                (y - layout.viewport.top) / layout.viewport.height().max(1.0),
-                0.0,
-                1.0,
+        // Scrollbar: the thumb grabs and drags; the track jumps the thumb to
+        // the press and then grabs it there, which is what Windows does.
+        if layout.scroll_max > 0.0 {
+            let track = Rect::new(
+                layout.scrollbar.left,
+                layout.viewport.top,
+                layout.scrollbar.right,
+                layout.viewport.bottom,
             );
-            return Hit::Scrollbar(fraction);
+            if track.contains(x, y) {
+                return Hit::Scrollbar {
+                    y,
+                    on_thumb: layout.scrollbar.contains(x, y),
+                };
+            }
         }
 
         match self.row_at(x, y) {
@@ -638,11 +671,7 @@ impl Window {
                     self.switch_section(target);
                 }
             }
-            Hit::Scrollbar(fraction) => {
-                let max = self.layout.as_ref().map(|layout| layout.scroll_max).unwrap_or(0.0);
-                self.scroll = fraction * max;
-                self.repaint();
-            }
+            Hit::Scrollbar { y, on_thumb } => self.scrollbar_press(y, on_thumb),
             Hit::DropdownChoice { row, value } => {
                 self.interaction.open_dropdown = None;
                 self.write_value(row, Value::Text(value.to_string()));
@@ -679,10 +708,7 @@ impl Window {
     fn click_row(&mut self, row_index: usize, x: f32, y: f32) {
         // `Row` is `Copy` and the field is `'static`, so both come out of the
         // layout by value and the borrow ends here.
-        let Some((field, control)) = self
-            .row(row_index)
-            .map(|row| (row.field, row.control))
-        else {
+        let Some((field, control)) = self.row(row_index).map(|row| (row.field, row.control)) else {
             return;
         };
         let parts = controls::parts(field, control, &self.metrics);
@@ -783,6 +809,121 @@ impl Window {
         self.commit(config);
     }
 
+    /// A press on the scrollbar: grab the thumb, or jump it under the press
+    /// and grab it there.
+    ///
+    /// The grab is what makes dragging feel like dragging rather than like a
+    /// jump every move: the offset between the pointer and the thumb's top
+    /// edge is held for the whole drag, so the thumb never centres itself
+    /// under the hand.
+    fn scrollbar_press(&mut self, y: f32, on_thumb: bool) {
+        let Some((track_top, track_height, thumb_height, thumb_top, scroll_max)) =
+            self.layout.as_ref().and_then(|layout| {
+                (layout.scroll_max > 0.0).then_some((
+                    layout.viewport.top,
+                    layout.viewport.height(),
+                    layout.scrollbar.height(),
+                    if on_thumb {
+                        layout.scrollbar.top
+                    } else {
+                        (y - layout.scrollbar.height() * 0.5).clamp(
+                            layout.viewport.top,
+                            layout.viewport.bottom - layout.scrollbar.height(),
+                        )
+                    },
+                    layout.scroll_max,
+                ))
+            })
+        else {
+            return;
+        };
+        // Whatever a previous flick left moving stops: the hand is on the
+        // thumb now.
+        self.stop_scroll();
+        if !on_thumb {
+            self.scroll =
+                (thumb_top - track_top) / (track_height - thumb_height).max(1.0) * scroll_max;
+        }
+        self.scroll_drag.begin(y, thumb_top);
+        self.interaction.scrollbar_pressed = true;
+        unsafe {
+            let _ = SetCapture(self.hwnd);
+        }
+        self.repaint();
+    }
+
+    /// Follow a scrollbar drag to `y`.
+    ///
+    /// The offset the drag answers is already clamped to the content's range,
+    /// so following the pointer out of the track parks the page at whichever
+    /// end it ran into instead of overshooting it.
+    fn scrollbar_drag_to(&mut self, y: f32) {
+        let Some(layout) = self.layout.as_ref() else {
+            return;
+        };
+        if layout.scroll_max <= 0.0 {
+            return;
+        }
+        let (track_top, track_height, thumb_height, scroll_max) = (
+            layout.viewport.top,
+            layout.viewport.height(),
+            layout.scrollbar.height(),
+            layout.scroll_max,
+        );
+        let scroll = self
+            .scroll_drag
+            .drag_to(y, track_top, track_height, thumb_height, scroll_max);
+        self.scroll = scroll;
+        self.repaint();
+    }
+
+    /// Finish a scrollbar drag. A fast release hands its speed to the glide,
+    /// which runs from a timer until it runs out of speed or range.
+    fn end_scroll_drag(&mut self) {
+        if !self.scroll_drag.is_dragging() {
+            return;
+        }
+        self.interaction.scrollbar_pressed = false;
+        if self.scroll_drag.release() {
+            self.start_glide();
+        }
+        self.repaint();
+    }
+
+    /// Beat the glide from a timer. Each tick repaints while it moves.
+    fn start_glide(&mut self) {
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), SCROLL_TIMER_ID, 16, None);
+        }
+    }
+
+    /// Drop any scrollbar drag or glide, and its timer.
+    fn stop_scroll(&mut self) {
+        self.scroll_drag.stop();
+        self.interaction.scrollbar_pressed = false;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), SCROLL_TIMER_ID);
+        }
+    }
+
+    /// One beat of the glide.
+    fn scroll_glide_tick(&mut self) {
+        let max = self
+            .layout
+            .as_ref()
+            .map(|layout| layout.scroll_max)
+            .unwrap_or(0.0);
+        let mut scroll = self.scroll;
+        let moving = self.scroll_drag.tick(&mut scroll, max);
+        if (scroll - self.scroll).abs() > 0.01 {
+            self.scroll = scroll;
+            self.repaint();
+        }
+        if !moving {
+            self.stop_scroll();
+        }
+    }
+
     /// Switch the sidebar selection.
     fn switch_section(&mut self, section: &'static Section) {
         if self.active.id == section.id {
@@ -790,6 +931,7 @@ impl Window {
         }
         self.stop_recording();
         self.commit_edit();
+        self.stop_scroll();
         self.active = section;
         self.scroll = 0.0;
         self.interaction.open_dropdown = None;
@@ -899,7 +1041,10 @@ impl Window {
             .with(Modifier::Control, held(VK_CONTROL.0 as i32))
             .with(Modifier::Alt, held(VK_MENU.0 as i32))
             .with(Modifier::Shift, held(VK_SHIFT.0 as i32))
-            .with(Modifier::Win, held(VK_LWIN.0 as i32) || held(VK_RWIN.0 as i32));
+            .with(
+                Modifier::Win,
+                held(VK_LWIN.0 as i32) || held(VK_RWIN.0 as i32),
+            );
 
         let Some(row_index) = self.interaction.recording else {
             return;
@@ -957,9 +1102,7 @@ impl Window {
             }
             Kind::Number { min, max, .. } => match text.trim().parse::<f64>() {
                 // The config's own range, not the float `clamp` in `geom`.
-                Ok(number) => {
-                    Value::Integer(number.clamp(min as f64, max as f64).round() as i64)
-                }
+                Ok(number) => Value::Integer(number.clamp(min as f64, max as f64).round() as i64),
                 Err(_) => {
                     self.repaint();
                     return;
@@ -987,6 +1130,8 @@ impl Window {
 
     /// Scroll by a number of notches.
     fn scroll_by(&mut self, notches: f32) {
+        // The wheel takes over from any glide that is still running.
+        self.stop_scroll();
         let Some(layout) = self.layout.as_ref() else {
             return;
         };
@@ -1188,9 +1333,11 @@ impl Window {
                             .layout
                             .as_ref()
                             .map(|layout| {
-                                paint::window_buttons(layout, &self.metrics).iter().any(|button| {
-                                    button.rect.contains(point.x as f32, point.y as f32)
-                                })
+                                paint::window_buttons(layout, &self.metrics)
+                                    .iter()
+                                    .any(|button| {
+                                        button.rect.contains(point.x as f32, point.y as f32)
+                                    })
                             })
                             .unwrap_or(false);
                         if (point.y as f32) < titlebar_bottom && !on_button {
@@ -1208,7 +1355,8 @@ impl Window {
                 if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
                     let clickable = self.interaction.hover_part.is_some()
                         || self.interaction.hover_nav.is_some()
-                        || self.interaction.hover_window.is_some();
+                        || self.interaction.hover_window.is_some()
+                        || self.interaction.hover_scrollbar;
                     set_cursor(clickable);
                     return Some(LRESULT(1));
                 }
@@ -1260,7 +1408,9 @@ impl Window {
             WM_ERASEBKGND => Some(LRESULT(1)),
             WM_MOUSEMOVE => {
                 let (x, y) = point_of(lparam);
-                if self.drag_row.is_some() {
+                if self.scroll_drag.is_dragging() {
+                    self.scrollbar_drag_to(y);
+                } else if self.drag_row.is_some() {
                     self.drag_to(x);
                 } else if self.update_hover(x, y, true) {
                     self.repaint();
@@ -1295,6 +1445,7 @@ impl Window {
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
+                self.end_scroll_drag();
                 self.end_drag();
                 unsafe {
                     let _ = ReleaseCapture();
@@ -1303,10 +1454,20 @@ impl Window {
             }
             // Capture can be lost mid-drag — a system menu, another window
             // grabbing the mouse — and the button-up never arrives. The value
-            // the drag reached still has to be persisted.
+            // the drag reached still has to be persisted, and the scrollbar's
+            // drag still has to end.
             WM_CAPTURECHANGED => {
+                self.end_scroll_drag();
                 self.end_drag();
                 Some(LRESULT(0))
+            }
+            WM_TIMER => {
+                if wparam.0 == SCROLL_TIMER_ID {
+                    self.scroll_glide_tick();
+                    Some(LRESULT(0))
+                } else {
+                    None
+                }
             }
             WM_MOUSEWHEEL => {
                 let notches = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
@@ -1619,8 +1780,7 @@ mod tests {
         let mut count = 0;
         let mut previous = HWND::default();
         loop {
-            let next =
-                unsafe { FindWindowExW(None, Some(previous), CLASS_NAME, PCWSTR::null()) };
+            let next = unsafe { FindWindowExW(None, Some(previous), CLASS_NAME, PCWSTR::null()) };
             match next {
                 Ok(hwnd) if !hwnd.0.is_null() => {
                     count += 1;
@@ -1653,7 +1813,11 @@ mod tests {
         assert!(wait_for_open(&window, true), "the window never appeared");
         // Long enough for a second window, had one been started, to show up.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        assert_eq!(settings_windows(), 1, "a second settings window was created");
+        assert_eq!(
+            settings_windows(),
+            1,
+            "a second settings window was created"
+        );
 
         window.close();
         assert!(
@@ -1673,7 +1837,10 @@ mod tests {
 
     #[test]
     fn the_window_has_sane_limits() {
-        assert!(MIN_WIDTH > 400, "the page cannot lay out narrower than this");
+        assert!(
+            MIN_WIDTH > 400,
+            "the page cannot lay out narrower than this"
+        );
         assert!(MIN_HEIGHT > 300);
         assert!(DEFAULT_WIDTH > MIN_WIDTH && DEFAULT_HEIGHT > MIN_HEIGHT);
     }

@@ -21,6 +21,7 @@ pub mod canvas;
 pub mod images;
 pub mod layout;
 pub mod paint;
+pub mod scrollbar;
 pub mod state;
 pub mod surface;
 pub mod theme;
@@ -281,8 +282,7 @@ impl Module for WidgetModule {
     }
 
     fn is_enabled(&self, config: &Config) -> bool {
-        config.widget.enabled
-            && config.any_widget_source()
+        config.widget.enabled && config.any_widget_source()
     }
 
     fn start(&self, ctx: ModuleContext) -> ModuleResult {

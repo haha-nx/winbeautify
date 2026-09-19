@@ -21,44 +21,48 @@ use std::sync::Arc;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT_NORMAL;
-use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
-use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMSBT_TRANSIENTWINDOW, DWMWCP_ROUND,
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMSBT_TRANSIENTWINDOW,
+    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
+use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
     GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
 };
 use windows::Win32::UI::Input::Ime::{
     ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow, ImmSetCompositionWindow,
-    CANDIDATEFORM, COMPOSITIONFORM, CFS_CANDIDATEPOS, CFS_POINT,
+    CANDIDATEFORM, CFS_CANDIDATEPOS, CFS_POINT, COMPOSITIONFORM,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_ESCAPE, VK_RETURN,
-    VK_UP,
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_DOWN, VK_ESCAPE,
+    VK_RETURN, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, HWND_TOPMOST,
-    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetWindowPos,
-    ShowWindow, TranslateMessage, HTCLIENT, IDC_ARROW, IDC_HAND, IDC_IBEAM, MSG, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW,
-    SW_HIDE, SW_SHOW, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_PAINT,
-    WM_SETCURSOR, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, KillTimer,
+    LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer,
+    SetWindowPos, ShowWindow, TranslateMessage, HTCLIENT, HWND_TOPMOST, IDC_ARROW, IDC_HAND,
+    IDC_IBEAM, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOW, WM_ACTIVATE,
+    WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_PAINT, WM_SETCURSOR, WM_TIMER,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::layout::{self, FooterAction, Hit, Metrics, RowTarget, Scene, Segment};
 use crate::paint::{Icon, Interaction, Painter, Palette};
 use crate::{ClipFilter, ClipRow, Host, Tab, TodoPage, TodoRow};
+use beautify_widget::scrollbar::ScrollDrag;
 
 /// Posted to make the panel redraw.
 pub const WM_APP_REFRESH: u32 = WM_APP + 91;
 /// Posted to take the panel down from another thread.
 pub const WM_APP_HIDE: u32 = WM_APP + 92;
+
+/// The id of the timer that beats a scrollbar glide after a fast release.
+const SCROLL_TIMER_ID: usize = 1;
 
 /// `WM_MOUSELEAVE` from `winuser.h`.
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -111,7 +115,15 @@ impl FlyoutWindow {
     pub fn show(&self, x: i32, y: i32, width: i32, height: i32) {
         if let Some(hwnd) = self.handle() {
             unsafe {
-                let _ = SetWindowPos(hwnd, None, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
                 let _ = ShowWindow(hwnd, SW_SHOW);
                 let _ = PostMessageW(Some(hwnd), WM_APP_REFRESH, WPARAM(0), LPARAM(0));
             }
@@ -183,6 +195,8 @@ struct Panel {
     /// The task whose title is being edited in place, with the text so far.
     editing_todo: Option<(i64, String)>,
     scroll: f32,
+    /// The scrollbar thumb drag, and the glide a fast release starts.
+    scroll_drag: ScrollDrag,
     /// The last frame's rectangles, for hit testing.
     scene: Option<Scene>,
     interaction: Interaction,
@@ -212,6 +226,7 @@ impl Panel {
             field_focused: false,
             editing_todo: None,
             scroll: 0.0,
+            scroll_drag: ScrollDrag::default(),
             scene: None,
             interaction: Interaction::default(),
             tracking_leave: false,
@@ -337,11 +352,7 @@ impl Panel {
         if scene.field.contains(x, y) {
             return Hit::Field;
         }
-        if scene
-            .segments
-            .iter()
-            .any(|(_, rect)| rect.contains(x, y))
-        {
+        if scene.segments.iter().any(|(_, rect)| rect.contains(x, y)) {
             let (segment, _) = scene
                 .segments
                 .iter()
@@ -355,9 +366,22 @@ impl Panel {
         {
             return Hit::FooterButton;
         }
-        if scene.scroll_max > 0.0 && scene.scrollbar.contains(x, y) {
-            let fraction = ((y - scene.list.top) / scene.list.height().max(1.0)).clamp(0.0, 1.0);
-            return Hit::Scrollbar(fraction);
+        // The scrollbar lives over the right edge of the list, so it is asked
+        // before the rows: the thumb grabs and drags, and the track jumps the
+        // thumb to the press and then grabs it there.
+        if scene.scroll_max > 0.0 {
+            let track = beautify_widget::layout::Rect::new(
+                scene.scrollbar.left,
+                scene.list.top,
+                scene.scrollbar.right,
+                scene.list.bottom,
+            );
+            if track.contains(x, y) {
+                return Hit::Scrollbar {
+                    y,
+                    on_thumb: scene.scrollbar.contains(x, y),
+                };
+            }
         }
         match scene.row_at(x, y) {
             Some(row) => {
@@ -395,12 +419,7 @@ impl Panel {
                 self.place_ime();
                 self.repaint();
             }
-            Hit::Scrollbar(fraction) => {
-                if let Some(scene) = self.scene.as_ref() {
-                    self.scroll = fraction * scene.scroll_max;
-                }
-                self.refresh();
-            }
+            Hit::Scrollbar { y, on_thumb } => self.scrollbar_press(y, on_thumb),
             Hit::Segment(segment) => self.select_segment(segment),
             Hit::FooterButton => {
                 let action = self
@@ -500,10 +519,12 @@ impl Panel {
                 self.filter = filter;
                 // The list is a different list now, so it starts at the top.
                 self.scroll = 0.0;
+                self.stop_scroll();
             }
             Segment::Todo(page) if self.page != page => {
                 self.page = page;
                 self.scroll = 0.0;
+                self.stop_scroll();
             }
             _ => return,
         }
@@ -524,6 +545,7 @@ impl Panel {
         self.field_focused = false;
         self.interaction.editing = false;
         self.scroll = 0.0;
+        self.stop_scroll();
         self.refresh();
     }
 
@@ -555,6 +577,9 @@ impl Panel {
     }
 
     fn hide(&mut self) {
+        // A glide ticking into a hidden list is work nobody sees; the list
+        // starts where it stopped next time the panel opens.
+        self.stop_scroll();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
@@ -571,6 +596,7 @@ impl Panel {
             self.interaction.hover_footer,
             self.interaction.hover_segment,
             self.interaction.hover_checkbox,
+            self.interaction.hover_scrollbar,
         );
         let hit = if inside {
             self.hit_test(x, y)
@@ -600,6 +626,9 @@ impl Panel {
             Hit::Segment(segment) => Some(segment),
             _ => None,
         };
+        // The thumb lights up under the pointer, the same hint that it is a
+        // handle the rest of the panel gives its targets.
+        self.interaction.hover_scrollbar = matches!(hit, Hit::Scrollbar { on_thumb: true, .. });
 
         previous
             != (
@@ -610,11 +639,14 @@ impl Panel {
                 self.interaction.hover_footer,
                 self.interaction.hover_segment,
                 self.interaction.hover_checkbox,
+                self.interaction.hover_scrollbar,
             )
     }
 
     /// Scroll by a number of notches.
     fn scroll_by(&mut self, notches: f32) {
+        // The wheel takes over from any glide that is still running.
+        self.stop_scroll();
         let Some(scene) = self.scene.as_ref() else {
             return;
         };
@@ -632,6 +664,119 @@ impl Panel {
         // Two rows a notch: one is too slow to be worth a wheel.
         self.scroll = (self.scroll - notches * step * 2.0).clamp(0.0, max);
         self.refresh();
+    }
+
+    /// A press on the scrollbar: grab the thumb, or jump it under the press
+    /// and grab it there.
+    ///
+    /// The grab is what makes dragging feel like dragging rather than like a
+    /// jump every move: the offset between the pointer and the thumb's top
+    /// edge is held for the whole drag, so the thumb never centres itself
+    /// under the hand.
+    fn scrollbar_press(&mut self, y: f32, on_thumb: bool) {
+        let Some((track_top, track_height, thumb_height, thumb_top, scroll_max)) =
+            self.scene.as_ref().and_then(|scene| {
+                (scene.scroll_max > 0.0).then_some((
+                    scene.list.top,
+                    scene.list.height(),
+                    scene.scrollbar.height(),
+                    if on_thumb {
+                        scene.scrollbar.top
+                    } else {
+                        (y - scene.scrollbar.height() * 0.5)
+                            .clamp(scene.list.top, scene.list.bottom - scene.scrollbar.height())
+                    },
+                    scene.scroll_max,
+                ))
+            })
+        else {
+            return;
+        };
+        // Whatever a previous flick left moving stops: the hand is on the
+        // thumb now.
+        self.stop_scroll();
+        if !on_thumb {
+            self.scroll =
+                (thumb_top - track_top) / (track_height - thumb_height).max(1.0) * scroll_max;
+        }
+        self.scroll_drag.begin(y, thumb_top);
+        self.interaction.scrollbar_pressed = true;
+        unsafe {
+            let _ = SetCapture(self.hwnd);
+        }
+        self.refresh();
+    }
+
+    /// Follow a scrollbar drag to `y`.
+    ///
+    /// The offset the drag answers is already clamped to the list's range, so
+    /// following the pointer out of the track parks the list at whichever end
+    /// it ran into instead of overshooting it.
+    fn scrollbar_drag_to(&mut self, y: f32) {
+        let Some(scene) = self.scene.as_ref() else {
+            return;
+        };
+        if scene.scroll_max <= 0.0 {
+            return;
+        }
+        let (track_top, track_height, thumb_height, scroll_max) = (
+            scene.list.top,
+            scene.list.height(),
+            scene.scrollbar.height(),
+            scene.scroll_max,
+        );
+        let scroll = self
+            .scroll_drag
+            .drag_to(y, track_top, track_height, thumb_height, scroll_max);
+        self.scroll = scroll;
+        self.refresh();
+    }
+
+    /// Finish a scrollbar drag. A fast release hands its speed to the glide,
+    /// which runs from a timer until it runs out of speed or range.
+    fn end_scroll_drag(&mut self) {
+        if !self.scroll_drag.is_dragging() {
+            return;
+        }
+        self.interaction.scrollbar_pressed = false;
+        if self.scroll_drag.release() {
+            self.start_glide();
+        }
+        self.refresh();
+    }
+
+    /// Beat the glide from a timer. Each tick repaints while it moves.
+    fn start_glide(&mut self) {
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), SCROLL_TIMER_ID, 16, None);
+        }
+    }
+
+    /// Drop any scrollbar drag or glide, and its timer.
+    fn stop_scroll(&mut self) {
+        self.scroll_drag.stop();
+        self.interaction.scrollbar_pressed = false;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), SCROLL_TIMER_ID);
+        }
+    }
+
+    /// One beat of the glide.
+    fn scroll_glide_tick(&mut self) {
+        let max = self
+            .scene
+            .as_ref()
+            .map(|scene| scene.scroll_max)
+            .unwrap_or(0.0);
+        let mut scroll = self.scroll;
+        let moving = self.scroll_drag.tick(&mut scroll, max);
+        if (scroll - self.scroll).abs() > 0.01 {
+            self.scroll = scroll;
+            self.refresh();
+        }
+        if !moving {
+            self.stop_scroll();
+        }
     }
 
     /// A key press that is not text.
@@ -804,7 +949,9 @@ impl Panel {
             windows::Win32::UI::WindowsAndMessaging::WM_ERASEBKGND => Some(LRESULT(1)),
             WM_MOUSEMOVE => {
                 let (x, y) = point_of(lparam);
-                if self.update_hover(x, y, true) {
+                if self.scroll_drag.is_dragging() {
+                    self.scrollbar_drag_to(y);
+                } else if self.update_hover(x, y, true) {
                     self.repaint();
                 }
                 if !self.tracking_leave {
@@ -836,8 +983,24 @@ impl Panel {
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
+                self.end_scroll_drag();
                 let _ = unsafe { ReleaseCapture() };
                 Some(LRESULT(0))
+            }
+            // Capture can be lost mid-drag — the panel deactivating, another
+            // window taking the mouse — and the button-up never arrives. The
+            // drag ends here instead, glide or no.
+            WM_CAPTURECHANGED => {
+                self.end_scroll_drag();
+                Some(LRESULT(0))
+            }
+            WM_TIMER => {
+                if wparam.0 == SCROLL_TIMER_ID {
+                    self.scroll_glide_tick();
+                    Some(LRESULT(0))
+                } else {
+                    None
+                }
             }
             WM_MOUSEWHEEL => {
                 let notches = ((wparam.0 >> 16) & 0xFFFF) as i16 as f32 / 120.0;
@@ -868,6 +1031,7 @@ impl Panel {
                     || self.interaction.hover_footer
                     || self.interaction.hover_segment.is_some()
                     || self.interaction.hover_checkbox.is_some()
+                    || self.interaction.hover_scrollbar
                 {
                     IDC_HAND
                 } else {
@@ -980,7 +1144,15 @@ fn run(
             cyBottomHeight: -1,
         };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, width, height, SWP_SHOWWINDOW);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            width,
+            height,
+            SWP_SHOWWINDOW,
+        );
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
     let mut message = MSG::default();

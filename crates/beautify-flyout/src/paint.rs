@@ -8,8 +8,8 @@ use windows::core::Result;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_U;
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1Layer, ID2D1SolidColorBrush,
-    D2D1CreateFactory, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1Layer,
+    ID2D1SolidColorBrush, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
 };
 use windows::Win32::Graphics::DirectWrite::{
@@ -62,6 +62,10 @@ pub struct Interaction {
     pub hover_segment: Option<Segment>,
     /// True while the pointer is over the check box of a task row.
     pub hover_checkbox: Option<usize>,
+    /// The pointer is over the scrollbar thumb.
+    pub hover_scrollbar: bool,
+    /// The scrollbar thumb is being dragged.
+    pub scrollbar_pressed: bool,
     /// The field has focus and is being typed into.
     pub editing: bool,
     pub editing_text: String,
@@ -195,7 +199,10 @@ impl Painter {
             pixelSize: D2D_SIZE_U { width, height },
             presentOptions: D2D1_PRESENT_OPTIONS_NONE,
         };
-        let target = unsafe { self.factory.CreateHwndRenderTarget(&properties, &hwnd_properties)? };
+        let target = unsafe {
+            self.factory
+                .CreateHwndRenderTarget(&properties, &hwnd_properties)?
+        };
         let brush = unsafe { target.CreateSolidColorBrush(&Rgba::TRANSPARENT.to_d2d(), None)? };
         self.target = Some(target);
         self.brush = Some(brush);
@@ -293,16 +300,14 @@ impl Painter {
                     LABEL_WEIGHT,
                     DWRITE_TEXT_ALIGNMENT_CENTER,
                 )?;
-                let padded = scene
-                    .list
-                    .inset_by(metrics.padding(), metrics.padding());
+                let padded = scene.list.inset_by(metrics.padding(), metrics.padding());
                 self.text_in(canvas, padded, empty_text, &format, palette.text_faint);
             }
             Ok::<(), windows::core::Error>(())
         })?;
 
         self.draw_footer(canvas, scene, metrics, palette, interaction, stats);
-        self.draw_scrollbar(canvas, scene, palette);
+        self.draw_scrollbar(canvas, scene, metrics, palette, interaction);
         Ok(())
     }
 
@@ -328,7 +333,11 @@ impl Painter {
             } else if interaction.hover_tab == Some(*tab) {
                 canvas.fill_rounded(*rect, metrics.px(6.0), palette.hover);
             }
-            let colour = if active { palette.accent } else { palette.text_dim };
+            let colour = if active {
+                palette.accent
+            } else {
+                palette.text_dim
+            };
             self.text_in(canvas, *rect, tab.label(), &format, colour);
         }
         // The close button, with the same cross as the settings title bar.
@@ -522,7 +531,14 @@ impl Painter {
                 // something to use.
                 _ => palette.text_faint,
             };
-            let _ = self.draw_icon(canvas, button.icon, button.rect, colour, metrics, button.active);
+            let _ = self.draw_icon(
+                canvas,
+                button.icon,
+                button.rect,
+                colour,
+                metrics,
+                button.active,
+            );
         }
     }
 
@@ -544,10 +560,7 @@ impl Painter {
             // A tick, not just a filled box: "done" has to be readable at a
             // glance down a list.
             let tick = [
-                (
-                    box_rect.left + box_rect.width() * 0.24,
-                    box_rect.center_y(),
-                ),
+                (box_rect.left + box_rect.width() * 0.24, box_rect.center_y()),
                 (
                     box_rect.left + box_rect.width() * 0.44,
                     box_rect.bottom - box_rect.height() * 0.28,
@@ -589,7 +602,9 @@ impl Painter {
             let fitted = fit_into((size.width, size.height), bounds);
             // The image is letterboxed inside the box and clipped to it, so a
             // portrait screenshot reads as a picture rather than a smear.
-            let _ = canvas.clipped(bounds, || self.draw_bitmap(canvas, &bitmap, fitted, bounds, radius));
+            let _ = canvas.clipped(bounds, || {
+                self.draw_bitmap(canvas, &bitmap, fitted, bounds, radius)
+            });
         }
         canvas.stroke_rounded(bounds, radius, palette.control_border, 1.0);
     }
@@ -617,7 +632,11 @@ impl Painter {
                 } else {
                     (
                         task.map(|task| task.title.as_str()).unwrap_or_default(),
-                        if done { palette.text_faint } else { palette.text },
+                        if done {
+                            palette.text_faint
+                        } else {
+                            palette.text
+                        },
                     )
                 };
                 self.text_block(
@@ -726,7 +745,14 @@ impl Painter {
     ) {
         canvas.fill_rounded(rect, metrics.px(5.0), palette.control);
         canvas.stroke_rounded(rect, metrics.px(5.0), palette.control_border, 1.0);
-        let _ = self.draw_icon(canvas, Icon::Kind(kind), rect, palette.text_dim, metrics, false);
+        let _ = self.draw_icon(
+            canvas,
+            Icon::Kind(kind),
+            rect,
+            palette.text_dim,
+            metrics,
+            false,
+        );
     }
 
     fn draw_footer(
@@ -782,14 +808,34 @@ impl Painter {
         }
     }
 
-    fn draw_scrollbar(&self, canvas: &Canvas<'_>, scene: &Scene, palette: &Palette) {
+    fn draw_scrollbar(
+        &self,
+        canvas: &Canvas<'_>,
+        scene: &Scene,
+        metrics: &Metrics,
+        palette: &Palette,
+        interaction: &Interaction,
+    ) {
         if scene.scroll_max <= 0.0 {
             return;
         }
+        // Dragging lights the thumb up most and swells it a little — wider
+        // only to the left, because the right edge is the window's. Hovering
+        // lights it up less, hinting that the thumb is a handle; the wheel
+        // and the track keep the old, dimmest look.
+        let (alpha, swell) = if interaction.scrollbar_pressed {
+            (0.95, metrics.px(1.5))
+        } else if interaction.hover_scrollbar {
+            (0.75, 0.0)
+        } else {
+            (0.5, 0.0)
+        };
+        let mut thumb = scene.scrollbar;
+        thumb.left -= swell;
         canvas.fill_rounded(
-            scene.scrollbar,
-            scene.scrollbar.width() * 0.5,
-            palette.text_faint.with_alpha(0.5),
+            thumb,
+            thumb.width() * 0.5,
+            palette.text_faint.with_alpha(alpha),
         );
     }
 
@@ -935,7 +981,10 @@ impl Painter {
                     &self.factory,
                     &[
                         (inner.left + bar, inner.bottom - bar),
-                        (inner.left + inner.width() * 0.44, inner.top + inner.height() * 0.46),
+                        (
+                            inner.left + inner.width() * 0.44,
+                            inner.top + inner.height() * 0.46,
+                        ),
                         (inner.right - bar, inner.bottom - bar),
                     ],
                     (0.0, 0.0),
@@ -996,9 +1045,8 @@ impl Painter {
         let target = self.target.clone()?;
         let bytes = std::fs::read(path).ok()?;
         // Stored clipboard images are `.bmp`, which WIC decodes directly.
-        let bitmap = unsafe {
-            beautify_widget::images::bitmap_from_bytes(&target, &self.wic, &bytes)
-        }?;
+        let bitmap =
+            unsafe { beautify_widget::images::bitmap_from_bytes(&target, &self.wic, &bytes) }?;
         if self.thumbnails.len() >= THUMBNAIL_CACHE {
             self.thumbnails.remove(0);
         }
@@ -1081,8 +1129,14 @@ mod tests {
         let box_rect = Rect::new(0.0, 0.0, 40.0, 40.0);
         let fitted = fit_into((400.0, 200.0), box_rect);
         assert!((fitted.width() - 40.0).abs() < 0.01);
-        assert!((fitted.height() - 20.0).abs() < 0.01, "the aspect ratio is kept");
-        assert!((fitted.center_y() - box_rect.center_y()).abs() < 0.01, "centred");
+        assert!(
+            (fitted.height() - 20.0).abs() < 0.01,
+            "the aspect ratio is kept"
+        );
+        assert!(
+            (fitted.center_y() - box_rect.center_y()).abs() < 0.01,
+            "centred"
+        );
         // A tall image fills the height instead.
         let tall = fit_into((100.0, 400.0), box_rect);
         assert!((tall.height() - 40.0).abs() < 0.01);

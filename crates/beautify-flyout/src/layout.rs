@@ -369,7 +369,10 @@ pub enum Hit {
     /// One of the segmented buttons under the field.
     Segment(Segment),
     FooterButton,
-    Scrollbar(f32),
+    /// A press on the scrollbar. `on_thumb` says whether it landed on the
+    /// thumb, which grabs and drags, or on the track, which jumps the thumb
+    /// to the press and then grabs it there.
+    Scrollbar { y: f32, on_thumb: bool },
     /// Empty space: commits an edit and nothing else.
     Nothing,
 }

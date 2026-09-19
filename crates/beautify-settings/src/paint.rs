@@ -69,6 +69,10 @@ pub struct Interaction {
     pub hover_nav: Option<usize>,
     /// The title-bar button under the pointer, if any.
     pub hover_window: Option<WindowButton>,
+    /// The pointer is over the scrollbar thumb.
+    pub hover_scrollbar: bool,
+    /// The scrollbar thumb is being dragged.
+    pub scrollbar_pressed: bool,
 }
 
 /// Live values the status rows show.
@@ -158,7 +162,10 @@ impl Painter {
             pixelSize: D2D_SIZE_U { width, height },
             presentOptions: D2D1_PRESENT_OPTIONS_NONE,
         };
-        let target = unsafe { self.factory.CreateHwndRenderTarget(&properties, &hwnd_properties)? };
+        let target = unsafe {
+            self.factory
+                .CreateHwndRenderTarget(&properties, &hwnd_properties)?
+        };
         let brush = unsafe { target.CreateSolidColorBrush(&Rgba::TRANSPARENT.to_d2d(), None)? };
         self.target = Some(target);
         self.brush = Some(brush);
@@ -190,7 +197,15 @@ impl Painter {
         // silently discarded. Getting this wrong produces a window that is
         // created, painted and completely blank.
         canvas.begin();
-        let drawn = self.draw_frame(&canvas, layout, metrics, palette, config, interaction, status);
+        let drawn = self.draw_frame(
+            &canvas,
+            layout,
+            metrics,
+            palette,
+            config,
+            interaction,
+            status,
+        );
         // `EndDraw` runs even when a shape failed: leaving the target in a
         // drawing state makes it refuse every later frame.
         let presented = canvas.end();
@@ -221,10 +236,18 @@ impl Painter {
         // The page is clipped to its viewport so a row scrolling up disappears
         // under the header instead of over it.
         canvas.clipped(layout.viewport, || {
-            self.draw_content(canvas, layout, metrics, palette, config, interaction, status)
+            self.draw_content(
+                canvas,
+                layout,
+                metrics,
+                palette,
+                config,
+                interaction,
+                status,
+            )
         })?;
 
-        self.draw_scrollbar(canvas, layout, metrics, palette)?;
+        self.draw_scrollbar(canvas, layout, metrics, palette, interaction)?;
 
         // The dropdown floats above everything, including the scrollbar.
         if let Some(row) = layout
@@ -281,12 +304,7 @@ impl Painter {
     /// wider than its rectangle is cut mid-glyph. Every single-line call site
     /// goes through here (or [`Self::fitted_start`]) so what the user sees is
     /// an ellipsis instead of half a character.
-    fn fitted(
-        &self,
-        text: &str,
-        format: &IDWriteTextFormat,
-        max_width: f32,
-    ) -> String {
+    fn fitted(&self, text: &str, format: &IDWriteTextFormat, max_width: f32) -> String {
         if max_width <= 0.0 {
             return String::new();
         }
@@ -295,12 +313,7 @@ impl Painter {
 
     /// [`Self::fitted`], but keeps the tail of the text — the right end is the
     /// part that identifies a path.
-    fn fitted_start(
-        &self,
-        text: &str,
-        format: &IDWriteTextFormat,
-        max_width: f32,
-    ) -> String {
+    fn fitted_start(&self, text: &str, format: &IDWriteTextFormat, max_width: f32) -> String {
         if max_width <= 0.0 {
             return String::new();
         }
@@ -343,7 +356,10 @@ impl Painter {
         if typing.is_none() {
             return;
         }
-        let typed = self.text.measure(&text, format, inner.width()).min(inner.width());
+        let typed = self
+            .text
+            .measure(&text, format, inner.width())
+            .min(inner.width());
         let x = (inner.left + typed).min(inner.right - metrics.px(1.0));
         canvas.fill_rect(
             Rect::new(
@@ -458,11 +474,7 @@ impl Painter {
                 // Two strokes, each a thin rotated bar. A cross made of two
                 // rectangles reads correctly even at 10 px.
                 for tilt in [-1.0f32, 1.0] {
-                    self.polygon(
-                        canvas,
-                        &bar_points(centre, arm, thickness, tilt),
-                        ink,
-                    )?;
+                    self.polygon(canvas, &bar_points(centre, arm, thickness, tilt), ink)?;
                 }
             }
         }
@@ -480,7 +492,9 @@ impl Painter {
         interaction: &Interaction,
         status: &StatusText,
     ) -> Result<()> {
-        let title_format = self.text.format(metrics.section_title_size(), TITLE_WEIGHT)?;
+        let title_format = self
+            .text
+            .format(metrics.section_title_size(), TITLE_WEIGHT)?;
         let hint_format = self.text.format(metrics.description_size(), LABEL_WEIGHT)?;
         let label_format = self.text.format(metrics.label_size(), LABEL_WEIGHT)?;
         let small_format = self.text.format(metrics.hint_size(), LABEL_WEIGHT)?;
@@ -488,12 +502,16 @@ impl Painter {
         // (labels, values, list entries) is left-aligned. Read-only values are
         // right-aligned: they end where every other control ends, and their
         // interesting half (a file name, a build number) is at the right.
-        let box_format = self
-            .text
-            .format_aligned(metrics.hint_size(), LABEL_WEIGHT, DWRITE_TEXT_ALIGNMENT_CENTER)?;
-        let right_format = self
-            .text
-            .format_aligned(metrics.hint_size(), LABEL_WEIGHT, DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+        let box_format = self.text.format_aligned(
+            metrics.hint_size(),
+            LABEL_WEIGHT,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+        )?;
+        let right_format = self.text.format_aligned(
+            metrics.hint_size(),
+            LABEL_WEIGHT,
+            DWRITE_TEXT_ALIGNMENT_TRAILING,
+        )?;
 
         // The section's own heading, where the layout put it — which is a little
         // below the top of the page, not on it. This used to be recomputed here
@@ -639,11 +657,7 @@ impl Painter {
                 let rect = parts.boxes[0];
                 let on = value.as_ref().and_then(|v| v.as_bool()).unwrap_or(false);
                 let radius = rect.height() * 0.5;
-                let track = if on {
-                    palette.accent
-                } else {
-                    palette.control
-                };
+                let track = if on { palette.accent } else { palette.control };
                 canvas.fill_rounded(rect, radius, track);
                 if !on {
                     canvas.stroke_rounded(rect, radius, palette.control_border, 1.0);
@@ -704,13 +718,7 @@ impl Painter {
                 let readout = parts.boxes[0];
                 let readout_rect = readout.inset_by(metrics.px(6.0), 0.0);
                 let text = self.fitted(&slider.format.render(current), small, readout_rect.width());
-                self.text_in(
-                    canvas,
-                    readout_rect,
-                    &text,
-                    small,
-                    palette.text_dim,
-                );
+                self.text_in(canvas, readout_rect, &text, small, palette.text_dim);
             }
             Kind::Select(choices) => {
                 let rect = parts.boxes[0];
@@ -820,12 +828,8 @@ impl Painter {
                 // itself is shortened with an ellipsis when even the full slot
                 // cannot hold it.
                 let text = self.fitted(text, small, (slot.width() - metrics.px(20.0)).max(0.0));
-                let width = (self
-                    .text
-                    .measure(&text, small, 4096.0)
-                    .max(0.0)
-                    + metrics.px(20.0))
-                .min(slot.width());
+                let width = (self.text.measure(&text, small, 4096.0).max(0.0) + metrics.px(20.0))
+                    .min(slot.width());
                 let pill = Rect::new(slot.left, slot.top, slot.left + width, slot.bottom);
                 canvas.fill_rounded(pill, pill.height() * 0.5, colour.with_alpha(0.16));
                 self.text_in(canvas, pill, &text, centred, colour);
@@ -946,12 +950,29 @@ impl Painter {
         layout: &Layout,
         metrics: &Metrics,
         palette: &Palette,
+        interaction: &Interaction,
     ) -> Result<()> {
         if layout.scroll_max <= 0.0 {
             return Ok(());
         }
-        let _ = metrics;
-        canvas.fill_rounded(layout.scrollbar, layout.scrollbar.width() * 0.5, palette.text_faint.with_alpha(0.5));
+        // Dragging lights the thumb up most and swells it a little — wider
+        // only to the left, because the right edge is the window's. Hovering
+        // lights it up less, hinting that the thumb is a handle; the wheel
+        // and the track keep the old, dimmest look.
+        let (alpha, swell) = if interaction.scrollbar_pressed {
+            (0.95, metrics.px(2.0))
+        } else if interaction.hover_scrollbar {
+            (0.75, 0.0)
+        } else {
+            (0.5, 0.0)
+        };
+        let mut thumb = layout.scrollbar;
+        thumb.left -= swell;
+        canvas.fill_rounded(
+            thumb,
+            thumb.width() * 0.5,
+            palette.text_faint.with_alpha(alpha),
+        );
         Ok(())
     }
 
@@ -1036,11 +1057,7 @@ impl Painter {
 ///
 /// Placed below the box, or above it when there is not enough room — the same
 /// flip the widget bar's flyout does.
-pub fn dropdown_rect(
-    row: &Row,
-    entries: usize,
-    metrics: &Metrics,
-) -> Option<Rect> {
+pub fn dropdown_rect(row: &Row, entries: usize, metrics: &Metrics) -> Option<Rect> {
     let height = entries as f32 * metrics.dropdown_row_height() + metrics.px(6.0);
     if height <= 0.0 {
         return None;
@@ -1049,7 +1066,11 @@ pub fn dropdown_rect(
     let above = row.control.top - metrics.px(2.0) - height;
     // The window is not known here, so "above" is only chosen when the row is
     // low enough that the list would clearly not fit; the window clamps later.
-    let top = if row.control.top > height { above } else { below };
+    let top = if row.control.top > height {
+        above
+    } else {
+        below
+    };
     Some(Rect::new(
         row.control.left,
         top,
@@ -1178,7 +1199,12 @@ pub fn window_buttons(layout: &Layout, metrics: &Metrics) -> Vec<PositionedButto
         },
         PositionedButton {
             kind: WindowButton::Minimize,
-            rect: Rect::new(right - size * 2.0 - gap, top, right - size - gap, top + size),
+            rect: Rect::new(
+                right - size * 2.0 - gap,
+                top,
+                right - size - gap,
+                top + size,
+            ),
         },
     ]
 }
@@ -1240,7 +1266,10 @@ mod tests {
             .iter()
             .find(|b| b.kind == WindowButton::Minimize)
             .unwrap();
-        assert!(close.rect.left > minimize.rect.right, "close is at the corner");
+        assert!(
+            close.rect.left > minimize.rect.right,
+            "close is at the corner"
+        );
         assert!(close.rect.right <= layout.titlebar.right);
         assert!(minimize.rect.left > 0.0);
     }

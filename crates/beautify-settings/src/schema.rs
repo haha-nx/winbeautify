@@ -675,10 +675,10 @@ const TASKBAR: &[Card] = &[
                 ),
                 taskbar_on,
             ),
-            when(
-                switch("taskbar.apply_to_secondary", "应用到副屏任务栏"),
-                taskbar_on,
-            ),
+            // when(
+            //     switch("taskbar.apply_to_secondary", "应用到副屏任务栏"),
+            //     taskbar_on,
+            // ),
         ],
     },
     Card {
