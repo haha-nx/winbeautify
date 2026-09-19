@@ -42,6 +42,11 @@ const MAX_TICK: Duration = Duration::from_millis(100);
 /// Moves closer together than this are one sample, not two. A `dt` of zero
 /// would be divided by.
 const MIN_SAMPLE: Duration = Duration::from_millis(1);
+/// The longest pause the drag still calls a flick. No mouse moves arrive
+/// while the hand rests, so the velocity estimate cannot decay on its own —
+/// held longer than this, the release is a stop and the next move is a new
+/// measurement, not a continuation of the old speed.
+const STATIONARY: Duration = Duration::from_millis(120);
 
 /// Whether the scrollbar thumb is being dragged, and how a release should
 /// glide.
@@ -119,13 +124,29 @@ impl ScrollDrag {
 
     /// Let go of the thumb. Answers whether a glide starts — the caller then
     /// beats [`ScrollDrag::tick`] from a timer until it answers `false`.
+    ///
+    /// A hand that was resting — no move for [`STATIONARY`] — releases into a
+    /// stop, not a glide. The estimate only moves when the pointer does, so
+    /// the speed of the last move would otherwise survive an indefinite
+    /// pause and fling the list the moment the button came up.
     pub fn release(&mut self) -> bool {
+        self.release_at(Instant::now())
+    }
+
+    /// [`ScrollDrag::release`] at a synthetic time, so tests do not sleep.
+    fn release_at(&mut self, now: Instant) -> bool {
         self.dragging = false;
+        let resting = self
+            .last_sample
+            .is_some_and(|last| now.duration_since(last) >= STATIONARY);
         self.last_sample = None;
+        if resting {
+            self.velocity = 0.0;
+        }
         self.gliding = self.velocity.is_finite() && self.velocity.abs() >= STOP_SPEED;
         if self.gliding {
             self.velocity = self.velocity.clamp(-MAX_SPEED, MAX_SPEED);
-            self.last_tick = Some(Instant::now());
+            self.last_tick = Some(now);
         }
         self.gliding
     }
@@ -185,7 +206,10 @@ impl ScrollDrag {
         }
         if !self.last_scroll.is_nan() {
             let instant = (scroll - self.last_scroll) / elapsed.as_secs_f32();
-            self.velocity = if self.velocity == 0.0 {
+            // A move after a long pause is a new measurement. Blending it
+            // with the old estimate would let the speed from before the
+            // pause survive a hand that has since been still.
+            self.velocity = if self.velocity == 0.0 || elapsed >= STATIONARY {
                 instant
             } else {
                 self.velocity * (1.0 - SMOOTHING) + instant * SMOOTHING
@@ -321,10 +345,69 @@ mod tests {
                 MAX,
             );
         }
-        assert!(drag.release(), "a fast release glides");
+        // Released while the sweep is still fresh — 16 ms after its last move.
+        assert!(
+            drag.release_at(t + Duration::from_millis(16)),
+            "a fast release glides"
+        );
         assert!(!drag.is_dragging());
         assert!(drag.is_gliding());
         assert!(drag.velocity < 0.0, "the glide keeps the flick's direction");
+    }
+
+    #[test]
+    fn a_pause_before_release_is_a_stop_not_a_flick() {
+        let mut drag = ScrollDrag::default();
+        drag.begin(0.0, 0.0);
+        let mut t = Instant::now();
+        for step in 0..4 {
+            t += Duration::from_millis(8);
+            let _ = drag.drag_to_at(
+                t,
+                40.0 - 10.0 * step as f32,
+                TRACK_TOP,
+                TRACK_HEIGHT,
+                THUMB,
+                MAX,
+            );
+        }
+        // The hand rests half a second — no moves arrive while it does — and
+        // then the button comes up. Nothing may move: the estimate would
+        // otherwise still carry the sweep's speed into the release.
+        assert!(!drag.release_at(t + Duration::from_millis(500)));
+        assert!(!drag.is_gliding());
+        assert_eq!(drag.velocity, 0.0);
+    }
+
+    #[test]
+    fn a_move_after_a_long_pause_does_not_carry_the_old_speed() {
+        let mut drag = ScrollDrag::default();
+        drag.begin(0.0, 0.0);
+        let mut t = Instant::now();
+        for step in 0..4 {
+            t += Duration::from_millis(8);
+            let _ = drag.drag_to_at(
+                t,
+                40.0 - 10.0 * step as f32,
+                TRACK_TOP,
+                TRACK_HEIGHT,
+                THUMB,
+                MAX,
+            );
+        }
+        assert!(drag.velocity < 0.0, "set-up: the sweep was fast");
+
+        // Half a second of stillness, then a slow one-pixel creep — the hand
+        // tremor case. Measured on its own it is nearly still; blended with
+        // the pre-pause speed it would have re-armed the flick.
+        t += Duration::from_millis(500);
+        let _ = drag.drag_to_at(t, 9.0, TRACK_TOP, TRACK_HEIGHT, THUMB, MAX);
+        assert!(
+            drag.velocity.abs() < 100.0,
+            "stale speed leaked through the pause: {}",
+            drag.velocity
+        );
+        assert!(!drag.release_at(t + Duration::from_millis(8)));
     }
 
     #[test]
