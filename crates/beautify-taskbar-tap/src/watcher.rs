@@ -85,6 +85,10 @@ pub struct Watcher {
     claim_attempts: AtomicU32,
     /// When that walk last ran, for the interval above.
     last_claim: Mutex<Option<std::time::Instant>>,
+    /// Walks that found no frame at all, which is what the give-up bound
+    /// counts. A walk that reaches a frame of a taskbar we already know is a
+    /// *successful* one and must not spend that budget — see `claim_is_due`.
+    claim_misses: AtomicU32,
     ref_count: AtomicU32,
 }
 
@@ -327,6 +331,18 @@ fn self_register_border(border: IUnknown) {
     service::register_frameless_hairline_border(border);
 }
 
+/// Could an element of this type be part of a taskbar island?
+///
+/// The callback fires for every element in the process, and this module mounts
+/// a composition sprite on the taskbar itself (the blur visual behind an
+/// acrylic fill), whose "added" events arrive on every apply. Composition
+/// visuals are not part of the island's element tree, so a walk started from
+/// one can never find a `TaskbarFrame` — spending the search on them is what
+/// used to end it early.
+fn could_hold_a_taskbar(type_name: &str) -> bool {
+    !type_name.starts_with("Windows.UI.Composition.")
+}
+
 /// The taskbar window that owns `window` — normally the island bridge's direct
 /// parent, and the only attribution that survives two monitors of the same
 /// size.
@@ -391,6 +407,7 @@ impl Watcher {
             pending_sources: Mutex::new(HashSet::new()),
             claim_attempts: AtomicU32::new(0),
             last_claim: Mutex::new(None),
+            claim_misses: AtomicU32::new(0),
             ref_count: AtomicU32::new(1),
         });
         // The caller (`TapSite::set_site`) runs inside `com::guard`, so a panic
@@ -466,9 +483,14 @@ impl Watcher {
         // claimed used to turn the search off, and the other monitors were
         // never beautified. Rate-limited, because the walk is far too expensive
         // to run on every mutation.
-        if mutation == VISUAL_MUTATION_ADD && self.claim_is_due() {
+        if mutation == VISUAL_MUTATION_ADD
+            && could_hold_a_taskbar(&type_name)
+            && self.claim_is_due()
+        {
             let attempt = self.claim_attempts.fetch_add(1, Ordering::Relaxed);
-            self.claim_from(element.handle, attempt < 3);
+            if !self.claim_from(element.handle, attempt < 3) {
+                self.claim_misses.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -484,15 +506,18 @@ impl Watcher {
         const BURST: u32 = 30;
         /// How often the walk may run once the burst is over.
         const INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
-        /// A taskbar that cannot be claimed must not keep the walk alive for
-        /// ever; the islands that need this path exist at connect time, so if
-        /// they have not turned up by now they are not going to.
-        const GIVE_UP_AFTER: u32 = 60;
+        /// How many walks that found nothing at all before the search is
+        /// abandoned. Counted per *fruitless* walk rather than per event: a
+        /// taskbar that only changes minutes after start-up still has to be
+        /// found, and an event budget is spent by elements of the taskbars we
+        /// already know — which is how the search used to end within a minute
+        /// of start-up, leaving the second monitor unclaimed for good.
+        const GIVE_UP_AFTER_MISSES: u32 = 200;
 
-        let attempts = self.claim_attempts.load(Ordering::Relaxed);
-        if attempts >= GIVE_UP_AFTER {
+        if self.claim_misses.load(Ordering::Relaxed) >= GIVE_UP_AFTER_MISSES {
             return false;
         }
+        let attempts = self.claim_attempts.load(Ordering::Relaxed);
         if attempts >= BURST {
             let Ok(mut last) = self.last_claim.lock() else {
                 return false;
@@ -511,10 +536,14 @@ impl Watcher {
     /// Walk up from an element looking for the `TaskbarFrame` that contains it,
     /// and claim the taskbar it belongs to. `verbose` reports the ancestry, for
     /// the first few events only.
-    fn claim_from(&self, handle: u64, verbose: bool) {
+    ///
+    /// Returns whether a frame turned up at all — including one that was
+    /// already registered, because that still proves the element belongs to a
+    /// taskbar we know and must not count against the give-up bound.
+    fn claim_from(&self, handle: u64, verbose: bool) -> bool {
         let mut chain = String::new();
         let Some(mut element) = self.inspectable_at(handle) else {
-            return;
+            return false;
         };
         for _ in 0..40 {
             let class = unsafe { xaml::runtime_class_name(element.as_raw()) }.unwrap_or_default();
@@ -529,13 +558,13 @@ impl Watcher {
                     crate::service::debug_log_fmt(format_args!("claim: ancestry {chain}"));
                 }
                 let Some(frame_handle) = self.handle_of(&element) else {
-                    return;
+                    return false;
                 };
                 // Already claimed: this element belongs to a taskbar we know, so
                 // there is nothing to do — and re-registering would re-run the
                 // frame walk and arm the re-walk timer on every attempt.
                 if service::is_registered(frame_handle) {
-                    return;
+                    return true;
                 }
                 match self.taskbar_for_frame(&element) {
                     Some(taskbar) => {
@@ -551,7 +580,7 @@ impl Watcher {
                         "claim: frame {frame_handle:x} could not be attributed to a taskbar window"
                     )),
                 }
-                return;
+                return true;
             }
             match unsafe { xaml::parent_of(element.as_raw()) } {
                 Some(parent) => element = parent,
@@ -561,6 +590,7 @@ impl Watcher {
         if verbose {
             crate::service::debug_log_fmt(format_args!("claim: no frame above {chain}"));
         }
+        false
     }
 
     fn on_added(&self, relation: &ParentChildRelation, handle: u64, type_name: &str, name: &str) {
