@@ -35,8 +35,8 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, W
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreatePen, CreateSolidBrush,
     DeleteDC, DeleteObject, EndPaint, FillRect, FrameRect, InvalidateRect, LineTo, MoveToEx,
-    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
-    PAINTSTRUCT, PS_SOLID, SRCCOPY,
+    RedrawWindow, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
+    HGDIOBJ, PAINTSTRUCT, PS_SOLID, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -45,13 +45,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, CS_DBLCLKS, GWLP_USERDATA, IDC_ARROW, IDC_HAND, IDC_SIZEALL, MSG,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    GetMessageW, GetWindowLongPtrW, GetWindowRect, LoadCursorW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    CS_DBLCLKS, GWLP_USERDATA, IDC_ARROW, IDC_HAND, IDC_SIZEALL, MSG, SWP_NOACTIVATE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOW, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SYSKEYDOWN, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::capture::Shot;
@@ -425,9 +424,19 @@ impl Pin {
         let x = origin_x + focus_x - (image_x * next).round() as i32;
         let y = origin_y + focus_y - (image_y * next).round() as i32;
         unsafe {
-            // A size change makes Windows invalidate the window, so the new
-            // frame is drawn without asking.
             let _ = SetWindowPos(self.hwnd, None, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+            // The resize invalidates the window, and that paint can run before
+            // the window's surface has been resized — in which case the frame
+            // that lands is the old one and nothing else asks for another, so the
+            // pin keeps showing the previous zoom. Measured: a screen grab then
+            // shows every frame the window has ever had, stacked. Redrawing here,
+            // once the resize has landed, is what makes the new zoom stick.
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+            );
         }
     }
 
