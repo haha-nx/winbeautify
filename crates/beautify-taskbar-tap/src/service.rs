@@ -262,33 +262,6 @@ pub fn has_bars() -> bool {
     with_service(|svc| !svc.bars.is_empty())
 }
 
-/// Has this frame already been claimed?
-///
-/// The recovery walk runs on tree mutations, and nearly all of them belong to a
-/// taskbar that was claimed long ago; this is what keeps those cheap.
-pub fn is_registered(frame_handle: u64) -> bool {
-    with_service(|svc| svc.bars.contains_key(&frame_handle))
-}
-
-/// Is a taskbar of this session still missing from the registry?
-///
-/// The recovery walk exists for the taskbars that were already there when we
-/// were injected: they never announce a frame, so they have to be looked for.
-/// It is gated on this rather than on "nothing has been claimed yet", which is
-/// what left every monitor but the primary untouched — the first island claimed
-/// turned the old gate off, and the rest were never looked for again.
-pub fn has_unclaimed_taskbar() -> bool {
-    let claimed = claimed_taskbars();
-    taskbar_windows()
-        .into_iter()
-        .any(|window| !claimed.contains(&window))
-}
-
-/// The taskbar windows that have an island registered against them.
-pub fn claimed_taskbars() -> Vec<isize> {
-    with_service(|svc| svc.bars.values().map(|bar| bar.taskbar).collect())
-}
-
 /// Remember one of the taskbar's background rectangles.
 pub fn register_taskbar_background(frame_handle: u64, shape: IUnknown) {
     with_service(|svc| {

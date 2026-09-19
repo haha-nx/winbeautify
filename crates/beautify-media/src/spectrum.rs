@@ -56,38 +56,6 @@ const SILENCE_RMS: f32 = 0.0015;
 /// `WAVE_FORMAT_EXTENSIBLE` from `mmreg.h`.
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
-// Adaptive normalisation, after WinIsland's spectrum: a fixed dB scale leaves
-// the top of the display dead for most material (music energy falls with
-// frequency) and pins the bottom for quiet tracks. Instead each band tracks a
-// decaying running maximum and is read relative to it, so a quiet song and a
-// loud one both use the full bar height.
-/// Per-frame decay of the running maximum (`max' = max * DECAY + peak * LEARN`).
-const ADAPTIVE_DECAY: f32 = 0.995;
-/// Per-frame learning rate towards the current band peak.
-const ADAPTIVE_LEARN: f32 = 0.005;
-/// How far below the frame's loudest band a band stops being amplified.
-///
-/// This floor has to be *relative* to the material, and it cannot be an
-/// absolute magnitude. The bands are on wildly different scales — music falls
-/// off with frequency, and the top of the spectrum arrives 47 dB below the bass
-/// — while the capture's own noise is only some 20 dB below that. A fixed
-/// magnitude therefore has to choose between silencing the top bands and
-/// amplifying the noise, and the 0.01 that used to be here chose the first:
-/// they read a couple of percent of the bar height and never moved, which is
-/// the "only the first four bars move" report. Measured on dense -6 dB/octave
-/// material, so the line sits at -70 dB under the frame's peak.
-const SIGNAL_FLOOR_RATIO: f32 = 3e-4;
-/// Slow release of the frame's loudness, so a gap between notes does not drop
-/// the floor onto the noise and light the display up with it.
-const LOUDNESS_RELEASE: f32 = 0.995;
-/// The floor is never taken below this, so a frame of exact silence cannot
-/// leave a band dividing by zero.
-const MINIMUM_REFERENCE: f32 = 1e-9;
-/// Headroom over the running maximum the value is divided by. Values hover
-/// below `1/GAIN` when a band is its own maximum, and saturate on transients
-/// while the maximum catches up.
-const NORMALIZATION_GAIN: f32 = 2.3;
-
 /// Sample layout of the capture stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SampleFormat {
@@ -339,7 +307,6 @@ fn pump(
     let mut fft_buffer = vec![Complex::new(0.0f32, 0.0); FFT_SIZE];
     let mut smoothed: Vec<f32> = Vec::new();
     let mut bands: Vec<f32> = Vec::new();
-    let mut normalizer = BandNormalizer::default();
 
     let mut last_emit = std::time::Instant::now();
     let mut silent_since: Option<std::time::Instant> = None;
@@ -455,7 +422,6 @@ fn pump(
                 fft.as_ref(),
                 stream.sample_rate,
                 &opts,
-                &mut normalizer,
                 &mut bands,
                 &mut smoothed,
             );
@@ -533,80 +499,6 @@ impl Ring {
     }
 }
 
-/// Per-band adaptive normalisation state.
-///
-/// One entry per band: a decaying running maximum of the band's magnitude.
-/// The state lives across frames, so a track that starts quiet opens the bars
-/// up instead of flat-lining them.
-#[derive(Debug, Default)]
-struct BandNormalizer {
-    /// `0.0` marks a band that has not been heard yet, which is not the same as
-    /// one whose running maximum is zero.
-    adaptive_max: Vec<f32>,
-    /// How loud the frame was, with a slow release. What counts as signal is
-    /// read against this rather than against a fixed magnitude, because the
-    /// bands are not on the same scale.
-    loudness: f32,
-}
-
-impl BandNormalizer {
-    /// Note how loud this frame was, before its bands are read against it.
-    fn observe(&mut self, peak: f32) {
-        self.loudness = (self.loudness * LOUDNESS_RELEASE).max(peak);
-    }
-
-    fn normalize(&mut self, band: usize, magnitude: f32) -> f32 {
-        if self.adaptive_max.len() <= band {
-            self.adaptive_max.resize(band + 1, 0.0);
-        }
-        let floor = (self.loudness * SIGNAL_FLOOR_RATIO).max(MINIMUM_REFERENCE);
-        let level = magnitude.max(floor);
-        let slot = &mut self.adaptive_max[band];
-        // A band opens at the level it is first heard at, not at a shared
-        // starting magnitude: a shared one is suited to the bass and leaves
-        // every quieter band suppressed for as long as its running maximum
-        // takes to walk down to its level, which is minutes at the top of the
-        // spectrum.
-        if *slot <= 0.0 {
-            *slot = level;
-        }
-        *slot = *slot * ADAPTIVE_DECAY + level * ADAPTIVE_LEARN;
-        (magnitude / (*slot * NORMALIZATION_GAIN)).clamp(0.0, 1.0)
-    }
-}
-
-/// The magnitude of each band of an already-transformed frame, low first.
-///
-/// Log-spaced bands: perceived pitch is logarithmic, so linear bins would cram
-/// every musical note into the leftmost third of the display. The band value is
-/// the *average* of its bins' magnitudes, not the peak — a peak makes one noisy
-/// bin jump the whole bar.
-///
-/// Separate from the normalisation that follows it, so the band layout — which
-/// frequency lands in which bar — can be checked on its own. It cannot be read
-/// off the finished frame: every band is normalised against its own history, so
-/// a steady tone settles every bar at the same height whatever the shape of the
-/// spectrum.
-fn band_magnitudes(spectrum: &[Complex<f32>], sample_rate: f32, bars: usize, out: &mut Vec<f32>) {
-    out.clear();
-    out.reserve(bars);
-    let bins = FFT_SIZE / 2;
-    let ratio = (BAND_MAX_HZ / BAND_MIN_HZ).powf(1.0 / bars as f32);
-    let bin_width = sample_rate / FFT_SIZE as f32;
-
-    for b in 0..bars {
-        let low = BAND_MIN_HZ * ratio.powi(b as i32);
-        let high = low * ratio;
-        let lo_bin = ((low / bin_width).floor() as usize).clamp(1, bins - 1);
-        let hi_bin = ((high / bin_width).ceil() as usize).clamp(lo_bin + 1, bins);
-
-        let count = (hi_bin - lo_bin).max(1) as f32;
-        let average = spectrum[lo_bin..hi_bin].iter().map(|c| c.norm()).sum::<f32>() / count;
-        // Scale so the result does not depend on the FFT size.
-        out.push(average * 2.0 / FFT_SIZE as f32);
-    }
-}
-
 /// Fill `smoothed` with `opts.bars` magnitudes in `0.0..=1.0`.
 #[allow(clippy::too_many_arguments)]
 fn compute_bars(
@@ -617,7 +509,6 @@ fn compute_bars(
     fft: &dyn rustfft::Fft<f32>,
     sample_rate: f32,
     opts: &SpectrumOptions,
-    normalizer: &mut BandNormalizer,
     bands: &mut Vec<f32>,
     smoothed: &mut Vec<f32>,
 ) {
@@ -631,16 +522,33 @@ fn compute_bars(
     }
     fft.process_with_scratch(fft_buffer, scratch);
 
-    band_magnitudes(fft_buffer, sample_rate, opts.bars, bands);
+    let bins = FFT_SIZE / 2;
+    bands.clear();
+    bands.reserve(opts.bars);
 
-    // Every band is read against its own running maximum, which is what makes
-    // the display use its whole height whatever the material's tilt. What
-    // counts as signal rather than noise is decided once per frame, against the
-    // frame's own peak.
-    let peak = bands.iter().copied().fold(0.0, f32::max);
-    normalizer.observe(peak);
-    for (b, magnitude) in bands.iter_mut().enumerate() {
-        *magnitude = (normalizer.normalize(b, *magnitude) * opts.sensitivity).clamp(0.0, 1.0);
+    // Log-spaced bands: perceived pitch is logarithmic, so linear bins would
+    // cram every musical note into the leftmost third of the display.
+    let ratio = (BAND_MAX_HZ / BAND_MIN_HZ).powf(1.0 / opts.bars as f32);
+    let bin_width = sample_rate / FFT_SIZE as f32;
+
+    for b in 0..opts.bars {
+        let low = BAND_MIN_HZ * ratio.powi(b as i32);
+        let high = low * ratio;
+        let lo_bin = ((low / bin_width).floor() as usize).clamp(1, bins - 1);
+        let hi_bin = ((high / bin_width).ceil() as usize).clamp(lo_bin + 1, bins);
+
+        let peak = fft_buffer[lo_bin..hi_bin]
+            .iter()
+            .map(|c| c.norm())
+            .fold(0.0f32, f32::max);
+        // Scale so the result does not depend on the FFT size.
+        let magnitude = peak * 2.0 / FFT_SIZE as f32;
+
+        // -80 dB .. 0 dB mapped onto 0..1: roughly how a hardware analyser
+        // behaves, and it keeps quiet passages visible.
+        let db = 20.0 * (magnitude + 1e-9).log10();
+        let normalised = ((db + 80.0) / 80.0).clamp(0.0, 1.0);
+        bands.push((normalised * opts.sensitivity).clamp(0.0, 1.0));
     }
 
     // Asymmetric smoothing: snap up so beats are visible, ease down so the
@@ -690,7 +598,6 @@ mod tests {
             fft.as_ref(),
             48_000.0,
             &opts,
-            &mut BandNormalizer::default(),
             &mut bands,
             &mut smoothed,
         );
@@ -698,122 +605,17 @@ mod tests {
     }
 
     /// Loudest band index for a pure tone at `freq`.
-    /// Which band a tone lands in, read off the band magnitudes.
-    ///
-    /// The magnitudes and not the finished frame: every band is normalised
-    /// against its own history, so a steady tone settles every bar at the same
-    /// height and the shape of the spectrum is not visible in the output.
     fn peak_band(freq: f32, bars: usize) -> usize {
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
-        let window = hann();
-        let mut buffer: Vec<Complex<f32>> = (0..FFT_SIZE)
-            .map(|i| {
-                let x = 2.0 * std::f32::consts::PI * freq * i as f32 / 48_000.0;
-                Complex::new(x.sin() * 0.8 * window[i], 0.0)
-            })
+        let samples: Vec<f32> = (0..FFT_SIZE)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / 48_000.0).sin() * 0.8)
             .collect();
-        let mut scratch = vec![Complex::new(0.0f32, 0.0); fft.get_inplace_scratch_len()];
-        fft.process_with_scratch(&mut buffer, &mut scratch);
-
-        let mut out = Vec::new();
-        band_magnitudes(&buffer, 48_000.0, bars, &mut out);
+        let out = analyse(&samples, bars);
         assert_eq!(out.len(), bars);
         out.iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .unwrap()
             .0
-    }
-
-    /// Every band of the display moves, whatever the material's spectral tilt.
-    ///
-    /// The check for the report that only the first four of the eight bars ever
-    /// moved. Two things caused it, and both are pinned here: the magnitude
-    /// below which a band counted as noise was absolute, which put it above the
-    /// whole range of the top bands, and each band's running maximum started
-    /// from a shared magnitude suited to the bass, which left the quieter bands
-    /// suppressed until it had walked down to them — minutes at the top of the
-    /// spectrum.
-    ///
-    /// The material is dense noise with a -6 dB/octave tilt, which is what music
-    /// looks like. Sparse partials are a poor stand-in: the average over a
-    /// wide band's bins then reads far lower than the energy in it.
-    #[test]
-    fn every_band_moves_on_music_like_material() {
-        use std::f32::consts::PI;
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
-        let ifft = planner.plan_fft_inverse(FFT_SIZE);
-        let mut buffer = vec![Complex::new(0.0f32, 0.0); FFT_SIZE];
-        let mut scratch = vec![Complex::new(0.0f32, 0.0); fft.get_inplace_scratch_len()];
-        let mut bands = Vec::new();
-        let mut smoothed = Vec::new();
-        let bars = 8;
-        let opts = SpectrumOptions {
-            bars,
-            sensitivity: 1.0,
-            smoothing: 0.0,
-        };
-        let mut normalizer = BandNormalizer::default();
-        let window = hann();
-
-        // A deterministic noise source, so a failure can be looked at twice.
-        let mut seed = 12_345u32;
-        let mut random = move || {
-            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (seed >> 8) as f32 / 16_777_216.0
-        };
-
-        let mut lows = vec![f32::MAX; bars];
-        let mut highs = vec![f32::MIN; bars];
-        for frame in 0..400 {
-            // Dense spectrum with a -6 dB/octave tilt: `|X[k]|` falls as 1/f.
-            for (k, bin) in buffer.iter_mut().enumerate() {
-                let f = (k as f32).max(1.0) * 48_000.0 / FFT_SIZE as f32;
-                let phase = 2.0 * PI * random();
-                *bin = Complex::new(phase.cos() / f, phase.sin() / f);
-            }
-            ifft.process_with_scratch(&mut buffer, &mut scratch);
-            let scale = 1.0 / FFT_SIZE as f32;
-            // A slow tremolo, so every band has something to move with.
-            let tremolo = 1.0 + 0.5 * (2.0 * PI * frame as f32 / 40.0).sin();
-            let samples: Vec<f32> = buffer
-                .iter()
-                .map(|c| c.re * scale * 0.35 * tremolo)
-                .collect();
-            compute_bars(
-                &samples,
-                &window,
-                &mut buffer,
-                &mut scratch,
-                fft.as_ref(),
-                48_000.0,
-                &opts,
-                &mut normalizer,
-                &mut bands,
-                &mut smoothed,
-            );
-            if frame > 300 {
-                for (band, value) in smoothed.iter().enumerate() {
-                    lows[band] = lows[band].min(*value);
-                    highs[band] = highs[band].max(*value);
-                }
-            }
-        }
-
-        for band in 0..bars {
-            let (low, high) = (lows[band], highs[band]);
-            assert!(
-                low > 0.05,
-                "band {band} never leaves the floor ({low:.4}); \
-                 the display is not using its height"
-            );
-            assert!(
-                high - low > 0.1,
-                "band {band} barely moves ({low:.4}..{high:.4})"
-            );
-        }
     }
 
     #[test]
@@ -892,7 +694,6 @@ mod tests {
                     sensitivity,
                     smoothing: 0.0,
                 },
-                &mut BandNormalizer::default(),
                 &mut bands,
                 &mut smoothed,
             );
@@ -920,7 +721,6 @@ mod tests {
 
         let mut bands = Vec::new();
         let mut smoothed = vec![0.0f32; 8];
-        let mut normalizer = BandNormalizer::default();
         compute_bars(
             &loud,
             &hann(),
@@ -929,7 +729,6 @@ mod tests {
             fft.as_ref(),
             48_000.0,
             &opts,
-            &mut normalizer,
             &mut bands,
             &mut smoothed,
         );
@@ -944,7 +743,6 @@ mod tests {
             fft.as_ref(),
             48_000.0,
             &opts,
-            &mut normalizer,
             &mut bands,
             &mut smoothed,
         );
@@ -1012,74 +810,9 @@ mod tests {
             fft.as_ref(),
             48_000.0,
             &SpectrumOptions::default(),
-            &mut BandNormalizer::default(),
             &mut bands,
             &mut smoothed,
         );
         assert!(smoothed.is_empty());
-    }
-
-    /// A quiet track fills the bars from the first frame.
-    ///
-    /// Each band opens at the level it is first heard at and is read against
-    /// its own running maximum from then on, so the amplitude of the material
-    /// only decides how tall the bars are, never whether they show at all. A
-    /// band at its own maximum hovers under `1 / NORMALIZATION_GAIN` rather than
-    /// saturating, and a quiet band must not need a settling period to become
-    /// visible — which is what the shared starting magnitude it used to have
-    /// imposed, at minutes for the top of the spectrum.
-    #[test]
-    fn a_quiet_signal_fills_the_bars_from_the_first_frame() {
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
-        let mut buffer = vec![Complex::new(0.0f32, 0.0); FFT_SIZE];
-        let mut scratch = vec![Complex::new(0.0f32, 0.0); fft.get_inplace_scratch_len()];
-        let mut bands = Vec::new();
-        let mut smoothed = Vec::new();
-        let opts = SpectrumOptions {
-            bars: 8,
-            sensitivity: 1.0,
-            smoothing: 0.0,
-        };
-        let quiet: Vec<f32> = (0..FFT_SIZE)
-            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin() * 0.2)
-            .collect();
-        let mut normalizer = BandNormalizer::default();
-        let mut first = None;
-        for frame in 0..600 {
-            compute_bars(
-                &quiet,
-                &hann(),
-                &mut buffer,
-                &mut scratch,
-                fft.as_ref(),
-                48_000.0,
-                &opts,
-                &mut normalizer,
-                &mut bands,
-                &mut smoothed,
-            );
-            if frame == 0 {
-                first = Some(smoothed.clone());
-            }
-        }
-        let first = first.unwrap();
-        let settled = smoothed.clone();
-        let band_of_tone = settled
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap()
-            .0;
-        assert!(
-            first[band_of_tone] > 0.05,
-            "a quiet tone must show on the very first frame, not settle into view: {}",
-            first[band_of_tone]
-        );
-        assert!(
-            settled[band_of_tone] <= 1.0 / NORMALIZATION_GAIN + 0.05,
-            "a band at its own maximum must not saturate: {}",
-            settled[band_of_tone]
-        );
     }
 }

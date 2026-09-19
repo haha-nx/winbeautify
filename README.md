@@ -26,13 +26,6 @@ Windows 桌面美化与增强工具。任务栏材质、任务栏歌词与实时
 ## 快速开始
 
 ```bash
-# 前端
-cd ui
-npm install
-npm run build
-
-# 后端
-cd ..
 # beautify-taskbar-tap 必须一起构建：它是注入 explorer 的 TAP DLL
 # （beautify_taskbar_tap.dll），宿主在 exe 同目录找它，缺了任务栏透明
 # 就只能退回 22H2 之前的旧路径。
