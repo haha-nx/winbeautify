@@ -250,6 +250,9 @@ fn bridge_events(app: &AppHandle) {
             Event::TaskbarChanged(taskbar) => {
                 *handle.state::<Arc<AppState>>().taskbar_state.write() = taskbar.as_ref().clone();
                 let _ = handle.emit("taskbar-changed", taskbar.as_ref());
+                // The settings window's status pill mirrors this state;
+                // refresh it so 「已应用」 tracks what the taskbar shows.
+                crate::settings::refresh(&handle);
                 // The taskbar has moved or resized; the bar has to follow.
                 let width = win::current_widget_width(&handle);
                 win::reposition_widget(&handle, width);

@@ -798,6 +798,10 @@ impl Window {
     fn commit(&mut self, config: Config) {
         self.config = self.host.update(config);
         self.palette = Palette::resolve(&self.config, self.host.system_is_light());
+        // The status pills depend on the config (e.g. which taskbar mode is
+        // active) and on live module state; a changed config must re-read
+        // them or the pill keeps describing the previous state.
+        self.status = self.host.status();
         // Visibility rules may have changed, so the layout is rebuilt.
         self.repaint();
     }

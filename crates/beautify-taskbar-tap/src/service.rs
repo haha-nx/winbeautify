@@ -621,11 +621,10 @@ fn set_appearance(cmd: &TapCommand) -> bool {
                     debug_log("acrylic: the composition graph failed, using a solid tint");
                     paint_fill(shape, || xaml::create_solid_brush(color))
                 } else {
-                    // The host folds the user's opacity into the alpha byte; a
-                    // zero-alpha tint would leave the acrylic material
-                    // untinted, so it bottoms out at half strength.
+                    // Half-strength tint: strong enough to read as a colour,
+                    // weak enough to leave the blur visible.
                     let mut tint = color;
-                    tint.a = tint.a.max(128);
+                    tint.a = 128;
                     paint_fill_keep_visual(shape, || xaml::create_solid_brush(tint))
                 }
             }

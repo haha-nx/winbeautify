@@ -11,7 +11,7 @@ Windows 桌面美化与增强工具。任务栏材质、任务栏歌词与实时
 
 | 模块 | 内容 |
 |---|---|
-| **任务栏** | 正常 / 透明 / 模糊 / 亚克力 Acrylic / 纯色（纯色可自定义着色与不透明度），顶部细线开关，副屏任务栏，动态模式（窗口最大化时切换效果），全屏应用自动暂停，退出时还原 |
+| **任务栏** | 正常 / 透明 / 模糊 / 亚克力 / 纯色，顶部细线开关，副屏任务栏，动态模式（窗口最大化时切换效果），全屏应用自动暂停，退出时还原 |
 | **小组件栏** | 嵌入任务栏的 Widget Bar：启动器 + 自适应宽度的音频组件；前景色可跟随主题或自定义 |
 | **任务栏歌词** | 通过 GSMTC 读取当前曲目，LRC 解析、可选在线接口（结果只存内存），歌词偏移补偿 |
 | **音乐频谱** | WASAPI 回环捕获系统音频 + rustfft，对数分频，无需虚拟声卡；柱状与上下律动两种样式 |
@@ -19,7 +19,7 @@ Windows 桌面美化与增强工具。任务栏材质、任务栏歌词与实时
 | **剪贴板** | 事件驱动监听，文本 / 图片 / 文件列表，搜索、收藏（★）、去重、容量上限；图片可一键贴到屏幕 |
 | **任务清单** | SQLite 存储，原生面板内增删改查（勾选、就地改名、删除），Markdown / JSON 导出 |
 | **截图贴图** | F1 拖选截屏（十字线 + 8 倍放大镜 + 坐标/取色），直接写入剪贴板（CF_DIB）；F3 把剪贴板的图片贴到屏幕最上层，可拖动、可缩放、带关闭按钮 |
-| **设置中心** | 全部配置的图形界面，改动即时生效并写入 `config.toml`；原生 Direct2D 窗口，不再依赖 WebView2 |
+| **设置中心** | 全部配置的图形界面，改动即时生效并写入 `config.toml`；原生 Direct2D 窗口 |
 
 ---
 
@@ -42,19 +42,6 @@ cargo build --release -p winbeautify -p beautify-taskbar-tap
 
 启动后常驻托盘，左键点托盘图标打开设置，右键菜单可以打开 Flyout、重载配置或退出。
 
-### 测试
-
-```bash
-cargo test --workspace                  # 纯逻辑测试，不需要桌面
-cargo test -p beautify-settings -- --ignored   # 真的开一个设置窗口，开→关→再开
-cargo clippy --workspace --all-targets
-```
-
-默认跑的是不依赖桌面的那些：布局、命中测试、像素运算、配置读写。真正需要窗口的测试
-标记了 `#[ignore]`，上面第二条是其中一个——它验证设置窗口能开、能关、还能再开一次。
-这条不是形式：`DestroyWindow` 会在处理消息的过程中同步投递 `WM_NCDESTROY`，重入消息
-过程曾让关闭设置窗口直接 abort 整个进程，这个测试就是那次缺陷的回归守卫。
-
 ---
 
 ## 架构
@@ -72,7 +59,6 @@ winbeautify/
 │   ├── beautify-settings/   原生设置中心：页面表格、布局、绘制、窗口
 │   └── beautify-widget/     原生小组件栏：Direct2D 绘制、分层窗口、命中测试
 ├── app/                     Tauri 宿主：窗口、托盘、热键、自启动、IPC
-├── ui/                      小组件栏 WebView2 回退页（vanilla TS + Vite）
 └── tools/make_icon.py       生成应用图标（纯标准库）
 ```
 
@@ -107,46 +93,6 @@ pub trait Module: Send + Sync {
 - **频谱**：WASAPI 的 `SetEventHandle` 驱动，阻塞在内核里，只有真的有音频时才做 FFT。
 
 ---
-
-## 配置
-
-配置文件在 `%LOCALAPPDATA%\WinBeautify\config.toml`，设置中心里改的每一项都会写回这里，
-手改文件后用托盘菜单的「重新载入配置」即可生效。数据库与歌词目录在同目录。
-
-几个值得注意的选项：
-
-```toml
-[taskbar]
-mode = "acrylic"            # normal | clear | blur | acrylic | opaque
-                            # 只有 opaque（纯色）能改 color / opacity
-show_hairline = false       # 任务栏顶部那条细线，默认隐藏
-dynamic_mode = true         # 窗口最大化时切换到 dynamic_mode_override
-hide_on_fullscreen = true   # 全屏应用前台时还原为系统默认
-restore_on_exit = true      # 退出时把任务栏还给 Windows
-
-[media]
-demo_mode = false           # 预览模式：伪造曲目/歌词/频谱，用来看外观
-spectrum_style = "bars"     # bars（柱状）| bounce（上下律动）
-lyric_provider = "netease"  # off | netease | qq | kugou | lrclib | custom
-online_api = ""             # 仅 lyric_provider = "custom" 时使用
-
-[widget]
-anchor = "taskbar-right"    # taskbar-* / bottom-*
-opacity = 0.0               # 背景不透明度，0 = 只留文字与图标
-color_mode = "theme"        # theme（跟随软件主题）| custom
-foreground = "#FFFFFF"      # 仅 color_mode = "custom" 时使用
-lyric_min_width = 96        # 宽度跟随歌词，这两项是下限/上限（物理像素）
-lyric_max_width = 280
-audio_min_width = 168       # 整个音频组件的下限/上限
-audio_max_width = 420
-
-[snip]
-enabled = true
-hotkey = "F1"               # 留空则只留托盘入口
-copy_to_clipboard = true    # 以标准 CF_DIB 写入剪贴板
-auto_pin = false            # 截完是否顺手贴回屏幕
-dim = 0.45                  # 选区外的遮罩深度
-```
 
 ### 截图与贴图
 
@@ -188,118 +134,6 @@ dim = 0.45                  # 选区外的遮罩深度
 **查到的歌词只留在内存里，不会写进磁盘**：换歌即弃，下次播放重新查一次。这个目录
 `%LOCALAPPDATA%\WinBeautify\lyrics` 因此是只读的，里面每个 `.lrc` 都是你自己放进去的。
 命名为 `歌手 - 歌名.lrc`，**优先于任何在线结果**——这是唯一你能手工校正的来源。
-
----
-
-## 实测资源占用
-
-在 2560×1440 @125% 的 Windows 11 上测得，release 构建，媒体模块开启：
-
-| 配置 | 进程数 | 内存 | CPU |
-|---|---|---|---|
-| 小组件栏用 WebView2（旧实现） | 7 | 351 MB | 空闲 0.00% |
-| 小组件栏用原生渲染（当前默认） | **1** | **约 39 MB** | 空闲约 0.2%；频谱播放时约 2.1% |
-| 不显示小组件栏 | 1 | 15 MB | 0.00% |
-| 原生渲染 + 打开着设置窗口 | 1 | 79 MB | — |
-| 原生渲染 + 首次打开过 Flyout | 7 | 约 230–290 MB | — |
-
-两点需要如实说明：
-
-- **设置中心已经是原生窗口**，画在宿主进程里：同一进程实测**开着 79 MB、关掉 62 MB**，
-  也就是约 17 MB，不新增进程。改成原生之前它是一整套 Chromium 进程（实测约 190 MB）。
-  窗口关闭即销毁，下次打开重建。
-- **Flyout 面板也是原生窗口**：任务清单与剪贴板列表都由 `beautify-flyout` 用 Direct2D
-  画，创建一次后隐藏复用。Chromium 进程树现在只剩小组件栏的 WebView2 回退渲染方式会用到。
-
-也就是说 39 MB 是「原生小组件栏 + 原生面板」的常驻占用；只有把小组件栏切回 WebView2
-渲染时，进程数才会回到 7 个。
-
-**小组件栏改用 Direct2D 原生绘制，内存从 351 MB 降到 39 MB（约 −89%）。**
-下面这段说明了为什么之前做不到，以及为什么现在可以。
-
-小组件栏原本是一个 Tauri WebView2 窗口。WebView2 无论内容多简单，都会拉起一整套
-Chromium 进程（主进程、GPU、渲染器、工具进程……），代价在 300 MB 量级。任何 WebView
-方案的宿命都是如此——Tauri 省的是 Electron 的 Node 运行时，省不掉 Chromium 本身。
-
-现在的实现完全不引入浏览器：用 `WS_EX_LAYERED` + `UpdateLayeredWindow` 拿到逐像素
-alpha，用 Direct2D + DirectWrite + WIC 直接画那一个圆角胶囊（启动器、封面、歌词、
-频谱）。全部在宿主进程内，没有额外的进程、没有额外的运行时。
-
-### 为什么用分层窗口而不是 DirectComposition
-
-分层窗口是最老、最可靠的逐像素透明方案，而且不依赖 GPU 合成器——本项目所在的虚拟机
-恰好就是「DWM/DirectComposition 路径不工作」的那类环境（WebView2 的透明窗口在这里
-根本不显示内容）。`UpdateLayeredWindow` 在这台机器上 0% / 25% / 50% / 100% 四档
-alpha 全部正确合成。
-
-它还带来一个额外好处：**分层窗口按 alpha 做命中测试**，所以胶囊周围全透明的部分会把
-点击透传给任务栏。因此窗口可以一次性按最大宽度创建、之后再也不 resize，只让内部胶囊
-做宽度动画——既省掉了窗口尺寸与动画不同步的所有竞态，也不会挡住任务栏的点击。
-
-代价是失去 DWM 的亚克力模糊背景（分层窗口不能叠加系统 backdrop）。胶囊是一块半透明
-纯色，而不是磨砂玻璃。由于没有模糊层托底，背景不透明度默认是 **0**：不画胶囊，只留
-文字与图标浮在任务栏上；需要一块底板时再把它调上去。
-
-### 仍然想用 WebView2
-
-设置中心 →「小组件栏」→「渲染方式」可以切回 WebView2。两条路径功能一致，保留它一是
-作为原生渲染出问题时的回退，二是方便直接对比。切换即时生效。
-
----
-
-## 已知限制
-
-**Windows 11 22H2 之后的任务栏完全不理会材质设置。**
-`SetWindowCompositionAttribute`（TranslucentTB 等工具在 Windows 10 时代依赖的未公开 API）
-在这些 build 上**仍然返回成功，然后什么都不做**——不报错，也没有任何视觉变化。
-25H2（build 26200）上实测：把背景模式设成「纯色」并指定纯红，任务栏颜色纹丝不动。
-原因是任务栏自 22H2 起改由 `explorer.exe` 里的 XAML 绘制，背景是一个 XAML 矩形而不是窗口
-表面，所以没有窗口表面可供染色。
-
-设置中心会如实显示「系统自带任务栏不响应（Win11 22H2 起）」，而不是谎报「已应用」；
-启动日志里也有一条对应的 WARN。想要真正生效，只能像 TranslucentTB 那样往 `explorer.exe`
-里注入 DLL、通过 XAML 诊断通道改写 `Taskbar.TaskbarFrame` 下 `BackgroundFill` 的 `Fill`——
-那是另一套独立组件，目前没有实现。系统设置里的「透明效果」不受影响，仍然有效。
-
-Windows 10 与 21H2 及更早的 Windows 11 不受此限制。
-
-**小组件栏是任务栏的附属窗口。**
-为了稳定地浮在任务栏之上，它通过 `GWLP_HWNDPARENT` 认 `Shell_TrayWnd` 做 owner；
-Explorer 重启后会重新认领。这不会出现在 Alt+Tab 或任务栏里。
-
-**托盘图标是唯一可靠的入口。**
-全局热键依赖 `RegisterHotKey`，与其它软件冲突时会注册失败（日志中有记录）；启动器按钮
-需要点击事件能到达 WebView2，在远程桌面或非交互式会话中不一定成立。
-
-**原生窗口没有无障碍树。**
-小组件栏和设置中心都是一块 Direct2D 画布，屏幕阅读器看不到其中的按钮、下拉和文本——
-它们之前的 WebView2 版本是有无障碍树的。小组件栏可以切回 WebView2 渲染；设置中心没有
-这条退路，它已经把 WebView2 版本删掉了。这是用内存换来的代价，需要无障碍支持的话目前
-只能用键盘热键把功能调出来的那部分（截图、Flyout 导航）。
-
-**设置中心的文本输入不是系统控件。**
-三个文本框（两个热键、一个自定义歌词接口地址）是就地绘制的，不是子 `EDIT` 控件——子窗口
-无法合成进 Direct2D 表面。因此它们**不支持输入法**，只有 ASCII 能正常输入；正在编辑时
-会画一条插入符，`Ctrl+V` / `Ctrl+C` 可用。这几项本来就只存加速键和 URL。
-
-**在线歌词接口需要自己配置。**
-默认不发任何网络请求。填了 `online_api` 之后走 WinHTTP，支持
-`{title}` / `{artist}` / `{album}` 占位符，也能解包一层 JSON 的 `lyric` / `lrc` 字段。
-
----
-
-## 本机构建环境说明
-
-这台机器上 `cargo` 偶尔会挑到 Git Bash 自带的 GNU `link.exe`，另外 MSVC 的 `cl.exe`
-需要显式设置 `INCLUDE`。构建前先设置：
-
-```bash
-export PATH="/d/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.29.30133/bin/Hostx64/x64:$PATH"
-export LIB='D:\Windows Kits\10\Lib\10.0.26100.0\um\x64;D:\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64;D:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.29.30133\lib\x64'
-export INCLUDE='D:\Windows Kits\10\Include\10.0.26100.0\ucrt;D:\Windows Kits\10\Include\10.0.26100.0\um;D:\Windows Kits\10\Include\10.0.26100.0\shared;D:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.29.30133\include'
-```
-
-`libsqlite3-sys` 用 `bundled` 编译 SQLite，因此需要可用的 C 编译器。
 
 ---
 

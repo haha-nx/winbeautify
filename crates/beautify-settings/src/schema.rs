@@ -242,7 +242,7 @@ pub const MODES: &[Choice] = &[
     },
     Choice {
         value: "acrylic",
-        label: "亚克力 Acrylic",
+        label: "亚克力",
     },
     Choice {
         value: "opaque",
@@ -421,11 +421,13 @@ const LOG_LEVELS: &[Choice] = &[
 fn taskbar_on(c: &Config) -> bool {
     c.taskbar.enabled
 }
-/// Only the solid mode has a tint the user can set. The translucent modes still
-/// read the stored colour, so switching away and back does not lose it, but
-/// they are defined by their material rather than by a colour.
-fn taskbar_solid(c: &Config) -> bool {
-    c.taskbar.enabled && c.taskbar.mode == TaskbarMode::Opaque
+/// Only the solid and acrylic modes have a tint the user can set. The
+/// translucent modes still read the stored colour, so switching away and back
+/// does not lose it, but they are defined by their material rather than by a
+/// colour.
+fn taskbar_tint(c: &Config) -> bool {
+    c.taskbar.enabled
+        && matches!(c.taskbar.mode, TaskbarMode::Opaque | TaskbarMode::Acrylic)
 }
 fn taskbar_dynamic(c: &Config) -> bool {
     c.taskbar.enabled && c.taskbar.dynamic_mode
@@ -608,7 +610,7 @@ const APPEARANCE: &[Card] = &[
             slider("widget.opacity", "背景不透明度", Some("0 表示不画背景，只留文字与图标。"), 0.0, 1.0, 0.01, Format::Percent),
             hint(
                 select("widget.color_mode", "前景颜色", WIDGET_COLOR_MODES),
-                "文字、图标与频谱的颜色。跟随主题时，浅色主题为黑色，深色主题为白色。",
+                "跟随主题时随深浅色切换。",
             ),
             when(
                 color("widget.foreground", "自定义前景色"),
@@ -629,7 +631,7 @@ const APPEARANCE: &[Card] = &[
             slider(
                 "widget.animation_ms",
                 "宽度过渡时长",
-                Some("组件宽度会跟随歌词长度变化，这里控制变化的动画时长，建议 120–180ms。"),
+                Some("宽度跟随歌词时的动画时长。"),
                 60.0,
                 400.0,
                 10.0,
@@ -647,7 +649,7 @@ const TASKBAR: &[Card] = &[
             Field {
                 path: "",
                 label: "当前状态",
-                hint: Some("实时反映任务栏模块正在做什么。"),
+                hint: Some("任务栏模块的实时状态。"),
                 kind: Kind::Status(StatusKind::Taskbar),
                 when: None,
             },
@@ -659,20 +661,16 @@ const TASKBAR: &[Card] = &[
             when(
                 hint(
                     select("taskbar.mode", "背景模式", MODES),
-                    "只有「纯色」可以自己指定颜色与不透明度；透明、模糊与亚克力由系统材质决定。",
+                    "「纯色」与「亚克力」可指定着色；透明与模糊由材质决定。",
                 ),
                 taskbar_on,
             ),
-            when(color("taskbar.color", "着色"), taskbar_solid),
-            when(
-                slider("taskbar.opacity", "着色不透明度", None, 0.0, 1.0, 0.01, Format::Percent),
-                taskbar_solid,
-            ),
+            when(color("taskbar.color", "着色"), taskbar_tint),
             when(
                 switch_hint(
                     "taskbar.show_hairline",
                     "显示任务栏顶部细线",
-                    "任务栏上沿的那条分隔线。默认隐藏：任务栏透明后它不再分隔任何东西，反而最显眼。",
+                    "任务栏上沿的分隔线。",
                 ),
                 taskbar_on,
             ),
@@ -689,7 +687,7 @@ const TASKBAR: &[Card] = &[
                 switch_hint(
                     "taskbar.dynamic_mode",
                     "动态模式",
-                    "当显示器上有窗口最大化时切换为指定效果，窗口还原后恢复。",
+                    "有窗口最大化时切换为指定效果。",
                 ),
                 taskbar_on,
             ),
@@ -701,7 +699,7 @@ const TASKBAR: &[Card] = &[
                 switch_hint(
                     "taskbar.hide_on_fullscreen",
                     "全屏应用时还原为系统默认",
-                    "避免在游戏或全屏视频上叠加异常的背景。",
+                    "避免在全屏画面上叠加背景。",
                 ),
                 taskbar_on,
             ),
@@ -709,7 +707,7 @@ const TASKBAR: &[Card] = &[
                 switch_hint(
                     "taskbar.restore_on_exit",
                     "退出时还原任务栏",
-                    "强烈建议保持开启；关闭后退出程序会保留当前效果直到注销。",
+                    "退出程序时恢复系统默认。",
                 ),
                 taskbar_on,
             ),
@@ -726,7 +724,7 @@ const WIDGET: &[Card] = &[
                 switch_hint(
                     "widget.hide_with_autohide",
                     "任务栏自动隐藏时一并隐藏",
-                    "任务栏收起时小组件栏也一起消失。",
+                    "任务栏收起时一并消失。",
                 ),
                 widget_on,
             ),
@@ -738,7 +736,7 @@ const WIDGET: &[Card] = &[
             when(
                 hint(
                     select("widget.anchor", "锚点", ANCHORS),
-                    "任务栏内锚点会贴住开始按钮或通知区域；屏幕锚点则使用工作区底部。",
+                    "贴住开始按钮或通知区域。",
                 ),
                 widget_on,
             ),
@@ -747,7 +745,7 @@ const WIDGET: &[Card] = &[
             when(
                 hint(
                     number("widget.margin", "边距", 0, 40, "px"),
-                    "小组件与任务栏上下边缘之间留出的空隙。",
+                    "与任务栏边缘的空隙。",
                 ),
                 widget_on,
             ),
@@ -781,7 +779,7 @@ const MEDIA: &[Card] = &[
             Field {
                 path: "",
                 label: "频谱采集",
-                hint: Some("频谱来自默认播放设备的回环捕获，不需要任何虚拟声卡。"),
+                hint: Some("来自系统音频回放，无需虚拟声卡。"),
                 kind: Kind::Status(StatusKind::Spectrum),
                 when: None,
             },
@@ -828,7 +826,7 @@ const MEDIA: &[Card] = &[
             when(
                 hint(
                     select("media.lyric_provider", "歌词来源", LYRIC_PROVIDERS),
-                    "除「关闭」外都会把当前歌曲的名称与歌手发送给对应平台以查询歌词，找不到时会自动尝试其它平台。查询结果只存在内存里，不会写入磁盘；介意联网就选「关闭」。",
+                    "除「关闭」外会把歌名与歌手发送给对应平台查询；结果只存内存。",
                 ),
                 media_on,
             ),
@@ -836,9 +834,7 @@ const MEDIA: &[Card] = &[
                 Field {
                     path: "media.online_api",
                     label: "自定义接口地址",
-                    hint: Some(
-                        "支持 {title} / {artist} / {album} 占位符；返回 LRC，或带 lyric/lrc 字段的 JSON。",
-                    ),
+                    hint: Some("支持 {title} / {artist} / {album} 占位符，返回 LRC。"),
                     kind: Kind::Text {
                         placeholder: "https://example.com/lrc?title={title}&artist={artist}",
                     },
@@ -850,9 +846,7 @@ const MEDIA: &[Card] = &[
                 Field {
                     path: "",
                     label: "歌词排错",
-                    hint: Some(
-                        "歌词目录里的 .lrc 文件名需为「歌手 - 歌名.lrc」，优先于在线结果。点「测试当前来源」会用正在播放的歌实际请求一次并告诉你结果。",
-                    ),
+                    hint: Some("「歌手 - 歌名.lrc」优先于在线结果。"),
                     kind: Kind::Action(&[
                         Button {
                             label: "测试当前来源",
@@ -873,7 +867,7 @@ const MEDIA: &[Card] = &[
                 slider(
                     "media.lyric_offset_ms",
                     "歌词偏移",
-                    Some("正值让歌词提前显示；用于补偿不同平台的进度上报延迟。"),
+                    Some("正值让歌词提前显示。"),
                     -5000.0,
                     5000.0,
                     50.0,
@@ -885,7 +879,7 @@ const MEDIA: &[Card] = &[
                 slider(
                     "media.poll_interval_ms",
                     "兜底刷新间隔",
-                    Some("播放状态由系统事件推送，这里只是防止遗漏的兜底轮询。"),
+                    Some("播放状态由系统事件推送，此项仅为兜底。"),
                     500.0,
                     10000.0,
                     250.0,
@@ -902,14 +896,14 @@ const MEDIA: &[Card] = &[
                 switch_hint(
                     "media.demo_mode",
                     "预览模式",
-                    "显示一段演示曲目、歌词与频谱，用来在没有播放任何内容时调整外观。",
+                    "播放演示曲目、歌词与频谱。",
                 ),
                 media_on,
             ),
             Field {
                 path: "",
                 label: "歌词文件",
-                hint: Some("歌词目录中的 .lrc 文件会被优先使用；在线获取的歌词不会写入这里。"),
+                hint: Some("本地 .lrc 优先于在线结果。"),
                 kind: Kind::Action(&[
                     Button {
                         label: "打开歌词目录",
@@ -964,7 +958,7 @@ const CLIPBOARD: &[Card] = &[
                 switch_hint(
                     "clipboard.capture_sensitive",
                     "记录被标记为「不记录」的内容",
-                    "密码管理器等程序会主动标记这类内容。默认忽略，仅在确实需要时开启。",
+                    "密码管理器会主动标记这类内容。",
                 ),
                 clipboard_on,
             ),
@@ -1003,7 +997,7 @@ const TODO: &[Card] = &[
                 switch_hint(
                     "todo.carry_over",
                     "启动时把未完成任务顺延到今天",
-                    "未完成的旧任务会出现在今天的列表里。",
+                    "旧任务会出现在今天的列表里。",
                 ),
                 todo_on,
             ),
@@ -1039,17 +1033,17 @@ const SYSTEM: &[Card] = &[
             switch_hint(
                 "general.autostart",
                 "开机自动启动",
-                "写入当前用户的启动项，不需要管理员权限。",
+                "写入当前用户的启动项。",
             ),
             hotkey(
                 "clipboard.hotkey",
                 "剪贴板快捷键",
-                "打开剪贴板历史。点一下再按组合键即可记录，按 Backspace 清空则不注册。",
+                "点一下再按组合键记录；Backspace 清空。",
             ),
             hotkey(
                 "clipboard.pin_hotkey",
                 "贴图快捷键",
-                "把剪贴板里的图片贴到屏幕最上层（与 Snipaste 的 F3 一致）。再按一次收起。",
+                "贴出剪贴板图片，再按一次收起。",
             ),
             hotkey("todo.hotkey", "任务清单快捷键", "打开任务清单。留空则不注册。"),
         ],
@@ -1110,7 +1104,7 @@ const SNIP: &[Card] = &[
                 hotkey(
                     "snip.hotkey",
                     "截图快捷键",
-                    "点一下再按组合键即可记录。按下后在整块桌面上拖出要截取的区域，Esc 或右键取消；                     按 Backspace 清空则不注册。",
+                    "点一下再按组合键记录。按下后拖选区域，Esc 或右键取消。",
                 ),
                 snip_on,
             ),
@@ -1137,7 +1131,7 @@ const SNIP: &[Card] = &[
                 switch_hint(
                     "snip.copy_to_clipboard",
                     "复制到剪贴板",
-                    "以标准 CF_DIB 写入，可直接粘贴到聊天窗口或画图。",
+                    "以标准 CF_DIB 写入，可直接粘贴。",
                 ),
                 snip_on,
             ),
@@ -1145,14 +1139,14 @@ const SNIP: &[Card] = &[
                 switch_hint(
                     "snip.auto_pin",
                     "同时贴到屏幕上",
-                    "在截取的原位置生成一张贴图：拖动移动，滚轮缩放，方向键微调，Esc 或双击关闭。",
+                    "在原位置生成可拖动缩放的贴图。",
                 ),
                 snip_on,
             ),
             when(
                 hint(
                     slider("snip.dim", "选区外遮罩", None, 0.0, 0.85, 0.05, Format::Percent),
-                    "遮罩越深，选区越突出；过深会看不清背景。",
+                    "遮罩越深，选区越突出。",
                 ),
                 snip_on,
             ),
@@ -1163,7 +1157,7 @@ const SNIP: &[Card] = &[
         fields: &[Field {
             path: "",
             label: "屏幕上可能有之前留下的贴图",
-            hint: Some("贴图是独立窗口，会一直留在桌面上直到手动关闭。"),
+            hint: Some("贴图会留在桌面上直到手动关闭。"),
             kind: Kind::Action(&[Button {
                 label: "关闭全部贴图",
                 action: ActionId::CloseAllPins,
@@ -1216,49 +1210,49 @@ pub const SECTIONS: &[Section] = &[
     Section {
         id: "appearance",
         title: "外观",
-        description: "主题、强调色，以及小组件外观。这些设置只影响 WinBeautify 自己的窗口。",
+        description: "WinBeautify 自己窗口的主题与外观。",
         cards: APPEARANCE,
         is_about: false,
     },
     Section {
         id: "taskbar",
         title: "任务栏",
-        description: "通过 DWM 与合成 API 为任务栏叠加透明、模糊或材质背景，不修改任何系统文件。",
+        description: "任务栏的透明、模糊与材质。",
         cards: TASKBAR,
         is_about: false,
     },
     Section {
         id: "widget",
         title: "小组件栏",
-        description: "嵌入任务栏的 Widget Bar：启动器、音频组件与 Flyout。",
+        description: "嵌入任务栏的启动器、歌词与频谱。",
         cards: WIDGET,
         is_about: false,
     },
     Section {
         id: "media",
         title: "媒体与歌词",
-        description: "通过 Windows 媒体会话（GSMTC）读取正在播放的内容，并从系统音频回放中提取频谱。",
+        description: "歌词与音乐频谱。",
         cards: MEDIA,
         is_about: false,
     },
     Section {
         id: "clipboard",
         title: "剪贴板",
-        description: "监听系统剪贴板变化并保存历史，支持文本、图片与文件列表。",
+        description: "剪贴板历史：文本、图片与文件。",
         cards: CLIPBOARD,
         is_about: false,
     },
     Section {
         id: "todo",
         title: "任务清单",
-        description: "轻量的待办列表，可从小组件栏的 Flyout 直接查看与勾选。",
+        description: "待办列表。",
         cards: TODO,
         is_about: false,
     },
     Section {
         id: "snip",
         title: "截图",
-        description: "拖动选择区域后把截图放进剪贴板，或贴回屏幕上继续对照。全程在本进程内完成，不写临时文件。",
+        description: "截图与贴图。",
         cards: SNIP,
         is_about: false,
     },
@@ -1446,8 +1440,8 @@ mod tests {
                 .visible_fields(c)
                 .any(|(_, field)| field.path == "taskbar.color")
         };
-        // The default mode is a material, so there is no tint to configure.
-        assert!(!shows_tint(&config), "no tint to configure in acrylic mode");
+        // The default mode is acrylic, which carries a tint.
+        assert!(shows_tint(&config), "acrylic has a colour to configure");
         config.taskbar.mode = TaskbarMode::Clear;
         assert!(!shows_tint(&config), "clear has nothing to tint");
         config.taskbar.mode = TaskbarMode::Opaque;
@@ -1455,16 +1449,8 @@ mod tests {
             shows_tint(&config),
             "the solid mode is the one with a colour"
         );
-
-        // Opacity travels with the colour: they are one control surface.
-        let shows_opacity = |c: &Config| {
-            section
-                .visible_fields(c)
-                .any(|(_, field)| field.path == "taskbar.opacity")
-        };
-        assert!(shows_opacity(&config));
         config.taskbar.mode = TaskbarMode::Blur;
-        assert!(!shows_opacity(&config));
+        assert!(!shows_tint(&config), "blur is defined by its material");
     }
 
     #[test]
