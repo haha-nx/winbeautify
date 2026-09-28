@@ -206,13 +206,21 @@ impl<'a> Canvas<'a> {
         offset: (f32, f32),
         color: Rgba,
     ) -> Result<()> {
-        let geometry = build_contours_path(factory, contours, offset)?;
+        let geometry = build_contours_path(
+            factory,
+            contours,
+            offset,
+            D2D1_FIGURE_END_CLOSED,
+        )?;
         self.set(color);
         unsafe { self.target.FillGeometry(&geometry, &self.brush, None) };
         Ok(())
     }
 
-    /// An outlined polygon, for the small "no artwork" style glyphs.
+    /// A stroked polyline whose ends stay open — the shape a checkmark is.
+    ///
+    /// Stroking a closed figure instead would join the last point back to the
+    /// first, which turns a tick into a triangle.
     pub fn stroke_polyline(
         &self,
         factory: &ID2D1Factory,
@@ -221,7 +229,28 @@ impl<'a> Canvas<'a> {
         color: Rgba,
         width: f32,
     ) -> Result<()> {
-        let geometry = build_path(factory, points, offset)?;
+        let geometry =
+            build_contours_path(factory, &[points], offset, D2D1_FIGURE_END_OPEN)?;
+        self.set(color);
+        unsafe {
+            self.target
+                .DrawGeometry(&geometry, &self.brush, width, None)
+        };
+        Ok(())
+    }
+
+    /// An outlined closed polygon, for the small "no artwork" style glyphs —
+    /// the star and the pin, whose silhouettes include the closing edge.
+    pub fn stroke_polygon(
+        &self,
+        factory: &ID2D1Factory,
+        points: &[(f32, f32)],
+        offset: (f32, f32),
+        color: Rgba,
+        width: f32,
+    ) -> Result<()> {
+        let geometry =
+            build_contours_path(factory, &[points], offset, D2D1_FIGURE_END_CLOSED)?;
         self.set(color);
         unsafe {
             self.target
@@ -237,17 +266,20 @@ pub fn build_path(
     points: &[(f32, f32)],
     offset: (f32, f32),
 ) -> Result<ID2D1PathGeometry> {
-    build_contours_path(factory, &[points], offset)
+    build_contours_path(factory, &[points], offset, D2D1_FIGURE_END_CLOSED)
 }
 
 /// Build one closed figure per contour, with each point offset by `(dx, dy)`.
 ///
 /// The fill mode is stated rather than relied on: alternate is what turns a
-/// contour inside another into a hole.
+/// contour inside another into a hole. `figure_end` decides whether the stroke
+/// variants leave the contour open — a checkmark — or close it back onto the
+/// first point — a polygon.
 fn build_contours_path(
     factory: &ID2D1Factory,
     contours: &[&[(f32, f32)]],
     offset: (f32, f32),
+    figure_end: D2D1_FIGURE_END,
 ) -> Result<ID2D1PathGeometry> {
     unsafe {
         let geometry = factory.CreatePathGeometry()?;
@@ -268,7 +300,7 @@ fn build_contours_path(
                         Y: y + offset.1,
                     });
                 }
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink.EndFigure(figure_end);
             }
         }
         sink.Close()?;

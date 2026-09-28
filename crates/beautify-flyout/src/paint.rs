@@ -865,7 +865,7 @@ impl Painter {
                 if filled {
                     canvas.fill_polygon(&self.factory, &points, (0.0, 0.0), colour)?;
                 }
-                canvas.stroke_polyline(&self.factory, &points, (0.0, 0.0), colour, thin)?;
+                canvas.stroke_polygon(&self.factory, &points, (0.0, 0.0), colour, thin)?;
             }
             Icon::Pin => {
                 // The source glyph is outline-style: filled it draws as the

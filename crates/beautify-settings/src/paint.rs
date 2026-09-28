@@ -39,6 +39,15 @@ use crate::schema::{Field, InfoKey, Kind, StatusKind};
 const LABEL_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_NORMAL;
 const TITLE_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_SEMI_BOLD;
 
+/// A device reorder drag in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceDrag {
+    /// The config path of the list being reordered.
+    pub path: &'static str,
+    /// The ticked position the drag is carrying.
+    pub ticked_index: usize,
+}
+
 /// What the pointer and keyboard are doing, which is all the painter needs to
 /// know about interaction.
 #[derive(Debug, Clone, Default)]
@@ -49,6 +58,8 @@ pub struct Interaction {
     pub hover_part: Option<Part>,
     /// The row a slider is being dragged on, if any.
     pub dragging_row: Option<usize>,
+    /// The device reorder drag, if any.
+    pub device_drag: Option<DeviceDrag>,
     /// The row whose dropdown is open.
     pub open_dropdown: Option<usize>,
     /// Index of the highlighted entry in that dropdown.
@@ -645,7 +656,7 @@ impl Painter {
         label: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         right: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
     ) -> Result<()> {
-        let parts = controls::parts(row.field, row.control, metrics);
+        let parts = controls::parts(row.field, row.control, metrics, &row.devices);
         let value = if row.field.path.is_empty() {
             None
         } else {
@@ -892,8 +903,156 @@ impl Painter {
                     self.text_in(canvas, rect, &text, centred, colour);
                 }
             }
+            // One line per audio device: a checkbox, the device name, and — on
+            // the lines that are in the switch order — a drag handle.
+            Kind::CheckboxList(_) => {
+                if row.devices.is_empty() {
+                    // An empty machine still says so in words. A blank card
+                    // reads as a broken page rather than as "no hardware".
+                    let Kind::CheckboxList(kind) = row.field.kind else {
+                        unreachable!("this arm is only reached for a checkbox list");
+                    };
+                    let text = self.fitted(kind.empty_message(), small, row.control.width());
+                    self.text_in(canvas, row.control, &text, small, palette.text_faint);
+                    return Ok(());
+                }
+
+                for (index, device) in row.devices.iter().enumerate() {
+                    let Some(tick) = parts.boxes.get(index).copied() else {
+                        break;
+                    };
+                    let hovered_box =
+                        hovered && interaction.hover_part == Some(Part::Box(index));
+
+                    // The tick: an outline box when off; when on, the accent
+                    // fills the box and a checkmark in the on-accent colour
+                    // rides inside it.
+                    let radius = metrics.px(4.0);
+                    if device.ticked {
+                        canvas.fill_rounded(tick, radius, palette.accent);
+                        self.check_mark(canvas, tick, metrics, palette.on_accent)?;
+                        if hovered_box {
+                            // The box itself is already the accent colour, so
+                            // the hover shows as a ring just outside it.
+                            let ring = tick.inset_by(-metrics.px(2.0), -metrics.px(2.0));
+                            canvas.stroke_rounded(ring, radius + metrics.px(2.0), palette.accent, 1.0);
+                        }
+                    } else {
+                        canvas.fill_rounded(tick, radius, palette.control);
+                        canvas.stroke_rounded(tick, radius, palette.control_border, 1.0);
+                        if hovered_box {
+                            canvas.stroke_rounded(tick, radius, palette.accent, 1.0);
+                        }
+                    }
+
+                    // The handle first, so the name can be fitted against
+                    // whatever room is left rather than running under it.
+                    let mut name_right = row.control.right;
+                    if let Some(ticked_index) = device.ticked_index {
+                        if let Some(rect) = parts.buttons.get(ticked_index) {
+                            let dragging = interaction.device_drag
+                                == Some(DeviceDrag {
+                                    path: row.field.path,
+                                    ticked_index,
+                                });
+                            let lit = hovered
+                                && interaction.hover_part == Some(Part::Button(ticked_index));
+                            let colour = if dragging || lit {
+                                palette.accent
+                            } else {
+                                palette.text_dim
+                            };
+                            self.drag_handle(canvas, *rect, colour, metrics)?;
+                            name_right = rect.left - metrics.control_gap() * 0.5;
+                        }
+                    }
+
+                    // The name, then the kind tag and the "current default"
+                    // mark as dimmed suffixes.
+                    let mut suffix = String::new();
+                    if device.is_default {
+                        suffix.push_str(" · 当前");
+                    }
+                    if !device.kind.is_empty() {
+                        suffix.push_str(" · ");
+                        suffix.push_str(&device.kind);
+                    }
+                    let text_left = tick.right + metrics.control_gap() * 0.5;
+                    let text_rect = Rect::new(
+                        text_left,
+                        tick.center_y() - metrics.label_size() * 0.5 * crate::layout::LINE_SPACING,
+                        name_right.max(text_left),
+                        tick.center_y() + metrics.label_size() * 0.5 * crate::layout::LINE_SPACING,
+                    );
+                    if text_rect.width() > 0.0 {
+                        let text = self.fitted(
+                            &format!("{}{}", device.name, suffix),
+                            small,
+                            text_rect.width(),
+                        );
+                        let colour = if device.ticked {
+                            palette.text
+                        } else {
+                            palette.text_dim
+                        };
+                        self.text_in(canvas, text_rect, &text, small, colour);
+                    }
+                }
+            }
         }
         let _ = label;
+        Ok(())
+    }
+
+    /// A tick inside a checkbox, stroked open — closing the figure would join
+    /// the two upper ends into a triangle.
+    fn check_mark(
+        &self,
+        canvas: &Canvas<'_>,
+        box_rect: Rect,
+        _metrics: &Metrics,
+        colour: Rgba,
+    ) -> Result<()> {
+        let cx = box_rect.center_x();
+        let cy = box_rect.center_y();
+        let unit = box_rect.width();
+        let points = [
+            (cx - unit * 0.24, cy + unit * 0.02),
+            (cx - unit * 0.06, cy + unit * 0.19),
+            (cx + unit * 0.26, cy - unit * 0.19),
+        ];
+        canvas.stroke_polyline(&self.factory, &points, (0.0, 0.0), colour, unit * 0.13)
+    }
+
+    /// The reorder handle: three short, deliberately stubby horizontal bars,
+    /// centred in its rect.
+    ///
+    /// A press-and-hold on it starts a drag; the accent colour says this is the
+    /// handle being carried.
+    fn drag_handle(
+        &self,
+        canvas: &Canvas<'_>,
+        rect: Rect,
+        colour: Rgba,
+        metrics: &Metrics,
+    ) -> Result<()> {
+        let cx = rect.center_x();
+        let cy = rect.center_y();
+        // Bars cover well under half the box and run thick: a long thin triple
+        // rule reads as a text decoration rather than as something to grab.
+        let half = rect.width() * 0.2;
+        let step = rect.height() * 0.24;
+        let width = metrics.px(2.6);
+        for offset in [-step, 0.0, step] {
+            let y = cy + offset;
+            canvas.stroke_polyline(
+                &self.factory,
+                &[(cx - half, y), (cx + half, y)],
+                (0.0, 0.0),
+                colour,
+                width,
+            )?;
+        }
         Ok(())
     }
 
@@ -1253,6 +1412,7 @@ mod tests {
             &metrics,
             crate::schema::section("appearance").unwrap(),
             &beautify_core::config::Config::default(),
+            &crate::devices::Devices::default(),
             0.0,
             &|_, _| 14.0,
         );
@@ -1286,6 +1446,7 @@ mod tests {
             &metrics,
             crate::schema::section("appearance").unwrap(),
             &beautify_core::config::Config::default(),
+            &crate::devices::Devices::default(),
             0.0,
             &|_, _| 14.0,
         );
@@ -1349,6 +1510,7 @@ mod tests {
             &metrics,
             crate::schema::section("appearance").unwrap(),
             &beautify_core::config::Config::default(),
+            &crate::devices::Devices::default(),
             0.0,
             &|_, _| 14.0,
         );
