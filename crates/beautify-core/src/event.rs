@@ -35,6 +35,9 @@ pub enum Event {
     TodoChanged,
     /// Windows light/dark theme changed.
     ThemeChanged,
+    /// The default audio endpoint moved — because the user double-clicked the
+    /// tray icon, or because Windows itself changed it.
+    AudioDeviceChanged,
 }
 
 impl Event {
@@ -49,6 +52,7 @@ impl Event {
             Event::ClipboardChanged => "clipboard-changed",
             Event::TodoChanged => "todo-changed",
             Event::ThemeChanged => "theme-changed",
+            Event::AudioDeviceChanged => "audio-device-changed",
         }
     }
 

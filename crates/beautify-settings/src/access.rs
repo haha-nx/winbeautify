@@ -24,6 +24,9 @@ pub enum Value {
     Integer(i64),
     Float(f64),
     Text(String),
+    /// An ordered list of strings — the ticked audio devices, where the order
+    /// *is* the setting (it is the order a double-click walks).
+    List(Vec<String>),
 }
 
 impl Value {
@@ -45,6 +48,13 @@ impl Value {
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Value::Text(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn as_list(&self) -> Option<&[String]> {
+        match self {
+            Value::List(value) => Some(value),
             _ => None,
         }
     }
@@ -70,6 +80,16 @@ fn to_value(raw: &toml::Value) -> Option<Value> {
         toml::Value::Integer(value) => Some(Value::Integer(*value)),
         toml::Value::Float(value) => Some(Value::Float(*value)),
         toml::Value::String(value) => Some(Value::Text(value.clone())),
+        // A list of strings, which is what the device selections are. A mixed
+        // or non-string array is refused rather than coerced: nothing in the
+        // schema declares one, so it would be a bug rather than a value.
+        toml::Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(item.as_str()?.to_string());
+            }
+            Some(Value::List(out))
+        }
         _ => None,
     }
 }
@@ -125,6 +145,12 @@ pub fn write(config: &mut Config, path: &str, value: Value) -> bool {
         (toml::Value::String(_), Value::Text(value)) => toml::Value::String(value),
         (toml::Value::String(_), Value::Integer(value)) => toml::Value::String(value.to_string()),
         (toml::Value::String(_), Value::Float(value)) => toml::Value::String(value.to_string()),
+        // A string list replaces a string list. The whole list is written at
+        // once — the device rows are reordered by replacing the array, not by
+        // mutating an element — so there is no per-element coercion to do.
+        (toml::Value::Array(_), Value::List(items)) => {
+            toml::Value::Array(items.into_iter().map(toml::Value::String).collect())
+        }
         // A mismatch the UI should not produce; refuse rather than corrupt the
         // field's type.
         _ => return false,
@@ -184,6 +210,7 @@ mod tests {
                 Kind::Select(_) | Kind::Color | Kind::Text { .. } | Kind::Hotkey => {
                     matches!(value, Value::Text(_))
                 }
+                Kind::CheckboxList(_) => matches!(value, Value::List(_)),
                 Kind::Status(_) | Kind::Info(_) | Kind::Action(_) => false,
             };
             assert!(matches, "{path} read back as {value:?}, which its control cannot use");
@@ -256,9 +283,88 @@ mod tests {
                         );
                     }
                 }
+                Kind::CheckboxList(_) => {
+                    // Exercised in full by `a_checkbox_list_round_trips_in_order`;
+                    // here it only has to accept a write of its own shape.
+                    let wanted: Vec<String> = vec!["x".into(), "y".into()];
+                    assert!(
+                        write(&mut config, path, Value::List(wanted.clone())),
+                        "{path} refused a list write"
+                    );
+                    assert_eq!(read(&config, path).unwrap().as_list().unwrap(), wanted);
+                }
                 Kind::Status(_) | Kind::Info(_) | Kind::Action(_) => unreachable!("filtered out"),
             }
         }
+    }
+
+    /// The device selections are the one list-valued control: reading one must
+    /// give a list, writing one must store exactly what was written *in order*,
+    /// and the order is the setting — a `Vec` that came back sorted would
+    /// silently change which device a double-click reaches next.
+    #[test]
+    fn a_checkbox_list_round_trips_in_order() {
+        for kind in crate::devices::DeviceListKind::ALL {
+            let path = kind.path();
+            let mut config = Config::default();
+
+            let initial = read(&config, path).expect("the list must resolve");
+            assert!(
+                initial.as_list().is_some_and(|list| list.is_empty()),
+                "{path} should start empty, got {initial:?}"
+            );
+
+            let wanted: Vec<String> = vec!["c".into(), "a".into(), "b".into()];
+            assert!(
+                write(&mut config, path, Value::List(wanted.clone())),
+                "{path} refused a list write"
+            );
+            let stored = read(&config, path).unwrap();
+            assert_eq!(
+                stored.as_list().unwrap(),
+                wanted.as_slice(),
+                "{path} must keep the order it was given"
+            );
+
+            // Emptying it again is a legitimate state: the user unticked
+            // everything.
+            assert!(write(&mut config, path, Value::List(Vec::new())));
+            assert!(read(&config, path).unwrap().as_list().unwrap().is_empty());
+        }
+    }
+
+    /// The two device lists must be independent, or ticking a speaker would
+    /// tick a microphone.
+    #[test]
+    fn the_two_device_lists_do_not_share_storage() {
+        use crate::devices::DeviceListKind;
+
+        let mut config = Config::default();
+        write(
+            &mut config,
+            DeviceListKind::Speakers.path(),
+            Value::List(vec!["s".into()]),
+        );
+        assert_eq!(config.audio_switch.speakers, ["s".to_string()]);
+        assert!(
+            config.audio_switch.microphones.is_empty(),
+            "writing the speaker list must not touch the microphone list"
+        );
+    }
+
+    /// A list field must refuse a scalar rather than turn it into a one-element
+    /// list, which would look like a successful tick.
+    #[test]
+    fn a_list_field_refuses_a_scalar() {
+        use crate::devices::DeviceListKind;
+
+        let mut config = Config::default();
+        assert!(!write(
+            &mut config,
+            DeviceListKind::Speakers.path(),
+            Value::Text("not a list".into())
+        ));
+        assert!(config.audio_switch.speakers.is_empty());
     }
 
     /// Writing a value the field cannot hold must be reported, not swallowed.

@@ -25,6 +25,11 @@ beautify-widget.workspace = true
 beautify-flyout.workspace = true
 beautify-settings.workspace = true
 beautify-snip.workspace = true
+# The audio switcher: endpoint enumeration and the default-device COM call. The
+# gesture, the config plumbing and the tray icon live in `app/src/audio.rs`.
+beautify-audio.workspace = true
+# The top-left confirmation panel the switch and its failures are reported in.
+beautify-toast.workspace = true
 
 tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
 serde.workspace = true

@@ -8,9 +8,11 @@ members = [
     "crates/beautify-clipboard",
     "crates/beautify-todo",
     "crates/beautify-snip",
+    "crates/beautify-audio",
     "crates/beautify-settings",
     "crates/beautify-flyout",
     "crates/beautify-widget",
+    "crates/beautify-toast",
     "app",
 ]
 
@@ -33,6 +35,8 @@ beautify-widget = { path = "crates/beautify-widget" }
 beautify-settings = { path = "crates/beautify-settings" }
 beautify-flyout = { path = "crates/beautify-flyout" }
 beautify-snip = { path = "crates/beautify-snip" }
+beautify-audio = { path = "crates/beautify-audio" }
+beautify-toast = { path = "crates/beautify-toast" }
 
 windows = "0.62"
 # Direct2D takes windows_numerics::Vector2 / Matrix3x2 for points and

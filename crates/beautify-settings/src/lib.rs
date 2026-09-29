@@ -22,6 +22,7 @@
 
 pub mod access;
 pub mod controls;
+pub mod devices;
 pub mod geom;
 pub mod layout;
 pub mod paint;
@@ -31,6 +32,7 @@ pub mod window;
 
 pub use access::{read, toggle, write, Value};
 pub use controls::{Part, Parts};
+pub use devices::{DeviceInfo, DeviceListKind, DeviceRow, Devices};
 pub use paint::{Interaction, StatusText, Tone};
 pub use schema::{
     ActionId, Button, Choice, Field, Format, InfoKey, Kind, Section, StatusKind, SECTIONS,

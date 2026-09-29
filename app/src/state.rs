@@ -12,6 +12,7 @@ use beautify_core::model::{FlyoutTab, TaskbarState};
 use beautify_core::{ModuleContext, Registry};
 use beautify_media::MediaModule;
 use beautify_taskbar::TaskbarModule;
+use beautify_toast::Toast;
 use beautify_todo::TodoModule;
 use beautify_widget::WidgetModule;
 use parking_lot::{Mutex, RwLock};
@@ -62,6 +63,13 @@ pub struct AppState {
     /// this is the channel a result reaches it through — there is no return path
     /// from an action row to the page.
     pub last_action: RwLock<String>,
+    /// The top-left confirmation panel.
+    ///
+    /// A handle rather than the window itself: [`Toast`] starts its own thread
+    /// on first use, so it can be built here before the app has any business
+    /// putting pixels on screen, and it is `Send + Sync` so the tray's message
+    /// pump and the event bus can both reach it.
+    pub toast: Toast,
     /// Set while `run()` is unwinding so background callbacks stop touching
     /// windows that are going away.
     pub shutting_down: AtomicBool,
@@ -107,6 +115,7 @@ impl AppState {
             flyout_panel: Mutex::new(None),
             settings_window: Mutex::new(None),
             last_action: RwLock::new(String::new()),
+            toast: Toast::new(),
             shutting_down: AtomicBool::new(false),
             started: AtomicBool::new(false),
             subscriptions: Mutex::new(Vec::new()),

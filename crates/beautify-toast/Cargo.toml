@@ -1,0 +1,33 @@
+[package]
+name = "beautify-toast"
+description = "Top-left confirmation toast for WinBeautify: a short-lived Direct2D panel that reports an action without interrupting it."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# The panel's geometry helpers (`Rect`) come from the same crate every other
+# module measures screens with.
+beautify-core.workspace = true
+# Reused rather than reimplemented: the layered surface and the Direct2D canvas
+# are the same plumbing the widget bar and the flyout already draw with.
+beautify-widget.workspace = true
+tracing.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+]

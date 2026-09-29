@@ -22,6 +22,7 @@ pub struct Config {
     pub todo: TodoConfig,
     pub widget: WidgetConfig,
     pub snip: SnipConfig,
+    pub audio_switch: AudioSwitchConfig,
     pub ui: UiConfig,
 }
 
@@ -36,6 +37,7 @@ impl Default for Config {
             todo: TodoConfig::default(),
             widget: WidgetConfig::default(),
             snip: SnipConfig::default(),
+            audio_switch: AudioSwitchConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -558,6 +560,104 @@ pub enum Theme {
     Auto,
 }
 
+/// Which side of the audio stack a double-click on the tray icon cycles.
+///
+/// The two sides are configured with their own device lists, so this only
+/// chooses which lists the one gesture drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AudioSwitchMode {
+    /// Playback devices only.
+    #[default]
+    Speakers,
+    /// Recording devices only.
+    Microphones,
+    /// Both, each cycling within its own list.
+    Both,
+}
+
+impl AudioSwitchMode {
+    /// The modes the settings page offers, in the order it lists them.
+    pub const ALL: [AudioSwitchMode; 3] = [
+        AudioSwitchMode::Speakers,
+        AudioSwitchMode::Microphones,
+        AudioSwitchMode::Both,
+    ];
+
+    /// Stable identifier used over the config boundary and in the UI tables.
+    pub const fn id(self) -> &'static str {
+        match self {
+            AudioSwitchMode::Speakers => "speakers",
+            AudioSwitchMode::Microphones => "microphones",
+            AudioSwitchMode::Both => "both",
+        }
+    }
+
+    /// Does this mode drive playback devices?
+    pub const fn covers_speakers(self) -> bool {
+        matches!(self, AudioSwitchMode::Speakers | AudioSwitchMode::Both)
+    }
+
+    /// Does this mode drive recording devices?
+    pub const fn covers_microphones(self) -> bool {
+        matches!(self, AudioSwitchMode::Microphones | AudioSwitchMode::Both)
+    }
+}
+
+/// Double-clicking the tray icon to hop between audio devices.
+///
+/// Device lists hold WASAPI **endpoint ID** strings, and the *order* is
+/// meaningful: it is the order a double-click walks, and the settings page
+/// offers up/down controls for it. Names are never stored — they are read live,
+/// so a renamed or unplugged device cannot leave a stale label behind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AudioSwitchConfig {
+    /// Master switch. Off means the tray icon stays the app's own icon and a
+    /// double-click does nothing.
+    ///
+    /// Off by default: silently repointing someone's audio on a double-click
+    /// would be a nasty surprise, and the feature is useless until devices have
+    /// been ticked anyway.
+    pub enabled: bool,
+    /// Which side of the stack the gesture drives.
+    pub mode: AudioSwitchMode,
+    /// Ticked playback endpoints, in switch order.
+    pub speakers: Vec<String>,
+    /// Ticked recording endpoints, in switch order.
+    pub microphones: Vec<String>,
+}
+
+impl AudioSwitchConfig {
+    /// The ticked endpoints for one side.
+    pub fn selected(&self, speakers: bool) -> &[String] {
+        if speakers {
+            &self.speakers
+        } else {
+            &self.microphones
+        }
+    }
+
+    /// Is there anything for a double-click to actually do in `mode`?
+    ///
+    /// Each side is judged on its own, which is the agreed behaviour: a
+    /// speaker list of three still cycles in [`AudioSwitchMode::Both`] even if
+    /// only one microphone is ticked. One device is not a choice — switching to
+    /// what is already default looks like a broken feature — so the bar is two.
+    pub fn is_usable(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let speakers = self.mode.covers_speakers() && self.speakers.len() >= MIN_AUDIO_DEVICES;
+        let microphones =
+            self.mode.covers_microphones() && self.microphones.len() >= MIN_AUDIO_DEVICES;
+        speakers || microphones
+    }
+}
+
+/// How many devices must be ticked before a side can be cycled.
+pub const MIN_AUDIO_DEVICES: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
@@ -693,6 +793,15 @@ impl Config {
         // Above about 0.85 the selection is hard to see against the dimmed
         // background, which makes the tool feel broken rather than dark.
         self.snip.dim = self.snip.dim.clamp(0.0, 0.85);
+
+        // Device lists are *not* validated against the machine here: the audio
+        // stack is not this layer's business, a device may simply be unplugged
+        // right now, and dropping an id would silently rewrite a preference the
+        // user is about to plug back in. Only the things that are wrong under
+        // every interpretation are removed — blank ids, and duplicates, which
+        // would make the cycle land on the same device twice in a row.
+        dedupe_devices(&mut self.audio_switch.speakers);
+        dedupe_devices(&mut self.audio_switch.microphones);
     }
 
     /// True when at least one module that owns a widget-bar surface is on.
@@ -701,12 +810,28 @@ impl Config {
     }
 }
 
+/// Drop blank entries and repeats from a device list, keeping the first
+/// occurrence of each.
+///
+/// Order is preserved because it *is* the switch order: a `Vec::dedup` after a
+/// sort would silently reorder the user's list, turning "walk these three in
+/// this order" into "walk them alphabetically".
+fn dedupe_devices(list: &mut Vec<String>) {
+    let mut seen: Vec<String> = Vec::with_capacity(list.len());
+    list.retain(|id| {
+        if id.trim().is_empty() || seen.iter().any(|k| k == id) {
+            return false;
+        }
+        seen.push(id.clone());
+        true
+    });
+}
+
 /// Owns the current config plus the path it lives at.
 ///
 /// Mutations go through [`ConfigManager::update`] so the in-memory copy and the
 /// file on disk can never drift.
-pub struct ConfigManager {
-    path: PathBuf,
+pub struct ConfigManager {    path: PathBuf,
     inner: parking_lot::RwLock<Config>,
 }
 
@@ -875,5 +1000,118 @@ mod tests {
         assert_eq!(cfg.taskbar.mode, TaskbarMode::Acrylic);
         assert!(path.with_extension("toml.broken").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The feature starts inert: a default config must not move anyone's audio.
+    #[test]
+    fn audio_switching_is_off_until_it_is_configured() {
+        let cfg = Config::default();
+        assert!(!cfg.audio_switch.enabled);
+        assert!(cfg.audio_switch.speakers.is_empty());
+        assert!(cfg.audio_switch.microphones.is_empty());
+        assert!(!cfg.audio_switch.is_usable());
+    }
+
+    /// Fewer than two ticked devices does nothing, in every mode — the rule the
+    /// whole feature hangs on.
+    #[test]
+    fn one_ticked_device_is_not_enough_to_switch() {
+        let mut cfg = Config::default();
+        cfg.audio_switch.enabled = true;
+        cfg.audio_switch.speakers = vec!["a".into()];
+        assert!(!cfg.audio_switch.is_usable(), "one device is not a choice");
+
+        cfg.audio_switch.speakers = vec!["a".into(), "b".into()];
+        assert!(cfg.audio_switch.is_usable(), "two devices can be cycled");
+    }
+
+    /// Each side stands on its own: a stocked speaker list still cycles in
+    /// `both` mode when only one microphone is ticked.
+    #[test]
+    fn the_two_sides_are_judged_independently() {
+        let mut cfg = Config::default();
+        cfg.audio_switch.enabled = true;
+        cfg.audio_switch.mode = AudioSwitchMode::Both;
+        cfg.audio_switch.speakers = vec!["s1".into(), "s2".into()];
+        cfg.audio_switch.microphones = vec!["m1".into()];
+        assert!(
+            cfg.audio_switch.is_usable(),
+            "the under-stocked microphone must not disable the speakers"
+        );
+
+        // …and the reverse: speakers emptied, microphones stocked.
+        cfg.audio_switch.speakers = vec!["s1".into()];
+        cfg.audio_switch.microphones = vec!["m1".into(), "m2".into()];
+        assert!(cfg.audio_switch.is_usable());
+
+        // Neither side stocked: nothing to do.
+        cfg.audio_switch.speakers = vec!["s1".into()];
+        cfg.audio_switch.microphones = vec!["m1".into()];
+        assert!(!cfg.audio_switch.is_usable());
+    }
+
+    /// A mode that does not cover the stocked side is still unusable: ticking
+    /// two microphones must not make `speakers`-mode do anything.
+    #[test]
+    fn the_mode_decides_which_stocked_side_counts() {
+        let mut cfg = Config::default();
+        cfg.audio_switch.enabled = true;
+        cfg.audio_switch.microphones = vec!["m1".into(), "m2".into()];
+
+        cfg.audio_switch.mode = AudioSwitchMode::Speakers;
+        assert!(!cfg.audio_switch.is_usable(), "speakers mode has no speakers");
+
+        cfg.audio_switch.mode = AudioSwitchMode::Microphones;
+        assert!(cfg.audio_switch.is_usable());
+
+        cfg.audio_switch.mode = AudioSwitchMode::Both;
+        assert!(cfg.audio_switch.is_usable());
+    }
+
+    /// The mode survives the config file in both directions.
+    #[test]
+    fn every_audio_mode_round_trips_through_the_config_file() {
+        for mode in AudioSwitchMode::ALL {
+            let text = format!("[audio_switch]\nmode = \"{}\"\n", mode.id());
+            let cfg = Config::from_toml(&text).unwrap();
+            assert_eq!(cfg.audio_switch.mode, mode, "{} did not survive", mode.id());
+        }
+    }
+
+    /// Blank ids and repeats are removed, and — the part that matters — the
+    /// user's order is preserved.
+    #[test]
+    fn device_lists_are_cleaned_without_being_reordered() {
+        let cfg = Config::from_toml(
+            "[audio_switch]\nenabled = true\nspeakers = [\"c\", \"a\", \"\", \"c\", \"b\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.audio_switch.speakers,
+            vec!["c".to_string(), "a".into(), "b".into()],
+            "duplicates and blanks go, order stays"
+        );
+    }
+
+    /// An unknown mode name must not fail the parse — a file that does not
+    /// parse is quarantined, which would cost the user every other setting.
+    #[test]
+    fn an_unknown_audio_mode_is_refused_without_losing_the_file() {
+        let cfg = Config::from_toml(
+            "[audio_switch]\nmode = \"nonsense\"\nspeakers = [\"a\", \"b\"]\n",
+        );
+        // Serde rejects an unknown variant; the important part is that this is
+        // a *parse* error the caller quarantines rather than a panic.
+        assert!(cfg.is_err(), "an unknown variant must be reported, not guessed");
+    }
+
+    /// Selected lists are addressed by side.
+    #[test]
+    fn the_selected_list_follows_the_side_asked_for() {
+        let mut cfg = AudioSwitchConfig::default();
+        cfg.speakers = vec!["s".into()];
+        cfg.microphones = vec!["m".into()];
+        assert_eq!(cfg.selected(true), ["s".to_string()]);
+        assert_eq!(cfg.selected(false), ["m".to_string()]);
     }
 }

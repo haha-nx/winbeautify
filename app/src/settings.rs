@@ -267,6 +267,25 @@ impl Host for SettingsHost {
     fn paste_text(&self) -> Option<String> {
         beautify_clipboard::capture::clipboard_text()
     }
+
+    fn audio_devices(&self) -> beautify_settings::Devices {
+        let flow = |flow: beautify_audio::Flow| {
+            beautify_audio::device::list(flow)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| beautify_settings::DeviceInfo {
+                    id: d.id,
+                    name: d.name,
+                    kind: d.kind.label().to_string(),
+                    is_default: d.is_default,
+                })
+                .collect()
+        };
+        beautify_settings::Devices {
+            speakers: flow(beautify_audio::Flow::Render),
+            microphones: flow(beautify_audio::Flow::Capture),
+        }
+    }
 }
 
 /// The Windows apps-light-theme setting.

@@ -15,6 +15,8 @@ use beautify_core::config::{
     Config, LyricProvider, SpectrumStyle, TaskbarMode, Theme, WidgetAnchor, WidgetColorMode,
 };
 
+use crate::devices::DeviceListKind;
+
 /// How a numeric value is rendered next to its slider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -156,6 +158,17 @@ pub enum Kind {
     /// the wrong affordance: the string is not the thing the user has in mind,
     /// the key press is, and a typo silently registers nothing.
     Hotkey,
+    /// A list of ticked items, drawn as one checkbox per entry.
+    ///
+    /// Unlike every other control this one is **variable height**: the contents
+    /// are the audio endpoints the machine happens to have, which the schema
+    /// cannot know. The rows come from [`crate::window::Host::audio_devices`]
+    /// and are resolved against the config by [`crate::devices::resolve`].
+    ///
+    /// The value at `path` is the ordered list of ticked ids, so the control
+    /// covers both "which devices" and "in what order" — the arrows only
+    /// reshuffle the same array.
+    CheckboxList(DeviceListKind),
     /// A live read-out; not editable.
     Status(StatusKind),
     /// A read-only key/value line whose value the host supplies. The label comes
@@ -392,6 +405,26 @@ const LYRIC_PROVIDERS: &[Choice] = &[
     },
 ];
 
+/// Which side of the audio stack a double-click drives.
+///
+/// The labels are written out rather than derived from the enum so they stay
+/// consistent with the rest of the page's wording; a test below checks that
+/// every storable mode is offered here.
+const AUDIO_MODES: &[Choice] = &[
+    Choice {
+        value: "speakers",
+        label: "仅切换扬声器",
+    },
+    Choice {
+        value: "microphones",
+        label: "仅切换麦克风",
+    },
+    Choice {
+        value: "both",
+        label: "同时切换",
+    },
+];
+
 const LOG_LEVELS: &[Choice] = &[
     Choice {
         value: "error",
@@ -463,6 +496,44 @@ fn snip_on(c: &Config) -> bool {
 }
 fn file_logging(c: &Config) -> bool {
     c.ui.file_logging
+}
+
+/// Is the audio switcher armed at all?
+///
+/// Everything below it hangs off this: with the feature off the tray icon is
+/// WinBeautify's own and none of the device rows mean anything.
+fn audio_on(c: &Config) -> bool {
+    c.audio_switch.enabled
+}
+
+/// The playback list, shown only when the mode actually drives playback.
+///
+/// Hiding it rather than disabling it is deliberate: a list of ticked playback
+/// devices under "仅切换麦克风" invites the user to tick things that will never
+/// be used.
+fn audio_speakers(c: &Config) -> bool {
+    c.audio_switch.enabled && c.audio_switch.mode.covers_speakers()
+}
+
+/// The recording list; see [`audio_speakers`].
+fn audio_microphones(c: &Config) -> bool {
+    c.audio_switch.enabled && c.audio_switch.mode.covers_microphones()
+}
+
+/// A checkbox list row for one side of the audio stack.
+///
+/// The label is not drawn for this kind — the list needs the full width, and
+/// the card's own title names the side — but it is still filled in, because a
+/// row without a label is indistinguishable from a mistake when the schema is
+/// read or tested.
+const fn device_list(kind: DeviceListKind, label: &'static str, hint: &'static str) -> Field {
+    Field {
+        path: kind.path(),
+        label,
+        hint: Some(hint),
+        kind: Kind::CheckboxList(kind),
+        when: None,
+    }
 }
 
 /// Shorthand for a switch row.
@@ -666,7 +737,11 @@ const TASKBAR: &[Card] = &[
                 ),
                 taskbar_on,
             ),
-            when(color("taskbar.color", "主题色"), taskbar_on),
+            // Only the modes that carry a tint offer one. `taskbar_on` here
+            // would show a colour picker for 透明 and 模糊, which have no tint
+            // and ignore the value — the hint above already says so, and
+            // `the_tint_rows_follow_the_mode` pins it.
+            when(color("taskbar.color", "主题色"), taskbar_tint),
             when(
                 switch_hint(
                     "taskbar.show_hairline",
@@ -1213,6 +1288,55 @@ const SNIP: &[Card] = &[
     },
 ];
 
+/// Double-click the tray icon to hop between audio devices.
+const AUDIO: &[Card] = &[
+    Card {
+        title: None,
+        fields: &[
+            switch_hint(
+                "audio_switch.enabled",
+                "双击托盘图标切换音频设备",
+                "关闭时托盘图标变为默认图标。",
+            ),
+            when(
+                hint(
+                    select("audio_switch.mode", "切换方式", AUDIO_MODES),
+                    "决定双击切换哪一侧的设备。",
+                ),
+                audio_on,
+            ),
+        ],
+    },
+    Card {
+        title: Some("播放设备"),
+        fields: &[when(
+            hint(
+                device_list(
+                    DeviceListKind::Speakers,
+                    "扬声器",
+                    "勾选至少两个才会切换。点击右侧的箭头即可调整顺序。",
+                ),
+                "点击箭头调整顺序；双击托盘图标按此顺序循环，至少勾选两个才生效。",
+            ),
+            audio_speakers,
+        )],
+    },
+    Card {
+        title: Some("录音设备"),
+        fields: &[when(
+            hint(
+                device_list(
+                    DeviceListKind::Microphones,
+                    "麦克风",
+                    "勾选至少两个才会切换。点击右侧的箭头即可调整顺序。",
+                ),
+                "仅切换麦克风或同时切换时才生效；同样至少勾选两个才生效。",
+            ),
+            audio_microphones,
+        )],
+    },
+];
+
 const ABOUT: &[Card] = &[
     Card {
         title: Some("运行信息"),
@@ -1302,6 +1426,13 @@ pub const SECTIONS: &[Section] = &[
         title: "截图",
         description: "截图与贴图。",
         cards: SNIP,
+        is_about: false,
+    },
+    Section {
+        id: "audio",
+        title: "音频切换",
+        description: "双击托盘图标在几个音频设备之间循环。",
+        cards: AUDIO,
         is_about: false,
     },
     Section {
@@ -1409,6 +1540,7 @@ pub fn mode_label(id: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beautify_core::config::AudioSwitchMode;
 
     #[test]
     fn every_editable_field_names_a_config_path() {
@@ -1689,6 +1821,87 @@ mod tests {
             );
         }
         assert_eq!(SPECTRUM_STYLES.len(), SpectrumStyle::ALL.len());
+
+        for mode in AudioSwitchMode::ALL {
+            assert!(offered(mode.id(), AUDIO_MODES), "{} has no row", mode.id());
+        }
+        assert_eq!(
+            AUDIO_MODES.len(),
+            AudioSwitchMode::ALL.len(),
+            "the page offers a mode the config does not have"
+        );
+    }
+
+    /// The audio section must not show a list the chosen mode will never use.
+    ///
+    /// Ticking playback devices under 「仅切换麦克风」 would be a promise the
+    /// double-click does not keep, so the row is hidden rather than merely
+    /// ignored.
+    #[test]
+    fn the_audio_lists_follow_the_switch_mode() {
+        let section = section("audio").unwrap();
+        let shows = |config: &Config, path: &str| {
+            section
+                .visible_fields(config)
+                .any(|(_, field)| field.path == path)
+        };
+
+        // Off: neither list is offered, and neither is the mode picker.
+        let config = Config::default();
+        assert!(!shows(&config, "audio_switch.mode"));
+        assert!(!shows(&config, "audio_switch.speakers"));
+        assert!(!shows(&config, "audio_switch.microphones"));
+
+        let enable = |mode| {
+            let mut config = Config::default();
+            config.audio_switch.enabled = true;
+            config.audio_switch.mode = mode;
+            config
+        };
+
+        let speakers = enable(AudioSwitchMode::Speakers);
+        assert!(shows(&speakers, "audio_switch.mode"));
+        assert!(shows(&speakers, "audio_switch.speakers"));
+        assert!(
+            !shows(&speakers, "audio_switch.microphones"),
+            "「仅切换扬声器」must not offer a microphone list"
+        );
+
+        let microphones = enable(AudioSwitchMode::Microphones);
+        assert!(!shows(&microphones, "audio_switch.speakers"));
+        assert!(shows(&microphones, "audio_switch.microphones"));
+
+        let both = enable(AudioSwitchMode::Both);
+        assert!(shows(&both, "audio_switch.speakers"));
+        assert!(shows(&both, "audio_switch.microphones"));
+    }
+
+    /// The two device lists are the only rows with a list-valued kind, and each
+    /// names its own config path — a copy-paste slip would have both writing the
+    /// speaker list.
+    #[test]
+    fn the_device_lists_point_at_their_own_config_paths() {
+        let section = section("audio").unwrap();
+        let mut seen = Vec::new();
+        for (_, field) in section
+            .cards
+            .iter()
+            .flat_map(|card| card.fields.iter())
+            .map(|field| (field, field))
+        {
+            if let Kind::CheckboxList(kind) = field.kind {
+                seen.push(kind);
+                assert_eq!(field.path, kind.path(), "{:?} names the wrong path", kind);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            crate::devices::DeviceListKind::ALL.len(),
+            "one checkbox list per side"
+        );
+        for kind in crate::devices::DeviceListKind::ALL {
+            assert!(seen.contains(&kind), "{kind:?} has no row");
+        }
     }
 
     /// The palette is the answer to "clicking the swatch does nothing", so its

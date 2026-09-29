@@ -25,6 +25,7 @@
 
 // The app links against `windows` for the shell helpers, so a crate-root
 // module named `windows` would shadow it; `win` is the window manager.
+mod audio;
 mod autostart;
 mod commands;
 mod flyout;
@@ -299,6 +300,12 @@ fn bridge_events(app: &AppHandle) {
                 flyout::refresh(&handle);
                 let _ = handle.emit("config-changed", handle.state::<Arc<AppState>>().config.get());
             }
+            Event::AudioDeviceChanged => {
+                // The tray icon names the current device's *kind*, so it has to
+                // be redrawn; the settings page marks which row is default.
+                crate::audio::refresh_tray_icon(&handle);
+                crate::settings::refresh(&handle);
+            }
         }
     });
     // Held for the lifetime of the process.
@@ -341,6 +348,12 @@ pub fn sync_side_effects(app: &AppHandle, config: &beautify_core::Config) {
     // its state from scratch — so re-push what only the host still knows.
     sync_flyout_state(app);
     push_widget_state(app);
+
+    // Turning the audio switcher on or off in Settings changes what the tray
+    // icon should be, and a reloaded config can change it just as much.
+    // Cheap: one default-endpoint read and, at most once per kind, one PNG
+    // decode.
+    crate::audio::refresh_tray_icon(app);
 }
 
 /// Tear everything down and exit. Safe to call more than once.

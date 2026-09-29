@@ -205,7 +205,217 @@ def main():
     with open(os.path.join(icons, "icon.ico"), "wb") as fh:
         fh.write(encode_ico(encoded))
 
+    write_device_icons(icons)
     print("wrote", icons)
+
+
+# ---------------------------------------------------------------------------
+# Tray icons for the audio-device switcher
+# ---------------------------------------------------------------------------
+#
+# When "double-click the tray icon to switch audio device" is armed, the tray
+# icon shows what the *current default playback device* is, so a glance at the
+# notification area answers "am I on headphones or speakers?". These are drawn
+# on the same gradient plate as the app icon so the three states read as one
+# family rather than as three unrelated programs.
+#
+# The glyphs are drawn as hard-edged predicates at 4x and then box-downsampled,
+# which is where their anti-aliasing comes from — the same trick the app plate
+# above relies on for its rounded corners.
+
+# Tray sizes are small, so one 32px master is plenty: the shell only ever asks
+# for 16, 20 or 24 logical pixels, and a 32px source has room to spare at 125%.
+DEVICE_SIZE = 32
+
+# White glyph over the plate; the plate's own gradient supplies the contrast.
+GLYPH = (255, 255, 255)
+# The "punched out" colour for holes in a glyph, matching the app's panel tint.
+PUNCH = (0x14, 0x16, 0x1C)
+
+
+def _in_circle(x, y, cx, cy, r):
+    return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+
+def _in_ring(x, y, cx, cy, r, half_width):
+    d = math.hypot(x - cx, y - cy)
+    return abs(d - r) <= half_width
+
+
+def _in_rounded_rect(x, y, left, top, w, h, rad):
+    """Point-in-rounded-rectangle, at supersampled resolution."""
+    if x < left or x > left + w or y < top or y > top + h:
+        return False
+    cx = min(max(x, left + rad), left + w - rad)
+    cy = min(max(y, top + rad), top + h - rad)
+    return (x - cx) ** 2 + (y - cy) ** 2 <= rad * rad
+
+
+def _in_triangle(x, y, a, b, c):
+    def side(p, q):
+        return (q[0] - p[0]) * (y - p[1]) - (q[1] - p[1]) * (x - p[0])
+
+    d1, d2, d3 = side(a, b), side(b, c), side(c, a)
+    has_neg = d1 < 0 or d2 < 0 or d3 < 0
+    has_pos = d1 > 0 or d2 > 0 or d3 > 0
+    return not (has_neg and has_pos)
+
+
+def _headphones(x, y, cx, cy, body):
+    """A headband over two ear cups."""
+    band_cy = cy - body * 0.02
+    band_r = body * 0.27
+    band_hw = body * 0.038
+    # Only the upper half of the ring, or it would look like a full halo.
+    if y <= band_cy and _in_ring(x, y, cx, band_cy, band_r, band_hw):
+        return True
+    cup_w = body * 0.150
+    cup_h = body * 0.215
+    cup_top = band_cy - body * 0.015
+    for sign in (-1, 1):
+        left = cx + sign * band_r - cup_w / 2
+        if _in_rounded_rect(x, y, left, cup_top, cup_w, cup_h, cup_w * 0.42):
+            return True
+    return False
+
+
+def _speakers(x, y, cx, cy, body):
+    """A cabinet with a woofer and a tweeter punched out of it."""
+    w = body * 0.44
+    h = body * 0.62
+    left, top = cx - w / 2, cy - h / 2
+    if not _in_rounded_rect(x, y, left, top, w, h, body * 0.09):
+        return False
+    # Holes rather than painted circles: the plate shows through, which reads
+    # far better at 16px than two white-on-white blobs would.
+    if _in_circle(x, y, cx, cy + body * 0.135, body * 0.125):
+        return False
+    if _in_circle(x, y, cx, cy - body * 0.130, body * 0.052):
+        return False
+    return True
+
+
+def _other(x, y, cx, cy, body):
+    """A generic output: a speaker cone with two sound waves.
+
+    Used for anything Windows does not label as headphones or speakers —
+    monitor outputs over HDMI, virtual cables, and so on.
+    """
+    oil = body * 0.300  # how far left the box starts
+    box_w = body * 0.100
+    box_h = body * 0.220
+    box_left = cx - oil
+    box_right = box_left + box_w
+    mouth_x = cx - body * 0.020
+
+    # The box the cone is mounted on.
+    if _in_rounded_rect(
+        x, y, box_left, cy - box_h / 2, box_w, box_h, body * 0.020
+    ):
+        return True
+    # The cone: apex at the box, flaring out to the right. Deliberately wide —
+    # the tray asks for 16 logical pixels and a daintier cone turned to mush.
+    if _in_triangle(
+        x,
+        y,
+        (box_right - body * 0.010, cy),
+        (mouth_x, cy - body * 0.270),
+        (mouth_x, cy + body * 0.270),
+    ):
+        return True
+
+    # Two sound waves to the right of the cone.
+    #
+    # They are *arcs*, not rings: the angular window keeps each one to a short
+    # stroke around the horizontal, so the pair reads as ")))" rather than as
+    # two circles wrapped around the cone — which is what an unrestricted
+    # half-ring looked like at this size.
+    wave_cx = cx + body * 0.020
+    dx = x - wave_cx
+    if dx > 0:
+        dy = y - cy
+        if abs(dy) <= dx:  # within ~45 degrees of horizontal
+            for radius, half_width in ((0.140, 0.036), (0.230, 0.030)):
+                if _in_ring(x, y, wave_cx, cy, body * radius, body * half_width):
+                    return True
+    return False
+
+
+DEVICE_GLYPHS = {
+    "headphones": _headphones,
+    "speakers": _speakers,
+    "other": _other,
+}
+
+
+def render_device(size, glyph):
+    """RGBA bytes for a device tray icon: the app plate plus a white glyph."""
+    ss = 4
+    big = size * ss
+    canvas = bytearray(big * big * 4)
+
+    pad = big * 0.055
+    body = big - 2 * pad
+    radius = body * 0.235
+    cx = cy = big / 2.0
+
+    # --- the same rounded gradient plate the app icon uses ---------------
+    for y in range(big):
+        t = y / max(1, big - 1)
+        r = lerp(TOP[0], BOTTOM[0], t)
+        g = lerp(TOP[1], BOTTOM[1], t)
+        b = lerp(TOP[2], BOTTOM[2], t)
+        row = y * big * 4
+        for x in range(big):
+            cov = rounded_rect_coverage(x - pad, y - pad, body, body, radius)
+            if cov <= 0:
+                continue
+            i = row + x * 4
+            canvas[i] = int(r)
+            canvas[i + 1] = int(g)
+            canvas[i + 2] = int(b)
+            canvas[i + 3] = int(255 * cov)
+
+    # --- the glyph --------------------------------------------------------
+    for y in range(big):
+        for x in range(big):
+            i = (y * big + x) * 4
+            if canvas[i + 3] == 0:
+                continue
+            if not glyph(x + 0.5, y + 0.5, cx, cy, body):
+                continue
+            for c in range(3):
+                canvas[i + c] = GLYPH[c]
+            canvas[i + 3] = 255
+
+    # --- downsample -------------------------------------------------------
+    out = bytearray(size * size * 4)
+    area = ss * ss
+    for y in range(size):
+        for x in range(size):
+            r = g = b = a = 0
+            for sy in range(ss):
+                for sx in range(ss):
+                    i = ((y * ss + sy) * big + (x * ss + sx)) * 4
+                    r += canvas[i]
+                    g += canvas[i + 1]
+                    b += canvas[i + 2]
+                    a += canvas[i + 3]
+            o = (y * size + x) * 4
+            out[o] = r // area
+            out[o + 1] = g // area
+            out[o + 2] = b // area
+            out[o + 3] = a // area
+    return bytes(out)
+
+
+def write_device_icons(icons):
+    """Write one PNG per device kind, named `device-<kind>.png`."""
+    for name, glyph in DEVICE_GLYPHS.items():
+        png = encode_png(render_device(DEVICE_SIZE, glyph), DEVICE_SIZE)
+        path = os.path.join(icons, "device-%s.png" % name)
+        with open(path, "wb") as fh:
+            fh.write(png)
 
 
 if __name__ == "__main__":
