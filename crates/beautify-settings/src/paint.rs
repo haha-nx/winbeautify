@@ -39,15 +39,6 @@ use crate::schema::{Field, InfoKey, Kind, StatusKind};
 const LABEL_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_NORMAL;
 const TITLE_WEIGHT: DWRITE_FONT_WEIGHT = DWRITE_FONT_WEIGHT_SEMI_BOLD;
 
-/// A device reorder drag in progress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeviceDrag {
-    /// The config path of the list being reordered.
-    pub path: &'static str,
-    /// The ticked position the drag is carrying.
-    pub ticked_index: usize,
-}
-
 /// What the pointer and keyboard are doing, which is all the painter needs to
 /// know about interaction.
 #[derive(Debug, Clone, Default)]
@@ -58,8 +49,6 @@ pub struct Interaction {
     pub hover_part: Option<Part>,
     /// The row a slider is being dragged on, if any.
     pub dragging_row: Option<usize>,
-    /// The device reorder drag, if any.
-    pub device_drag: Option<DeviceDrag>,
     /// The row whose dropdown is open.
     pub open_dropdown: Option<usize>,
     /// Index of the highlighted entry in that dropdown.
@@ -945,24 +934,26 @@ impl Painter {
                         }
                     }
 
-                    // The handle first, so the name can be fitted against
+                    // The arrow first, so the name can be fitted against
                     // whatever room is left rather than running under it.
                     let mut name_right = row.control.right;
                     if let Some(ticked_index) = device.ticked_index {
                         if let Some(rect) = parts.buttons.get(ticked_index) {
-                            let dragging = interaction.device_drag
-                                == Some(DeviceDrag {
-                                    path: row.field.path,
-                                    ticked_index,
-                                });
-                            let lit = hovered
-                                && interaction.hover_part == Some(Part::Button(ticked_index));
-                            let colour = if dragging || lit {
-                                palette.accent
-                            } else {
-                                palette.text_dim
-                            };
-                            self.drag_handle(canvas, *rect, colour, metrics)?;
+                            // The first line has nowhere to move up into, so
+                            // it shows no arrow; its slot stays reserved,
+                            // which keeps every ticked line's name fitting
+                            // the same way.
+                            if ticked_index > 0 {
+                                let lit = hovered
+                                    && interaction.hover_part
+                                        == Some(Part::Button(ticked_index));
+                                let colour = if lit {
+                                    palette.accent
+                                } else {
+                                    palette.text_dim
+                                };
+                                self.up_arrow(canvas, *rect, colour)?;
+                            }
                             name_right = rect.left - metrics.control_gap() * 0.5;
                         }
                     }
@@ -1024,36 +1015,25 @@ impl Painter {
         canvas.stroke_polyline(&self.factory, &points, (0.0, 0.0), colour, unit * 0.13)
     }
 
-    /// The reorder handle: three short, deliberately stubby horizontal bars,
-    /// centred in its rect.
+    /// The reorder arrow: a solid triangle pointing up, drawn in every ticked
+    /// line's slot except the first, which has nowhere to move to.
     ///
-    /// A press-and-hold on it starts a drag; the accent colour says this is the
-    /// handle being carried.
-    fn drag_handle(
-        &self,
-        canvas: &Canvas<'_>,
-        rect: Rect,
-        colour: Rgba,
-        metrics: &Metrics,
-    ) -> Result<()> {
+    /// One press moves its line one place up; the accent colour says the
+    /// pointer is on it.
+    fn up_arrow(&self, canvas: &Canvas<'_>, rect: Rect, colour: Rgba) -> Result<()> {
         let cx = rect.center_x();
         let cy = rect.center_y();
-        // Bars cover well under half the box and run thick: a long thin triple
-        // rule reads as a text decoration rather than as something to grab.
-        let half = rect.width() * 0.2;
-        let step = rect.height() * 0.24;
-        let width = metrics.px(2.6);
-        for offset in [-step, 0.0, step] {
-            let y = cy + offset;
-            canvas.stroke_polyline(
-                &self.factory,
-                &[(cx - half, y), (cx + half, y)],
-                (0.0, 0.0),
-                colour,
-                width,
-            )?;
-        }
-        Ok(())
+        // A little wider than tall, and nudged down a hair: a triangle centred
+        // on its box reads as sitting high.
+        let half = rect.width() * 0.19;
+        let height = rect.height() * 0.30;
+        let drop = rect.height() * 0.05;
+        let points = [
+            (cx, cy - height * 0.5 + drop),
+            (cx + half, cy + height * 0.5 + drop),
+            (cx - half, cy + height * 0.5 + drop),
+        ];
+        canvas.fill_polygon(&self.factory, &points, (0.0, 0.0), colour)
     }
 
     /// The open colour palette, drawn over the page.

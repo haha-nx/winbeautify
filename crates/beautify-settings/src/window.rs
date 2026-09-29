@@ -70,6 +70,7 @@ use beautify_widget::scrollbar::ScrollDrag;
 
 use crate::access::{self, Value};
 use crate::controls;
+use crate::devices::{self, Devices};
 use crate::geom::{clamp, Rect};
 use crate::layout::{self, Layout, Metrics};
 use crate::paint::{self, Interaction, Painter, StatusText, WindowButton};
@@ -121,6 +122,16 @@ pub trait Host: Send + Sync {
     }
     /// Live values for the status and 关于 rows.
     fn status(&self) -> StatusText;
+    /// The audio endpoints the machine currently offers.
+    ///
+    /// Enumerating endpoints is a COM round-trip, so the window caches the
+    /// answer and only asks when something might have changed — see
+    /// [`Window::refresh_devices`]. The default is empty, which draws the
+    /// "nothing here" line; a host with no audio support therefore degrades to
+    /// a page that says so rather than to one that fails to draw.
+    fn audio_devices(&self) -> Devices {
+        Devices::default()
+    }
     /// Run an action row button.
     fn action(&self, action: ActionId);
     /// Copy text to the system clipboard, for the text fields.
@@ -310,6 +321,13 @@ struct Window {
     drag_row: Option<usize>,
     /// Whether a `WM_MOUSELEAVE` is pending, so it is only requested once.
     tracking_leave: bool,
+    /// The audio endpoints the machine offers, for the checkbox lists.
+    ///
+    /// Cached rather than asked for on every frame: enumerating endpoints is a
+    /// COM round-trip that costs milliseconds, and a page repaints on every
+    /// mouse move. It is refreshed when the host says something changed, and
+    /// when the user opens the audio section — see [`Window::refresh_devices`].
+    devices: Devices,
 }
 
 impl Window {
@@ -331,7 +349,16 @@ impl Window {
             status: StatusText::default(),
             drag_row: None,
             tracking_leave: false,
+            devices: Devices::default(),
         }
+    }
+
+    /// Re-read the audio endpoints from the host.
+    ///
+    /// Cheap enough to call on any event that might have changed the hardware,
+    /// and deliberately *not* called per frame.
+    fn refresh_devices(&mut self) {
+        self.devices = self.host.audio_devices();
     }
 
     /// The client area, in physical pixels.
@@ -351,6 +378,10 @@ impl Window {
         self.config = self.host.config();
         self.palette = Palette::resolve(&self.config, self.host.system_is_light());
         self.status = self.host.status();
+        // The device lists can change for reasons the config never sees — a
+        // headset plugged in, a monitor switched off — so a refresh re-reads
+        // them rather than trusting the cache.
+        self.refresh_devices();
         self.repaint();
     }
 
@@ -362,6 +393,7 @@ impl Window {
             &self.metrics,
             self.active,
             &self.config,
+            &self.devices,
             self.scroll,
             &|text, width| self.measure_hint(text, width),
         )
@@ -488,7 +520,7 @@ impl Window {
             });
             let part = interactive.and_then(|index| {
                 let row = self.row(index)?;
-                let parts = controls::parts(row.field, row.control, &self.metrics);
+                let parts = controls::parts(row.field, row.control, &self.metrics, &row.devices);
                 parts.part_at(x, y)
             });
             let nav = self.layout.as_ref().and_then(|layout| {
@@ -706,12 +738,15 @@ impl Window {
 
     /// Act on a click inside a row.
     fn click_row(&mut self, row_index: usize, x: f32, y: f32) {
-        // `Row` is `Copy` and the field is `'static`, so both come out of the
-        // layout by value and the borrow ends here.
-        let Some((field, control)) = self.row(row_index).map(|row| (row.field, row.control)) else {
+        // The field is `'static` and the device lines are cloned out, so the
+        // borrow of the layout ends before anything below mutates `self`.
+        let Some((field, control, device_rows)) = self
+            .row(row_index)
+            .map(|row| (row.field, row.control, row.devices.clone()))
+        else {
             return;
         };
-        let parts = controls::parts(field, control, &self.metrics);
+        let parts = controls::parts(field, control, &self.metrics, &device_rows);
         let Some(part) = parts.part_at(x, y) else {
             self.stop_recording();
             self.commit_edit();
@@ -724,6 +759,21 @@ impl Window {
                 if access::toggle(&mut config, field.path).is_some() {
                     self.commit(config);
                 }
+            }
+            // Tick or untick one device. The checkbox index *is* the index into
+            // the row's resolved device list, which is why the layout hands the
+            // same vector to the painter and the hit tester.
+            (Kind::CheckboxList(_), controls::Part::Box(index)) => {
+                let Some(device) = device_rows.get(index) else {
+                    return;
+                };
+                self.toggle_device(field.path, &device.id);
+            }
+            // A press on a reorder arrow moves its line one place up, then and
+            // there. The first line shows no arrow, and a press there asks for
+            // a move that does not exist — which `reorder_device` refuses.
+            (Kind::CheckboxList(_), controls::Part::Button(ticked_index)) => {
+                self.reorder_device(field.path, ticked_index, true);
             }
             (Kind::Slider(slider), controls::Part::SliderTrack) => {
                 if let Some(fraction) = parts.slider_fraction(x) {
@@ -784,7 +834,7 @@ impl Window {
         let Kind::Slider(slider) = row.field.kind else {
             return;
         };
-        let parts = controls::parts(row.field, row.control, &self.metrics);
+        let parts = controls::parts(row.field, row.control, &self.metrics, &row.devices);
         let Some(fraction) = parts.slider_fraction(x) else {
             return;
         };
@@ -933,6 +983,10 @@ impl Window {
         self.commit_edit();
         self.stop_scroll();
         self.active = section;
+        // Device lists are the one thing that changes without this window's
+        // involvement — re-read them so an opened page does not show hardware
+        // that was unplugged (or miss hardware plugged in) while it sat here.
+        self.refresh_devices();
         self.scroll = 0.0;
         self.interaction.open_dropdown = None;
         self.interaction.open_color = None;
@@ -981,6 +1035,53 @@ impl Window {
         self.repaint();
     }
 
+    /// Tick or untick one audio device on the list at `path`.
+    ///
+    /// Ticking appends to the end, so the order of the switch cycle is the
+    /// order the user picked things — which is what the arrows then adjust.
+    fn toggle_device(&mut self, path: &str, id: &str) {
+        let mut config = self.config.clone();
+        let current = match access::read(&config, path).and_then(|value| match value {
+            Value::List(ids) => Some(ids),
+            _ => None,
+        }) {
+            Some(ids) => ids,
+            // A list field that does not read back as a list is a schema
+            // mistake, not something to guess at.
+            None => return,
+        };
+        let next = devices::toggle_selection(&current, id);
+        if access::write(&mut config, path, Value::List(next)) {
+            self.commit(config);
+        }
+    }
+
+    /// Move one ticked device a place up or down the switch order.
+    ///
+    /// Every ticked line but the first carries an up arrow; the first line's
+    /// press produces no move, so a click there leaves the config alone rather
+    /// than wrapping the entry around.
+    fn reorder_device(&mut self, path: &str, index: usize, up: bool) {
+        let mut config = self.config.clone();
+        let current = match access::read(&config, path).and_then(|value| match value {
+            Value::List(ids) => Some(ids),
+            _ => None,
+        }) {
+            Some(ids) => ids,
+            None => return,
+        };
+        let moved = if up {
+            devices::move_up(&current, index)
+        } else {
+            devices::move_down(&current, index)
+        };
+        if let Some(next) = moved {
+            if access::write(&mut config, path, Value::List(next)) {
+                self.commit(config);
+            }
+        }
+    }
+
     /// Put the caret in a row's text box, with its current value selected.
     fn begin_edit(&mut self, row_index: usize) {
         let Some(row) = self.row(row_index) else {
@@ -991,7 +1092,9 @@ impl Window {
                 Value::Text(text) => Some(text),
                 Value::Integer(number) => Some(number.to_string()),
                 Value::Float(number) => Some(number.to_string()),
-                Value::Bool(_) => None,
+                // Neither of these is ever edited as text. A checkbox list has
+                // no text box at all, and a switch has no caret.
+                Value::Bool(_) | Value::List(_) => None,
             })
             .unwrap_or_default();
         self.commit_edit();

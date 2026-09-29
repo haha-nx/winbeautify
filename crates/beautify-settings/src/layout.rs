@@ -14,6 +14,7 @@
 
 use beautify_core::config::Config;
 
+use crate::devices::{self, DeviceListKind, DeviceRow, Devices};
 use crate::geom::{clamp, Rect};
 use crate::schema::{Card as CardSpec, Field, Kind, Section, SECTIONS};
 
@@ -202,22 +203,55 @@ impl Metrics {
     pub fn window_buttons_width(&self) -> f32 {
         self.px(58.0)
     }
+
+    /// Height of one device line inside a checkbox list.
+    pub fn device_row_height(&self) -> f32 {
+        self.px(28.0)
+    }
+
+    /// Edge length of the checkbox square in a device line.
+    pub fn checkbox_size(&self) -> f32 {
+        self.px(16.0)
+    }
+
+    /// Edge length of the box a reorder arrow sits in.
+    pub fn arrow_size(&self) -> f32 {
+        self.px(22.0)
+    }
+
+    /// Gap between two device lines.
+    pub fn device_row_gap(&self) -> f32 {
+        self.px(2.0)
+    }
+
+    /// Gap between the hint above a checkbox list and its first line.
+    pub fn device_list_gap(&self) -> f32 {
+        self.px(6.0)
+    }
 }
 
 /// One row, positioned.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Row {
     /// The schema entry this came from, so the painter knows the control kind
     /// without being told separately.
     pub field: &'static Field,
     /// The whole row, including padding.
     pub rect: Rect,
-    /// Where the label goes. Empty for status and action rows.
+    /// Where the label goes. Empty for status, action and checkbox-list rows.
     pub label: Rect,
     /// Where the hint goes. Empty when the field has none.
     pub hint: Rect,
     /// Where the control goes.
     pub control: Rect,
+    /// For a [`Kind::CheckboxList`] row: the lines to draw, already resolved
+    /// against the config. Empty for every other kind.
+    ///
+    /// Carried on the row rather than recomputed by the painter and the hit
+    /// tester separately — those two must agree on which checkbox is at which
+    /// rectangle, and the only way to guarantee that is for both to read the
+    /// same resolved list.
+    pub devices: Vec<DeviceRow>,
     /// Draw a divider above this row (false for the first row of a card).
     pub divider: bool,
 }
@@ -303,12 +337,15 @@ impl Layout {
 /// Build the layout for one section.
 ///
 /// `measure_hint(text, width)` returns the height the hint needs when wrapped
-/// into `width`.
+/// into `width`. `devices` is what the machine currently offers, which is what
+/// sizes the checkbox lists — they are the one control whose height the schema
+/// cannot know.
 pub fn layout(
     window: Rect,
     metrics: &Metrics,
     section: &'static Section,
     config: &Config,
+    devices: &Devices,
     scroll: f32,
     measure_hint: &dyn Fn(&str, f32) -> f32,
 ) -> Layout {
@@ -331,7 +368,7 @@ pub fn layout(
     );
 
     let nav = layout_nav(sidebar, metrics, section);
-    let content = layout_content(viewport, metrics, section, config, scroll, measure_hint);
+    let content = layout_content(viewport, metrics, section, config, devices, scroll, measure_hint);
 
     let scroll_max = (content.height - viewport.height()).max(0.0);
     let scroll = clamp(scroll, 0.0, scroll_max);
@@ -397,6 +434,7 @@ fn layout_content(
     metrics: &Metrics,
     section: &'static Section,
     config: &Config,
+    devices: &Devices,
     scroll: f32,
     measure_hint: &dyn Fn(&str, f32) -> f32,
 ) -> Content {
@@ -443,6 +481,8 @@ fn layout_content(
             let row = layout_row(
                 field,
                 metrics,
+                config,
+                devices,
                 left,
                 right,
                 inner,
@@ -501,6 +541,8 @@ fn layout_content(
 fn layout_row(
     field: &'static Field,
     metrics: &Metrics,
+    config: &Config,
+    devices: &Devices,
     left: f32,
     right: f32,
     top: f32,
@@ -517,19 +559,50 @@ fn layout_row(
     // box several lines high and drop it onto the hint below.
     let label_line = label_size * LINE_SPACING;
 
+    // The lines of a checkbox list, resolved once here: the height below, the
+    // painter and the hit tester all read this same vector.
+    let device_rows = match field.kind {
+        Kind::CheckboxList(kind) => {
+            let ticked = match crate::access::read(config, field.path) {
+                Some(crate::access::Value::List(ids)) => ids,
+                // A list field whose value is missing is not worth failing the
+                // whole page over; an empty list still draws every device,
+                // unticked, which is exactly what the user can recover from.
+                _ => Vec::new(),
+            };
+            devices::resolve(devices.of(kind), &ticked)
+        }
+        _ => Vec::new(),
+    };
+
     let mut text_height = label_line;
     let mut hint_height = 0.0;
     if let Some(hint) = field.hint {
         hint_height = measure_hint(hint, label_width) + metrics.hint_gap();
         text_height += hint_height;
     }
-    let control_height = control_height_for(&field.kind, metrics);
-    let content_height = text_height.max(control_height);
+    let control_height = control_height_for(&field.kind, metrics, config, &device_rows);
+    // A checkbox list stacks its hint above its lines, so their heights add;
+    // every other control sits beside its label, where the taller of the two
+    // sets the height.
+    let stacked = matches!(field.kind, Kind::CheckboxList(_));
+    let content_height = if stacked {
+        hint_height
+            + if hint_height > 0.0 {
+                metrics.device_list_gap()
+            } else {
+                0.0
+            }
+            + control_height
+    } else {
+        text_height.max(control_height)
+    };
     let row_height = (content_height + padding_v * 2.0).max(metrics.row_min_height());
     let rect = Rect::new(left, top, right, top + row_height);
 
-    // Status and action rows put their control in the label column: there is no
-    // value to the right of the label to describe.
+    // Status, action and checkbox-list rows put their control in the label
+    // column: there is no value beside the label to describe, and the lists
+    // need the full width to show a device name next to its box.
     let (label, control) = match field.kind {
         Kind::Status(_) => (Rect::EMPTY, Rect::new(left + padding_h, rect.top + padding_v, right - padding_h, rect.bottom - padding_v)),
         Kind::Action(_) => (Rect::EMPTY, Rect::new(left + padding_h, rect.top + padding_v, right - padding_h, rect.bottom - padding_v)),
@@ -547,6 +620,17 @@ fn layout_row(
             ),
             Rect::new(
                 left + padding_h + label_width + metrics.control_gap() * 0.5,
+                rect.top + padding_v,
+                right - padding_h,
+                rect.bottom - padding_v,
+            ),
+        ),
+        Kind::CheckboxList(_) => (
+            Rect::EMPTY,
+            // The hint is split off the top of this rectangle further down, so
+            // the control simply fills the row's inner height here.
+            Rect::new(
+                left + padding_h,
                 rect.top + padding_v,
                 right - padding_h,
                 rect.bottom - padding_v,
@@ -582,23 +666,70 @@ fn layout_row(
         Rect::EMPTY
     };
 
+    // A checkbox list has no label column, so its hint goes in the list's own
+    // rectangle, at the top, with the lines below it.
+    let (hint, control) = if matches!(field.kind, Kind::CheckboxList(_)) && hint_height > 0.0 {
+        let hint_rect = Rect::new(
+            control.left,
+            control.top,
+            control.right,
+            control.top + hint_height,
+        );
+        let shifted = Rect::new(
+            control.left,
+            hint_rect.bottom + metrics.device_list_gap(),
+            control.right,
+            control.bottom,
+        );
+        (hint_rect, shifted)
+    } else {
+        (hint, control)
+    };
+
     Row {
         field,
         rect,
         label,
         hint,
         control,
+        devices: device_rows,
         divider: !is_first,
     }
 }
 
 /// How tall the control of `kind` wants to be.
-fn control_height_for(kind: &Kind, metrics: &Metrics) -> f32 {
+///
+/// A checkbox list is the one kind that is variable: its height is one line per
+/// device, which only the machine can say.
+fn control_height_for(
+    kind: &Kind,
+    metrics: &Metrics,
+    config: &Config,
+    device_rows: &[DeviceRow],
+) -> f32 {
+    let _ = config;
     match kind {
         Kind::Switch => metrics.switch_height(),
         Kind::Action(_) => metrics.button_height(),
+        Kind::CheckboxList(kind) => device_list_height(*kind, metrics, device_rows),
         _ => metrics.control_height(),
     }
+}
+
+/// The height the lines of a checkbox list need.
+///
+/// An empty machine still gets one line's worth, because the list says so in
+/// words ("没有找到可用的播放设备") rather than drawing nothing at all — a blank
+/// card reads as a bug.
+pub fn device_list_height(
+    _kind: DeviceListKind,
+    metrics: &Metrics,
+    device_rows: &[DeviceRow],
+) -> f32 {
+    let count = device_rows.len().max(1);
+    let line = metrics.device_row_height();
+    let gap = metrics.device_row_gap();
+    count as f32 * line + (count.saturating_sub(1)) as f32 * gap
 }
 
 #[cfg(test)]
@@ -618,15 +749,130 @@ mod tests {
     }
 
     fn build(section: &str, config: &Config, scroll: f32) -> Layout {
+        build_with(section, config, &Devices::default(), scroll)
+    }
+
+    /// Build a page with a given audio-device catalogue.
+    fn build_with(section: &str, config: &Config, devices: &Devices, scroll: f32) -> Layout {
         let metrics = Metrics::new(96);
         layout(
             window(),
             &metrics,
             crate::schema::section(section).unwrap(),
             config,
+            devices,
             scroll,
             &fake_measure,
         )
+    }
+
+    fn device(id: &str) -> crate::devices::DeviceInfo {
+        crate::devices::DeviceInfo {
+            id: id.to_string(),
+            name: format!("设备 {id}"),
+            kind: "音箱".to_string(),
+            is_default: false,
+        }
+    }
+
+    /// The row for `path`, or `None` when the section does not show it.
+    fn row_for<'a>(layout: &'a Layout, path: &str) -> Option<&'a Row> {
+        layout
+            .content
+            .cards
+            .iter()
+            .flat_map(|card| card.rows.iter())
+            .find(|row| row.field.path == path)
+    }
+
+    /// A checkbox list is the one control whose height the schema cannot know,
+    /// so the row has to grow with the machine's device count. A fixed-height
+    /// row would clip the list — and the clipped lines would remain
+    /// hit-testable, so the clicks would land on devices nobody can see.
+    #[test]
+    fn a_checkbox_list_row_grows_with_the_device_count() {
+        use beautify_core::config::AudioSwitchMode;
+
+        let mut config = Config::default();
+        config.audio_switch.enabled = true;
+        config.audio_switch.mode = AudioSwitchMode::Speakers;
+
+        let row_height = |count: usize| {
+            let devices = Devices {
+                speakers: (0..count).map(|i| device(&format!("s{i}"))).collect(),
+                microphones: Vec::new(),
+            };
+            let layout = build_with("audio", &config, &devices, 0.0);
+            row_for(&layout, "audio_switch.speakers")
+                .map(|row| row.rect.height())
+                .expect("the speaker list row must be laid out")
+        };
+
+        let one = row_height(1);
+        let three = row_height(3);
+        let six = row_height(6);
+
+        assert!(
+            three > one,
+            "three devices must need more room than one ({three} vs {one})"
+        );
+        assert!(six > three, "and six more than three ({six} vs {three})");
+        // The growth is one line per device, not something arbitrary.
+        let metrics = Metrics::new(96);
+        let per_device = metrics.device_row_height() + metrics.device_row_gap();
+        assert!(
+            ((six - three) - 3.0 * per_device).abs() < 0.01,
+            "three extra devices should add exactly three lines"
+        );
+    }
+
+    /// An empty machine still gets a line's worth of height, because the list
+    /// says "nothing here" in words rather than drawing a blank card.
+    #[test]
+    fn an_empty_checkbox_list_still_has_room_for_its_message() {
+        use beautify_core::config::AudioSwitchMode;
+
+        let mut config = Config::default();
+        config.audio_switch.enabled = true;
+        config.audio_switch.mode = AudioSwitchMode::Speakers;
+
+        let layout = build_with("audio", &config, &Devices::default(), 0.0);
+        let row = row_for(&layout, "audio_switch.speakers")
+            .expect("the row is laid out even with no hardware");
+        assert!(
+            row.control.height() > 0.0,
+            "the message needs somewhere to go"
+        );
+        assert!(
+            row.devices.is_empty(),
+            "and there is genuinely nothing to tick"
+        );
+    }
+
+    /// The hint must not be drawn through the first device line: the list has
+    /// to start below it.
+    #[test]
+    fn the_checkbox_list_starts_below_its_hint() {
+        use beautify_core::config::AudioSwitchMode;
+
+        let mut config = Config::default();
+        config.audio_switch.enabled = true;
+        config.audio_switch.mode = AudioSwitchMode::Speakers;
+        let devices = Devices {
+            speakers: vec![device("s0"), device("s1")],
+            microphones: Vec::new(),
+        };
+
+        let layout = build_with("audio", &config, &devices, 0.0);
+        let row = row_for(&layout, "audio_switch.speakers").expect("the row");
+        assert!(!row.hint.is_empty(), "the row has a hint to place");
+        assert!(
+            row.control.top >= row.hint.bottom - 0.01,
+            "the list starts at {} but the hint ends at {}",
+            row.control.top,
+            row.hint.bottom
+        );
+        assert_eq!(row.devices.len(), 2);
     }
 
     #[test]
@@ -640,6 +886,7 @@ mod tests {
                 &metrics,
                 section,
                 &Config::default(),
+                &Devices::default(),
                 0.0,
                 &fake_measure,
             );
@@ -663,6 +910,7 @@ mod tests {
                 &metrics,
                 section,
                 &Config::default(),
+                &Devices::default(),
                 0.0,
                 &fake_measure,
             );
@@ -850,6 +1098,7 @@ mod tests {
             &metrics,
             crate::schema::section("widget").unwrap(),
             &Config::default(),
+            &Devices::default(),
             0.0,
             &fake_measure,
         );
@@ -865,7 +1114,7 @@ mod tests {
     #[test]
     fn hit_testing_respects_the_viewport() {
         let layout = build("media", &Config::default(), 0.0);
-        let first = layout.content.cards[0].rows[0];
+        let first = &layout.content.cards[0].rows[0];
         let center = (
             (first.rect.left + first.rect.right) * 0.5,
             (first.rect.top + first.rect.bottom) * 0.5,
@@ -900,6 +1149,7 @@ mod tests {
             &metrics,
             crate::schema::section("appearance").unwrap(),
             &config,
+            &Devices::default(),
             0.0,
             &fake_measure,
         );
