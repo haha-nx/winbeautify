@@ -37,6 +37,10 @@ pub const SPECTRUM_BARS: usize = beautify_core::model::SPECTRUM_BANDS;
 const SPECTRUM_BAR_WIDTH: f32 = 2.5;
 /// Gap between bands.
 const SPECTRUM_BAR_GAP: f32 = 1.5;
+/// The lyric's design size, in 96-DPI pixels. Lives here rather than in the
+/// painter because the layout needs it too: the slot's floor is one character
+/// of this font, which for the CJK lines the bar carries is one em.
+pub const LYRIC_PX: f32 = 12.0;
 /// Minimum height of the pill, so a 1-px taskbar cannot produce a 0-px window.
 pub const MIN_BAR_HEIGHT: f32 = 26.0;
 /// Bar width is only recomputed when it changes by at least this much.
@@ -231,12 +235,11 @@ pub struct Content {
 /// Widths the layout needs from outside.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Bounds on the whole audio component.
-    pub audio_min: f32,
+    /// Ceiling on the whole audio component.
     pub audio_max: f32,
-    /// Bounds on the measured lyric. The component hugs the lyric between
-    /// these, which is what makes the bar grow and shrink with the song.
-    pub lyric_min: f32,
+    /// Ceiling on the measured text. The component hugs the text between the
+    /// one-character floor and this, which is what makes the bar grow and
+    /// shrink with the song.
     pub lyric_max: f32,
 }
 
@@ -244,9 +247,7 @@ impl Limits {
     pub fn from_config(cfg: &beautify_core::Config) -> Self {
         let w = &cfg.widget;
         Self {
-            audio_min: w.audio_min_width as f32,
             audio_max: w.audio_max_width as f32,
-            lyric_min: w.lyric_min_width as f32,
             lyric_max: w.lyric_max_width as f32,
         }
     }
@@ -293,7 +294,7 @@ impl Layout {
         let gap = metrics.px(2.0);
         let button = metrics.button();
         let primary = metrics.button_primary();
-        let total = button * 2.0 + primary + gap * 2.0;
+        let total = controls_width(metrics);
         let left = audio.slot.left + (audio.slot.width() - total) * 0.5;
         let center_y = audio.slot.center_y();
 
@@ -369,16 +370,36 @@ impl Hit {
     }
 }
 
+/// Width of the three transport buttons side by side, including their gaps —
+/// the least a slot must be for hovering to show them whole.
+pub fn controls_width(metrics: &Metrics) -> f32 {
+    metrics.button() * 2.0 + metrics.button_primary() + metrics.px(2.0) * 2.0
+}
+
 /// Width of the lyric slot.
 ///
-/// The bar hugs the lyric — that is the whole point of the adaptive width — but
-/// never narrower than the transport controls, so switching to the hover state
-/// cannot clip them or resize the bar.
-pub fn slot_width(limits: &Limits, metrics: &Metrics, lyric_width: f32) -> f32 {
-    let controls = metrics.button() * 2.0 + metrics.button_primary() + metrics.px(2.0) * 2.0;
-    lyric_width
-        .clamp(limits.lyric_min, limits.lyric_max)
-        .max(controls)
+/// The bar hugs the text. The floor is **one character** of the lyric font —
+/// an empty moment in the song still leaves a visible sliver of slot, and
+/// nothing more: a wider floor would show blank space to the left of the
+/// now left-aligned text. The transport controls are *not* part of that
+/// floor; they are reserved only while the pointer hovers the audio
+/// component ([`Layout::controls`]), because a bar narrower than the buttons
+/// cannot show them — see the hover branch in the caller that owns the
+/// width.
+pub fn slot_width(
+    limits: &Limits,
+    metrics: &Metrics,
+    lyric_width: f32,
+    reserve_controls: bool,
+) -> f32 {
+    let min = if reserve_controls {
+        controls_width(metrics)
+    } else {
+        metrics.px(LYRIC_PX)
+    };
+    // Raise to the floor, cap at the configured ceiling, and raise again —
+    // `f32::clamp` would panic if a hand-edited ceiling sat below the floor.
+    lyric_width.max(min).min(limits.lyric_max).max(min)
 }
 
 /// Width the audio component wants, before clamping.
@@ -388,11 +409,13 @@ fn natural_audio_width(
     metrics: &Metrics,
     lyric_width: f32,
     spectrum_width: f32,
+    reserve_controls: bool,
 ) -> f32 {
     if !content.audio {
         return 0.0;
     }
-    let mut width = metrics.cover() + metrics.audio_gap() + slot_width(limits, metrics, lyric_width);
+    let mut width =
+        metrics.cover() + metrics.audio_gap() + slot_width(limits, metrics, lyric_width, reserve_controls);
     if content.show_spectrum && spectrum_width > 0.0 {
         width += metrics.audio_gap() + spectrum_width;
     }
@@ -418,11 +441,19 @@ pub fn spectrum_band(metrics: &Metrics) -> (f32, f32) {
 }
 
 /// Total bar width, in physical pixels, for the current content.
-pub fn bar_width(content: &Content, limits: &Limits, metrics: &Metrics, lyric_width: f32) -> f32 {
+pub fn bar_width(
+    content: &Content,
+    limits: &Limits,
+    metrics: &Metrics,
+    lyric_width: f32,
+    reserve_controls: bool,
+) -> f32 {
     let spect = spectrum_width(metrics, content.audio && content.show_spectrum);
-    let natural = natural_audio_width(content, limits, metrics, lyric_width, spect);
+    let natural = natural_audio_width(content, limits, metrics, lyric_width, spect, reserve_controls);
+    // Hug: the natural width already carries the one-character floor, so the
+    // only bound left is the configured ceiling.
     let audio = if content.audio {
-        natural.clamp(limits.audio_min, limits.audio_max)
+        natural.min(limits.audio_max)
     } else {
         0.0
     };
@@ -596,9 +627,7 @@ mod tests {
 
     fn limits() -> Limits {
         Limits {
-            audio_min: 168.0,
             audio_max: 420.0,
-            lyric_min: 96.0,
             lyric_max: 280.0,
         }
     }
@@ -631,9 +660,19 @@ mod tests {
     fn lay_aligned(c: &Content, lyric: f32, align: Align) -> (Layout, Metrics, Limits, f32) {
         let m = metrics();
         let l = limits();
-        let width = bar_width(c, &l, &m, lyric);
+        let width = bar_width(c, &l, &m, lyric, false);
         let window = Rect::new(0.0, 0.0, max_bar_width(c, &l, &m) + 2.0 * BAR_INSET, 44.0);
         (layout(window, width, align, c, &m), m, l, width)
+    }
+
+    /// The same, but with the transport controls' width reserved — the state
+    /// the bar is in while the pointer hovers the audio component.
+    fn lay_reserved(c: &Content, lyric: f32) -> (Layout, Metrics, Limits, f32) {
+        let m = metrics();
+        let l = limits();
+        let width = bar_width(c, &l, &m, lyric, true);
+        let window = Rect::new(0.0, 0.0, max_bar_width(c, &l, &m) + 2.0 * BAR_INSET, 44.0);
+        (layout(window, width, Align::End, c, &m), m, l, width)
     }
 
     #[test]
@@ -692,7 +731,6 @@ mod tests {
     fn a_long_lyric_is_clamped_to_the_configured_maximum() {
         let (_, _, l, width) = lay(&content(true), 5000.0);
         assert!(width <= l.audio_max + LAUNCHER + 2.0 * BAR_PAD + 1.0);
-        assert!(width > l.audio_min);
     }
 
     #[test]
@@ -707,13 +745,35 @@ mod tests {
         );
     }
 
+    /// A short (or absent) lyric hugs down to **one character** of the lyric
+    /// font and nothing more — the floor is no longer the transport controls'
+    /// width, so the left-aligned text sits against the cover with no blank
+    /// field beside it.
     #[test]
-    fn a_very_short_lyric_still_leaves_room_for_the_controls() {
-        // Switching to the hover state must not clip the transport buttons, so
-        // the slot never goes below their width.
-        let (l, m, _, _) = lay(&content(true), 0.0);
+    fn a_very_short_lyric_hugs_down_to_one_character() {
+        let (l, _, _, _) = lay(&content(true), 0.0);
         let slot = l.audio.unwrap().slot;
+        assert!(
+            (slot.width() - LYRIC_PX).abs() < 0.01,
+            "slot {} is not the one-character floor",
+            slot.width()
+        );
+        let m = metrics();
         let controls = l.controls(&m).unwrap();
+        assert!(
+            slot.width() < controls.next.right - controls.previous.left,
+            "the floor must be below the controls' width; reserving those is the hover's job"
+        );
+    }
+
+    /// Hovering asks for the transport controls, and a bar that hugged a
+    /// short lyric grows to fit them: the reservation is the one case where
+    /// hovering may change the width.
+    #[test]
+    fn hovering_a_short_lyric_reserves_the_controls_width() {
+        let (l, _, _, _) = lay_reserved(&content(true), 0.0);
+        let slot = l.audio.unwrap().slot;
+        let controls = l.controls(&metrics()).unwrap();
         assert!(
             slot.width() >= controls.next.right - controls.previous.left - 0.01,
             "slot {} is narrower than the controls",
@@ -721,14 +781,16 @@ mod tests {
         );
     }
 
+    /// A lyric wider than the controls is unaffected by hovering: both states
+    /// share the slot, so reaching for a button never resizes the bar. Only
+    /// the narrow case grows (see the reservation test above).
     #[test]
-    fn hovering_never_changes_the_width_because_both_states_share_the_slot() {
-        let (l, m, _, _) = lay(&content(true), 10.0);
-        let controls = l.controls(&m).unwrap();
-        let slot = l.audio.unwrap().slot;
-
-        assert!(controls.previous.left >= slot.left - 0.01);
-        assert!(controls.next.right <= slot.right + 0.01);
+    fn hovering_a_wide_lyric_changes_nothing() {
+        let m = metrics();
+        let l = limits();
+        let plain = bar_width(&content(true), &l, &m, 120.0, false);
+        let reserved = bar_width(&content(true), &l, &m, 120.0, true);
+        assert!((plain - reserved).abs() < 0.01);
     }
 
     #[test]
@@ -863,7 +925,7 @@ mod tests {
     fn lay_content(c: &Content, lyric: f32) -> Layout {
         let m = metrics();
         let l = limits();
-        let width = bar_width(c, &l, &m, lyric);
+        let width = bar_width(c, &l, &m, lyric, false);
         let window = Rect::new(0.0, 0.0, 900.0, 44.0);
         layout(window, width, Align::End, c, &m)
     }
@@ -979,7 +1041,7 @@ mod tests {
         let m = Metrics::new(120); // 125%
         let l = limits();
         let c = content(false);
-        let width = bar_width(&c, &l, &m, 0.0);
+        let width = bar_width(&c, &l, &m, 0.0, false);
         let expected = (LAUNCHER + 2.0 * BAR_PAD) * 1.25;
         assert!((width - expected).abs() < 0.01);
     }

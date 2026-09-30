@@ -503,9 +503,7 @@ pub struct WidgetConfig {
     pub hide_with_autohide: bool,
 
     // --- adaptive audio component geometry (physical px) ---
-    pub audio_min_width: i32,
     pub audio_max_width: i32,
-    pub lyric_min_width: i32,
     pub lyric_max_width: i32,
 
     // --- flyout ---
@@ -533,9 +531,7 @@ impl Default for WidgetConfig {
             animation_ms: 150,
             hide_with_autohide: true,
 
-            audio_min_width: 168,
             audio_max_width: 420,
-            lyric_min_width: 96,
             lyric_max_width: 280,
 
             flyout_width: 380,
@@ -793,16 +789,8 @@ impl Config {
         // takes no custom radius), so anything larger would leave a gap between the CSS
         // panel and the frame it is clipped to.
         self.widget.corner_radius = self.widget.corner_radius.clamp(0.0, 8.0);
-        self.widget.audio_min_width = self.widget.audio_min_width.clamp(96, 900);
-        self.widget.audio_max_width = self
-            .widget
-            .audio_max_width
-            .clamp(self.widget.audio_min_width, 1600);
-        self.widget.lyric_min_width = self.widget.lyric_min_width.clamp(0, 1200);
-        self.widget.lyric_max_width = self
-            .widget
-            .lyric_max_width
-            .clamp(self.widget.lyric_min_width, 1600);
+        self.widget.audio_max_width = self.widget.audio_max_width.clamp(0, 1600);
+        self.widget.lyric_max_width = self.widget.lyric_max_width.clamp(0, 1600);
         self.widget.flyout_width = self.widget.flyout_width.clamp(260, 900);
         self.widget.flyout_height = self.widget.flyout_height.clamp(240, 1200);
         self.widget.animation_ms = self.widget.animation_ms.min(1000);
@@ -951,12 +939,10 @@ mod tests {
 
     #[test]
     fn out_of_range_values_are_clamped() {
-        let cfg = Config::from_toml("[taskbar]\nopacity = 4.5\n\n[widget]\naudio_min_width = 9000\n")
+        let cfg = Config::from_toml("[taskbar]\nopacity = 4.5\n\n[widget]\naudio_max_width = 9000\n")
             .unwrap();
         assert_eq!(cfg.taskbar.opacity, 1.0);
-        assert_eq!(cfg.widget.audio_min_width, 900);
-        // max is pulled up to stay at least min
-        assert!(cfg.widget.audio_max_width >= cfg.widget.audio_min_width);
+        assert_eq!(cfg.widget.audio_max_width, 1600);
     }
 
     /// A config written before Mica was dropped must still load — as acrylic.

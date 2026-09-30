@@ -316,17 +316,25 @@ impl Pump {
         }
 
         // Recomputed every time: a config change can widen the bar without the
-        // window itself moving — except while the pointer is on the bar. The
-        // width follows the lyric, and the lyric advances every few seconds, so
-        // without this the transport controls slide out from under a pointer
-        // that is on its way to one of them. The bar re-adapts on the way out
-        // (see WM_MOUSELEAVE).
+        // window itself moving. While the pointer hovers the audio component
+        // the width is held where the pointer found it — the lyric advancing
+        // mid-hover must not slide the transport controls out from under a
+        // pointer on its way to one of them — except that it may grow, once,
+        // to the minimum the controls need: a bar that hugged a short lyric
+        // down to one character is narrower than the buttons, and hovering is
+        // what asks to see them. On the way out (see WM_MOUSELEAVE) the bar
+        // re-adapts to the text.
         let metrics = Metrics::new(geometry.dpi);
         let content = state.content();
         let limits = state.limits();
         if state.hover.is_none() {
             let lyric = self.measure_lyric(&state, &metrics);
-            self.target_width = layout::bar_width(&content, &limits, &metrics, lyric);
+            self.target_width = layout::bar_width(&content, &limits, &metrics, lyric, false);
+        } else {
+            // Frozen measurement: the lyric may have advanced since the
+            // pointer arrived, and re-hugging now would move the controls.
+            let reserved = layout::bar_width(&content, &limits, &metrics, self.lyric_width, true);
+            self.target_width = self.target_width.max(reserved);
         }
         self.easing = easing_for(state.config.widget.animation_ms);
         if self.bar_width <= 0.0 {
@@ -778,7 +786,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 with_pump(|pump| pump.tracking_leave = true);
             }
             if changed {
-                with_pump(|pump| pump.draw());
+                // Hovering may have to widen the bar (a lyric hugged down to
+                // one character is narrower than the transport controls), so
+                // the hover-enter path mirrors WM_MOUSELEAVE: recompute the
+                // target, animate to it, and draw once if already settled.
+                with_pump(|pump| {
+                    pump.sync_geometry();
+                    pump.kick_animation();
+                    if !pump.animating {
+                        pump.draw();
+                    }
+                });
             }
             LRESULT(0)
         }

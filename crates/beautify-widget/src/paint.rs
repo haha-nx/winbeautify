@@ -45,8 +45,8 @@ use crate::theme::{Rgba, Theme};
 /// memory: far wider and taller than any real taskbar.
 const MAX_WINDOW_PIXELS: i64 = 4096 * 256;
 
-/// Text sizes from the design, in 96-DPI pixels.
-const LYRIC_PX: f32 = 12.0;
+/// Text sizes from the design, in 96-DPI pixels. The lyric size lives in
+/// `layout` because the one-character slot floor needs it too.
 const BADGE_PX: f32 = 9.0;
 /// Two-line (「歌名+歌词」) sizes. Both lines together must fit the album
 /// cover's height band — that is the user-facing constraint — so the pair
@@ -363,20 +363,21 @@ impl Painter {
 
     /// The lyric format for `scale`.
     ///
-    /// Horizontally centred: the slot is sized to the lyric but never narrower
-    /// than the transport controls, so a short line has slack on both sides and
-    /// belongs in the middle of it rather than against the cover.
+    /// Left-aligned: the bar hugs the text, so there is normally no slack at
+    /// all, and when there is — the one-character floor, or the hover state's
+    /// reserved controls width — the line belongs against the cover, not
+    /// drifting in the middle of the slot.
     fn lyric_format(&self, scale: f32) -> Result<IDWriteTextFormat> {
         self.text.format_aligned(
-            (LYRIC_PX * scale).max(1.0),
+            (layout::LYRIC_PX * scale).max(1.0),
             DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
         )
     }
 
     /// The two-line pair's formats for `scale`: the title is a small
-    /// **left-aligned** caption pinned to the slot's left edge, the lyric
-    /// below it stays centred as ever.
+    /// left-aligned caption pinned to the slot's left edge, the lyric below
+    /// it left-aligned with it — the two lines read as one block.
     fn title_format(&self, scale: f32) -> Result<IDWriteTextFormat> {
         self.text.format_aligned(
             (TITLE_PX * scale).max(1.0),
@@ -389,7 +390,7 @@ impl Painter {
         self.text.format_aligned(
             (PAIR_LYRIC_PX * scale).max(1.0),
             DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_TEXT_ALIGNMENT_CENTER,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
         )
     }
 
@@ -747,10 +748,10 @@ fn draw_slot(
         // slot like the cover itself, so the text block lines up with the
         // artwork. The band is split between the lines in proportion to their
         // font sizes, which keeps the gap between them tight while leaving
-        // every glyph's ink comfortably inside its own row. The title is a
-        // left-aligned caption pinned to the slot's left edge; only the lyric
-        // is centred. A third line never happens — the state layer produces at
-        // most two — and is dropped rather than squeezed in.
+        // every glyph's ink comfortably inside its own row. Both lines are
+        // left-aligned against the cover. A third line never happens — the
+        // state layer produces at most two — and is dropped rather than
+        // squeezed in.
         [title, lyric, ..] => {
             let Some(pair) = &scene.pair else {
                 return Ok(());

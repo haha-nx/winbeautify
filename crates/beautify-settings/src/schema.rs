@@ -12,8 +12,7 @@
 //! than silently doing nothing when the user drags a slider.
 
 use beautify_core::config::{
-    Config, LyricProvider, LyricStyle, SpectrumStyle, TaskbarMode, Theme, WidgetAnchor,
-    WidgetColorMode,
+    Config, LyricProvider, SpectrumStyle, TaskbarMode, Theme, WidgetAnchor, WidgetColorMode,
 };
 
 use crate::devices::DeviceListKind;
@@ -849,16 +848,8 @@ const WIDGET: &[Card] = &[
         title: Some("音频组件宽度"),
         fields: &[
             when(
-                number("widget.audio_min_width", "最小宽度", 96, 900, "px"),
-                widget_on,
-            ),
-            when(
                 number("widget.audio_max_width", "最大宽度", 96, 1600, "px"),
                 widget_on,
-            ),
-            when(
-                number("widget.lyric_min_width", "歌词最小宽度", 0, 1200, "px"),
-                widget_lyrics,
             ),
             when(
                 number("widget.lyric_max_width", "歌词最大宽度", 0, 1600, "px"),
@@ -1561,7 +1552,7 @@ pub fn mode_label(id: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beautify_core::config::AudioSwitchMode;
+    use beautify_core::config::{AudioSwitchMode, LyricStyle};
 
     #[test]
     fn every_editable_field_names_a_config_path() {
