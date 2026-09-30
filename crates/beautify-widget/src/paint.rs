@@ -48,6 +48,13 @@ const MAX_WINDOW_PIXELS: i64 = 4096 * 256;
 /// Text sizes from the design, in 96-DPI pixels.
 const LYRIC_PX: f32 = 12.0;
 const BADGE_PX: f32 = 9.0;
+/// Two-line (「歌名+歌词」) sizes. Both lines together must fit the album
+/// cover's height band — that is the user-facing constraint — so the pair
+/// runs smaller than the single lyric: 9 + 10.5 px have natural line boxes
+/// of ≈12 + 14 px, which sum to the 26 px cover exactly. The layout splits
+/// the band in the same ratio (see `draw_slot`), so ink never clips.
+const TITLE_PX: f32 = 9.0;
+const PAIR_LYRIC_PX: f32 = 10.5;
 /// Corner radius of the album-art tile, in 96-DPI pixels.
 const COVER_RADIUS: f32 = 5.0;
 /// Corner radius of the launcher's hover highlight.
@@ -101,6 +108,9 @@ struct Scene<'a> {
     artwork: Option<&'a ID2D1Bitmap>,
     badge_format: Option<&'a IDWriteTextFormat>,
     lyric_format: &'a IDWriteTextFormat,
+    /// The two-line pair's formats (title above, lyric below), present only
+    /// when 「歌名+歌词」 mode has two lines to draw.
+    pair: Option<PairText<'a>>,
     layout: &'a Layout,
     content: &'a Content,
     metrics: &'a Metrics,
@@ -114,6 +124,14 @@ struct Scene<'a> {
     /// Optical centring corrections, measured from the font's line metrics.
     lyric_optical_offset: f32,
     badge_optical_offset: f32,
+}
+
+/// The two-line pair's formats and their measured optical corrections.
+struct PairText<'a> {
+    title: &'a IDWriteTextFormat,
+    lyric: &'a IDWriteTextFormat,
+    title_optical_offset: f32,
+    lyric_optical_offset: f32,
 }
 
 impl Painter {
@@ -181,6 +199,8 @@ impl Painter {
         let theme = Theme::resolve(&state.config);
         let display = state.display_lines();
         let lyric_format = self.lyric_format(metrics.scale)?;
+        let title_format = self.title_format(metrics.scale)?;
+        let pair_lyric_format = self.pair_lyric_format(metrics.scale)?;
 
         let (window, generation) = {
             let frame = self.frame.as_ref().expect("just ensured");
@@ -193,11 +213,20 @@ impl Painter {
             layout::layout(window, bar_width, align, &content, &metrics);
 
         // Truncation needs DirectWrite metrics, i.e. `&self`, so it happens here
-        // rather than in the draw code.
+        // rather than in the draw code. Each line is fitted in the format it
+        // will be drawn with — the pair's title and lyric run smaller than the
+        // single-line lyric, so their truncation points differ.
         let fitted: Vec<(String, bool)> = match layout.audio.as_ref() {
             Some(audio) => {
-                let lines: Vec<&str> = display.iter().map(|(line, _)| line.as_str()).collect();
-                self.fit_batch(&lines, &lyric_format, metrics.scale, audio.slot.width())
+                let lines: Vec<(&str, &IDWriteTextFormat)> = match display.len() {
+                    0 => Vec::new(),
+                    1 => vec![(display[0].0.as_str(), &lyric_format)],
+                    _ => vec![
+                        (display[0].0.as_str(), &title_format),
+                        (display[1].0.as_str(), &pair_lyric_format),
+                    ],
+                };
+                self.fit_batch(&lines, metrics.scale, audio.slot.width())
                     .into_iter()
                     .zip(display.iter().map(|(_, dim)| *dim))
                     .collect()
@@ -226,6 +255,12 @@ impl Painter {
                 artwork: artwork.as_ref(),
                 badge_format: self.badge_format.as_ref(),
                 lyric_format: &lyric_format,
+                pair: (fitted.len() >= 2).then(|| PairText {
+                    title: &title_format,
+                    lyric: &pair_lyric_format,
+                    title_optical_offset: self.text.vertical_correction(&title_format),
+                    lyric_optical_offset: self.text.vertical_correction(&pair_lyric_format),
+                }),
                 layout: &layout,
                 content: &content,
                 metrics: &metrics,
@@ -339,19 +374,58 @@ impl Painter {
         )
     }
 
+    /// The two-line pair's formats for `scale`: the title is a small
+    /// **left-aligned** caption pinned to the slot's left edge, the lyric
+    /// below it stays centred as ever.
+    fn title_format(&self, scale: f32) -> Result<IDWriteTextFormat> {
+        self.text.format_aligned(
+            (TITLE_PX * scale).max(1.0),
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_TEXT_ALIGNMENT_LEADING,
+        )
+    }
+
+    fn pair_lyric_format(&self, scale: f32) -> Result<IDWriteTextFormat> {
+        self.text.format_aligned(
+            (PAIR_LYRIC_PX * scale).max(1.0),
+            DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_TEXT_ALIGNMENT_CENTER,
+        )
+    }
+
+    /// Width of a line measured in the format it will actually be drawn in.
+    ///
+    /// The bar's width follows this line alone — in 「歌名+歌词」 mode that is
+    /// the lyric drawn at the smaller pair size, so measuring it at the
+    /// single-line size would make the bar wider than what it shows.
+    pub fn measure_driver_line(&self, text: &str, scale: f32, in_pair: bool) -> f32 {
+        if !in_pair {
+            return self.measure_line(text, scale);
+        }
+        match self.pair_lyric_format(scale) {
+            Ok(format) => self.text.measure(text, &format, 4096.0),
+            Err(_) => text.chars().count() as f32 * 8.0 * scale,
+        }
+    }
+
     /// [`TextEngine::fit`] memoised on the lines and the width they must fit
-    /// in.
+    /// in. Each line is fitted in the format it will be drawn with.
     fn fit_batch(
         &mut self,
-        lines: &[&str],
-        format: &IDWriteTextFormat,
+        lines: &[(&str, &IDWriteTextFormat)],
         scale: f32,
         max_width: f32,
     ) -> Vec<String> {
         // Rounded so sub-pixel jitter during the width animation does not miss
-        // the cache on every frame.
+        // the cache on every frame. The format choice is a pure function of the
+        // line count, which the joined key already fixes (one line has no
+        // separator), so the key needs no format component.
         let key = max_width.round() as i32;
-        let joined = lines.join("\u{1}");
+        let joined = lines
+            .iter()
+            .map(|(line, _)| *line)
+            .collect::<Vec<_>>()
+            .join("\u{1}");
         let hit = matches!(
             self.fitted.as_ref(),
             Some((cached, cached_scale, cached_key, _))
@@ -362,7 +436,7 @@ impl Painter {
         if !hit {
             let fitted = lines
                 .iter()
-                .map(|line| self.text.fit(line, format, max_width).to_string())
+                .map(|(line, format)| self.text.fit(line, format, max_width).to_string())
                 .collect();
             self.fitted = Some((joined, scale, key, fitted));
         }
@@ -641,51 +715,93 @@ fn draw_slot(
     let slot = audio.slot;
     match scene.lines {
         // The historic single line: centred in the whole slot.
-        [(line, dim)] => draw_slot_line(target, brush, scene, line, *dim, slot),
-        // 「歌名+歌词」: the track line lives in the top half of the slot,
-        // the lyric in the bottom half, each centred in its own half. A third
-        // line never happens — the state layer produces at most two — and is
-        // dropped rather than squeezed in.
+        [(line, dim)] => {
+            draw_slot_line(
+                target,
+                brush,
+                line,
+                *dim,
+                slot,
+                scene.lyric_format,
+                scene.lyric_optical_offset,
+                scene.theme,
+            );
+        }
+        // 「歌名+歌词」: the two lines together occupy exactly the album
+        // cover's height band — the user-facing constraint — centred on the
+        // slot like the cover itself, so the text block lines up with the
+        // artwork. The band is split between the lines in proportion to their
+        // font sizes, which keeps the gap between them tight while leaving
+        // every glyph's ink comfortably inside its own row. The title is a
+        // left-aligned caption pinned to the slot's left edge; only the lyric
+        // is centred. A third line never happens — the state layer produces at
+        // most two — and is dropped rather than squeezed in.
         [title, lyric, ..] => {
-            let top = Rect::new(slot.left, slot.top, slot.right, slot.center_y());
-            let bottom = Rect::new(slot.left, slot.center_y(), slot.right, slot.bottom);
-            draw_slot_line(target, brush, scene, &title.0, title.1, top);
-            draw_slot_line(target, brush, scene, &lyric.0, lyric.1, bottom);
+            let Some(pair) = &scene.pair else {
+                return Ok(());
+            };
+            let band = scene.metrics.cover();
+            let top = slot.center_y() - band * 0.5;
+            let title_h = band * TITLE_PX / (TITLE_PX + PAIR_LYRIC_PX);
+            let title_rect = Rect::new(slot.left, top, slot.right, top + title_h);
+            let lyric_rect = Rect::new(slot.left, top + title_h, slot.right, top + band);
+            draw_slot_line(
+                target,
+                brush,
+                &title.0,
+                title.1,
+                title_rect,
+                pair.title,
+                pair.title_optical_offset,
+                scene.theme,
+            );
+            draw_slot_line(
+                target,
+                brush,
+                &lyric.0,
+                lyric.1,
+                lyric_rect,
+                pair.lyric,
+                pair.lyric_optical_offset,
+                scene.theme,
+            );
         }
         [] => {}
     }
     Ok(())
 }
 
-/// One centred text run inside `rect`.
+/// One text run inside `rect`, in `format`.
 ///
 /// Paragraph centring positions the line box; the glyph ink sits above that
 /// centre, by ~2 px at this size. Shift the run so the text *looks* centred.
+#[allow(clippy::too_many_arguments)]
 fn draw_slot_line(
     target: &ID2D1RenderTarget,
     brush: &ID2D1SolidColorBrush,
-    scene: &Scene<'_>,
     line: &str,
     dim: bool,
     rect: Rect,
+    format: &IDWriteTextFormat,
+    optical_offset: f32,
+    theme: &Theme,
 ) {
     let color = if dim {
-        scene.theme.foreground_dim
+        theme.foreground_dim
     } else {
-        scene.theme.foreground
+        theme.foreground
     };
     canvas::set_brush(brush, color);
-    let offset = scene.lyric_optical_offset;
     let shifted = Rect::new(
         rect.left,
-        rect.top + offset,
+        rect.top + optical_offset,
         rect.right,
-        rect.bottom + offset,
+        rect.bottom + optical_offset,
     );
     unsafe {
         let _ = target.DrawText(
             &line.encode_utf16().collect::<Vec<u16>>(),
-            scene.lyric_format,
+            format,
             &canvas::rect_f(shifted),
             brush,
             D2D1_DRAW_TEXT_OPTIONS_CLIP,
