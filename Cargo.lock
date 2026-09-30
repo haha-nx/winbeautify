@@ -125,7 +125,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "beautify-audio"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-core",
  "tracing",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-clipboard"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-core",
  "parking_lot",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "parking_lot",
  "serde",
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-flyout"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-core",
  "beautify-widget",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-media"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-core",
  "parking_lot",
@@ -180,7 +180,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-settings"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-core",
  "beautify-widget",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-snip"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-clipboard",
  "beautify-core",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-taskbar"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-core",
  "beautify-taskbar-tap",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-taskbar-tap"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-toast"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-core",
  "beautify-widget",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-todo"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-core",
  "parking_lot",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-update"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "reqwest",
  "sha2",
@@ -254,7 +254,7 @@ dependencies = [
 
 [[package]]
 name = "beautify-widget"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-core",
  "beautify-taskbar",
@@ -4869,7 +4869,7 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "winbeautify"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "beautify-audio",
  "beautify-clipboard",

@@ -13,7 +13,7 @@ use reqwest::blocking::Client;
 use reqwest::{StatusCode, Url};
 
 /// The GitHub repository releases are read from.
-pub const RELEASE_REPO: &str = "winbeautify/winbeautify";
+pub const RELEASE_REPO: &str = "haha-nx/winbeautify";
 
 /// A release worth updating to, with the URLs of the two assets this crate
 /// consumes.
