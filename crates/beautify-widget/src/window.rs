@@ -504,13 +504,12 @@ impl Pump {
         true
     }
 
-    /// Width of the line that drives the bar, re-measuring only when the
-    /// lines changed.
+    /// Width the bar should hug, re-measuring only when the lines changed.
     ///
-    /// That line is the last one — the lyric in 「歌名+歌词」 mode, the only
-    /// line otherwise. The title line above it is a left-aligned caption that
-    /// must not move the bar when the track changes: it is truncated to the
-    /// slot instead, so the width keeps answering to the lyric alone.
+    /// The widest display line wins, each measured in the format it is drawn
+    /// with — in 「歌名+歌词」 mode the left-aligned title line drives the
+    /// width exactly as the lyric does. A line wider than the slot still gets
+    /// truncated at draw time, so the configured width maximum holds for both.
     fn measure_lyric(&mut self, state: &WidgetState, metrics: &Metrics) -> f32 {
         let lines = state.display_lines();
         // A separator that cannot appear in either line keeps two-line keys
@@ -526,11 +525,8 @@ impl Pump {
                 return *width;
             }
         }
-        let in_pair = lines.len() >= 2;
-        let width = lines
-            .last()
-            .map(|(line, _)| self.painter.measure_driver_line(line, metrics.scale, in_pair))
-            .unwrap_or(0.0);
+        let texts: Vec<&str> = lines.iter().map(|(line, _)| line.as_str()).collect();
+        let width = self.painter.measure_display(&texts, metrics.scale);
         self.line_cache = Some((key, width));
         self.lyric_width = width;
         width

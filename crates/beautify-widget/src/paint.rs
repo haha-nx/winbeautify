@@ -393,18 +393,33 @@ impl Painter {
         )
     }
 
-    /// Width of a line measured in the format it will actually be drawn in.
+    /// Width of the widest display line, each line measured in the format it
+    /// will actually be drawn with.
     ///
-    /// The bar's width follows this line alone — in 「歌名+歌词」 mode that is
-    /// the lyric drawn at the smaller pair size, so measuring it at the
-    /// single-line size would make the bar wider than what it shows.
-    pub fn measure_driver_line(&self, text: &str, scale: f32, in_pair: bool) -> f32 {
-        if !in_pair {
-            return self.measure_line(text, scale);
-        }
-        match self.pair_lyric_format(scale) {
-            Ok(format) => self.text.measure(text, &format, 4096.0),
-            Err(_) => text.chars().count() as f32 * 8.0 * scale,
+    /// The bar hugs this, so in 「歌名+歌词」 mode the title drives the width
+    /// too: a long track name widens the bar exactly as a long lyric does,
+    /// against the same configured maximum. The two pair lines run smaller
+    /// than the single-line lyric, so measuring them at the single-line size
+    /// would make the bar wider than what it shows.
+    pub fn measure_display(&self, lines: &[&str], scale: f32) -> f32 {
+        let fallback = |line: &str| line.chars().count() as f32 * 8.0 * scale;
+        match lines {
+            [] => 0.0,
+            [line] => match self.lyric_format(scale) {
+                Ok(format) => self.text.measure(line, &format, 4096.0),
+                Err(_) => fallback(line),
+            },
+            [title, lyric, ..] => {
+                let title_w = match self.title_format(scale) {
+                    Ok(format) => self.text.measure(title, &format, 4096.0),
+                    Err(_) => fallback(title),
+                };
+                let lyric_w = match self.pair_lyric_format(scale) {
+                    Ok(format) => self.text.measure(lyric, &format, 4096.0),
+                    Err(_) => fallback(lyric),
+                };
+                title_w.max(lyric_w)
+            }
         }
     }
 
