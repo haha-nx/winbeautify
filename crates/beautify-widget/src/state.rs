@@ -4,7 +4,7 @@
 //! thread owns one and the event bus writes into it, so it is kept behind a
 //! lock and cloned only for the fields that are cheap to clone.
 
-use beautify_core::config::Config;
+use beautify_core::config::{Config, LyricStyle};
 use beautify_core::model::{Lyrics, MediaSnapshot, SpectrumFrame};
 use std::sync::Arc;
 
@@ -84,11 +84,33 @@ impl WidgetState {
         Some(line)
     }
 
-    /// The single line the bar shows, plus whether it is the fallback.
-    pub fn display_line(&self) -> (String, bool) {
-        match self.current_lyric() {
-            Some(line) => (line.to_string(), false),
-            None => (self.track_line().unwrap_or_default(), true),
+    /// The lines the bar draws, in order, each with whether it is the dimmed
+    /// fallback rather than live content.
+    ///
+    /// 「歌名+歌词」 splits the display in two — 「歌名 - 歌手」 on top, the
+    /// timed lyric below. 「仅歌词」 keeps the historic single line. Both fall
+    /// back to the track line alone while nothing timed is on screen, and both
+    /// draw nothing when lyrics are off or no session is playing.
+    pub fn display_lines(&self) -> Vec<(String, bool)> {
+        if !self.content().show_lyrics {
+            return Vec::new();
+        }
+        let track = self.track_line();
+        match (self.config.media.lyric_style, self.current_lyric()) {
+            (LyricStyle::TitleAndLyrics, Some(lyric)) => {
+                // The title line only earns a row when there is a lyric under
+                // it; on its own it is just the single-line fallback.
+                let mut lines = Vec::with_capacity(2);
+                if let Some(t) = track {
+                    lines.push((t, true));
+                }
+                lines.push((lyric.to_string(), false));
+                lines
+            }
+            (_, Some(lyric)) => vec![(lyric.to_string(), false)],
+            (_, None) => track
+                .map(|t| vec![(t, true)])
+                .unwrap_or_default(),
         }
     }
 
@@ -125,13 +147,64 @@ mod tests {
     #[test]
     fn a_track_without_lyrics_falls_back_to_title_and_artist() {
         let state = with_media();
-        let (line, fallback) = state.display_line();
-        assert_eq!(line, "夜航西飞 - WinBeautify");
-        assert!(fallback, "the caller needs to know to dim it");
+        assert_eq!(
+            state.display_lines(),
+            vec![("夜航西飞 - WinBeautify".to_string(), true)],
+            "the caller needs to know to dim it"
+        );
     }
 
     #[test]
-    fn a_timed_lyric_wins_over_the_track_name() {
+    fn title_and_lyrics_is_two_lines_once_something_is_timed() {
+        let mut state = with_lyrics();
+        state.lyric_index = Some(1);
+        assert_eq!(
+            state.display_lines(),
+            vec![
+                ("夜航西飞 - WinBeautify".to_string(), true),
+                ("第二句".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn lyrics_only_keeps_the_historic_single_line() {
+        let mut state = with_lyrics();
+        state.lyric_index = Some(1);
+        let mut cfg = (*state.config).clone();
+        cfg.media.lyric_style = LyricStyle::LyricsOnly;
+        state.config = Arc::new(cfg);
+        assert_eq!(state.display_lines(), vec![("第二句".to_string(), false)]);
+    }
+
+    #[test]
+    fn the_title_line_only_exists_when_there_is_a_lyric_under_it() {
+        // The default style is title-and-lyrics; with nothing timed yet the
+        // track name must not appear twice or claim a second row for itself.
+        let mut state = with_lyrics();
+        state.lyric_index = None;
+        assert_eq!(
+            state.display_lines(),
+            vec![("夜航西飞 - WinBeautify".to_string(), true)]
+        );
+
+        // A track with neither title nor artist cannot produce the top line.
+        state.lyric_index = Some(0);
+        state.media = Arc::new(MediaSnapshot {
+            has_session: true,
+            title: String::new(),
+            artist: String::new(),
+            status: PlaybackStatus::Playing,
+            ..Default::default()
+        });
+        assert_eq!(
+            state.display_lines(),
+            vec![("第一句".to_string(), false)],
+            "a nameless track degrades to the lyric alone"
+        );
+    }
+
+    fn with_lyrics() -> WidgetState {
         let mut state = with_media();
         state.lyrics = Arc::new(Lyrics {
             lines: vec![
@@ -146,15 +219,12 @@ mod tests {
             ],
             source: "local".into(),
         });
-        state.lyric_index = Some(1);
-        let (line, fallback) = state.display_line();
-        assert_eq!(line, "第二句");
-        assert!(!fallback);
+        state
     }
 
     #[test]
     fn an_index_before_the_first_line_falls_back() {
-        let mut state = with_media();
+        let mut state = with_lyrics();
         state.lyrics = Arc::new(Lyrics {
             lines: vec![LyricLine {
                 time_ms: 5000,
@@ -163,27 +233,24 @@ mod tests {
             source: String::new(),
         });
         state.lyric_index = None;
-        let (line, fallback) = state.display_line();
-        assert_eq!(line, "夜航西飞 - WinBeautify");
-        assert!(fallback);
+        assert_eq!(
+            state.display_lines(),
+            vec![("夜航西飞 - WinBeautify".to_string(), true)]
+        );
     }
 
     #[test]
-    fn disabling_lyrics_falls_back_even_with_a_timed_line() {
-        let mut state = with_media();
+    fn disabling_lyrics_shows_nothing_even_with_a_timed_line() {
+        let mut state = with_lyrics();
         let mut cfg = (*state.config).clone();
         cfg.media.show_lyrics = false;
         state.config = Arc::new(cfg);
-        state.lyrics = Arc::new(Lyrics {
-            lines: vec![LyricLine {
-                time_ms: 0,
-                text: "第一句".into(),
-            }],
-            source: String::new(),
-        });
         state.lyric_index = Some(0);
         assert!(state.current_lyric().is_none());
-        assert!(state.display_line().1, "should show the fallback instead");
+        assert!(
+            state.display_lines().is_empty(),
+            "lyrics off means no lyric lines at all"
+        );
     }
 
     #[test]
@@ -191,7 +258,7 @@ mod tests {
         let state = WidgetState::new(Config::default());
         assert!(!state.has_audio());
         assert!(!state.content().audio);
-        assert_eq!(state.display_line().0, "");
+        assert!(state.display_lines().is_empty());
     }
 
     #[test]

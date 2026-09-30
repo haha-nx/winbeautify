@@ -65,7 +65,10 @@ pub struct Painter {
     text: TextEngine,
     badge_format: Option<IDWriteTextFormat>,
     badge_scale: f32,
-    fitted: Option<(String, f32, i32, String)>,
+    /// The display lines fitted to the slot width, cached as one batch: they
+    /// change together (new track, new lyric line), so a per-line cache would
+    /// just thrash against the spectrum's ~30 fps redraws.
+    fitted: Option<(String, f32, i32, Vec<String>)>,
     /// The single brush every shape recolours before filling. Held across
     /// frames so a 30 fps spectrum does not allocate a COM object per frame.
     brush: Option<ID2D1SolidColorBrush>,
@@ -103,9 +106,9 @@ struct Scene<'a> {
     metrics: &'a Metrics,
     theme: &'a Theme,
     state: &'a WidgetState,
-    /// Already truncated to the slot width.
-    line: &'a str,
-    line_is_fallback: bool,
+    /// The lines to draw, already truncated to the slot width, each with
+    /// whether it is the dimmed fallback.
+    lines: &'a [(String, bool)],
     hover: Option<Hit>,
     corner_radius: f32,
     /// Optical centring corrections, measured from the font's line metrics.
@@ -176,7 +179,7 @@ impl Painter {
         let glyphs = self.glyphs(dpi)?.clone();
         let content = state.content();
         let theme = Theme::resolve(&state.config);
-        let (line, line_is_fallback) = state.display_line();
+        let display = state.display_lines();
         let lyric_format = self.lyric_format(metrics.scale)?;
 
         let (window, generation) = {
@@ -191,11 +194,15 @@ impl Painter {
 
         // Truncation needs DirectWrite metrics, i.e. `&self`, so it happens here
         // rather than in the draw code.
-        let fitted = match layout.audio.as_ref() {
-            Some(audio) => self
-                .fit_cached(&line, &lyric_format, metrics.scale, audio.slot.width())
-                .to_string(),
-            None => String::new(),
+        let fitted: Vec<(String, bool)> = match layout.audio.as_ref() {
+            Some(audio) => {
+                let lines: Vec<&str> = display.iter().map(|(line, _)| line.as_str()).collect();
+                self.fit_batch(&lines, &lyric_format, metrics.scale, audio.slot.width())
+                    .into_iter()
+                    .zip(display.iter().map(|(_, dim)| *dim))
+                    .collect()
+            }
+            None => Vec::new(),
         };
 
         let artwork = {
@@ -224,8 +231,7 @@ impl Painter {
                 metrics: &metrics,
                 theme: &theme,
                 state,
-                line: &fitted,
-                line_is_fallback,
+                lines: &fitted,
                 hover,
                 corner_radius,
                 lyric_optical_offset: self.text.vertical_correction(&lyric_format),
@@ -333,29 +339,34 @@ impl Painter {
         )
     }
 
-    /// [`TextEngine::fit`] memoised on the string and the width it must fit in.
-    fn fit_cached<'a>(
-        &'a mut self,
-        text: &str,
+    /// [`TextEngine::fit`] memoised on the lines and the width they must fit
+    /// in.
+    fn fit_batch(
+        &mut self,
+        lines: &[&str],
         format: &IDWriteTextFormat,
         scale: f32,
         max_width: f32,
-    ) -> &'a str {
+    ) -> Vec<String> {
         // Rounded so sub-pixel jitter during the width animation does not miss
         // the cache on every frame.
         let key = max_width.round() as i32;
+        let joined = lines.join("\u{1}");
         let hit = matches!(
             self.fitted.as_ref(),
             Some((cached, cached_scale, cached_key, _))
-                if cached == text
+                if *cached == joined
                     && (cached_scale - scale).abs() < f32::EPSILON
                     && *cached_key == key
         );
         if !hit {
-            let fitted = self.text.fit(text, format, max_width);
-            self.fitted = Some((text.to_string(), scale, key, fitted));
+            let fitted = lines
+                .iter()
+                .map(|line| self.text.fit(line, format, max_width).to_string())
+                .collect();
+            self.fitted = Some((joined, scale, key, fitted));
         }
-        &self.fitted.as_ref().expect("just filled").3
+        self.fitted.as_ref().expect("just filled").3.clone()
     }
 
     // -- cached resources ---------------------------------------------------
@@ -613,7 +624,8 @@ fn draw_cover(
     Ok(())
 }
 
-/// The lyric, or the transport controls when the pointer is over them.
+/// The lyric (with the track line above it in 「歌名+歌词」 mode), or the
+/// transport controls when the pointer is over them.
 fn draw_slot(
     target: &ID2D1RenderTarget,
     brush: &ID2D1SolidColorBrush,
@@ -623,35 +635,63 @@ fn draw_slot(
     if scene.hover.is_some_and(Hit::is_audio) {
         return draw_controls(target, brush, scene);
     }
-
-    if scene.line.is_empty() || audio.slot.width() <= 0.0 {
+    if scene.lines.is_empty() || audio.slot.width() <= 0.0 {
         return Ok(());
     }
-    let color = if scene.line_is_fallback {
+    let slot = audio.slot;
+    match scene.lines {
+        // The historic single line: centred in the whole slot.
+        [(line, dim)] => draw_slot_line(target, brush, scene, line, *dim, slot),
+        // 「歌名+歌词」: the track line lives in the top half of the slot,
+        // the lyric in the bottom half, each centred in its own half. A third
+        // line never happens — the state layer produces at most two — and is
+        // dropped rather than squeezed in.
+        [title, lyric, ..] => {
+            let top = Rect::new(slot.left, slot.top, slot.right, slot.center_y());
+            let bottom = Rect::new(slot.left, slot.center_y(), slot.right, slot.bottom);
+            draw_slot_line(target, brush, scene, &title.0, title.1, top);
+            draw_slot_line(target, brush, scene, &lyric.0, lyric.1, bottom);
+        }
+        [] => {}
+    }
+    Ok(())
+}
+
+/// One centred text run inside `rect`.
+///
+/// Paragraph centring positions the line box; the glyph ink sits above that
+/// centre, by ~2 px at this size. Shift the run so the text *looks* centred.
+fn draw_slot_line(
+    target: &ID2D1RenderTarget,
+    brush: &ID2D1SolidColorBrush,
+    scene: &Scene<'_>,
+    line: &str,
+    dim: bool,
+    rect: Rect,
+) {
+    let color = if dim {
         scene.theme.foreground_dim
     } else {
         scene.theme.foreground
     };
     canvas::set_brush(brush, color);
-    // Paragraph centring positions the line box; the glyph ink sits above that
-    // centre, by ~2 px at this size. Shift the run so the text *looks* centred.
-    let slot = Rect::new(
-        audio.slot.left,
-        audio.slot.top + scene.lyric_optical_offset,
-        audio.slot.right,
-        audio.slot.bottom + scene.lyric_optical_offset,
+    let offset = scene.lyric_optical_offset;
+    let shifted = Rect::new(
+        rect.left,
+        rect.top + offset,
+        rect.right,
+        rect.bottom + offset,
     );
     unsafe {
-        target.DrawText(
-            &scene.line.encode_utf16().collect::<Vec<u16>>(),
+        let _ = target.DrawText(
+            &line.encode_utf16().collect::<Vec<u16>>(),
             scene.lyric_format,
-            &canvas::rect_f(slot),
+            &canvas::rect_f(shifted),
             brush,
             D2D1_DRAW_TEXT_OPTIONS_CLIP,
             DWRITE_MEASURING_MODE_NATURAL,
-        )
-    };
-    Ok(())
+        );
+    }
 }
 
 fn draw_controls(

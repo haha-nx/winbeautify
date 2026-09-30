@@ -12,7 +12,8 @@
 //! than silently doing nothing when the user drags a slider.
 
 use beautify_core::config::{
-    Config, LyricProvider, SpectrumStyle, TaskbarMode, Theme, WidgetAnchor, WidgetColorMode,
+    Config, LyricProvider, LyricStyle, SpectrumStyle, TaskbarMode, Theme, WidgetAnchor,
+    WidgetColorMode,
 };
 
 use crate::devices::DeviceListKind;
@@ -279,6 +280,17 @@ const SPECTRUM_STYLES: &[Choice] = &[
     Choice {
         value: "bounce",
         label: "上下律动（自中间向两侧）",
+    },
+];
+
+const LYRIC_STYLES: &[Choice] = &[
+    Choice {
+        value: "title-and-lyrics",
+        label: "歌名+歌词",
+    },
+    Choice {
+        value: "lyrics-only",
+        label: "仅歌词",
     },
 ];
 
@@ -895,6 +907,15 @@ const MEDIA: &[Card] = &[
         title: Some("显示"),
         fields: &[
             when(switch("media.show_lyrics", "显示歌词"), media_on),
+            // The lyric style is the 显示歌词 toggle's second-level option: it
+            // only exists while lyrics are shown at all.
+            when(
+                hint(
+                    select("media.lyric_style", "歌词显示方式", LYRIC_STYLES),
+                    "「歌名+歌词」在歌词上方加一行歌名与歌手。",
+                ),
+                media_lyrics,
+            ),
             when(switch("media.show_spectrum", "显示频谱"), media_on),
             when(
                 select("media.spectrum_style", "频谱样式", SPECTRUM_STYLES),
@@ -1821,6 +1842,15 @@ mod tests {
             );
         }
         assert_eq!(SPECTRUM_STYLES.len(), SpectrumStyle::ALL.len());
+
+        for style in LyricStyle::ALL {
+            assert!(
+                offered(style.id(), LYRIC_STYLES),
+                "{} has no row",
+                style.id()
+            );
+        }
+        assert_eq!(LYRIC_STYLES.len(), LyricStyle::ALL.len());
 
         for mode in AudioSwitchMode::ALL {
             assert!(offered(mode.id(), AUDIO_MODES), "{} has no row", mode.id());

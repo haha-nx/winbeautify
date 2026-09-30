@@ -235,11 +235,35 @@ impl SpectrumStyle {
     }
 }
 
+/// How the widget bar presents the playing track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LyricStyle {
+    /// Two lines: 「歌名 - 歌手」 on top, the timed lyric below.
+    #[default]
+    TitleAndLyrics,
+    /// Only the timed lyric — the historic single-line presentation.
+    LyricsOnly,
+}
+
+impl LyricStyle {
+    pub const ALL: [LyricStyle; 2] = [LyricStyle::TitleAndLyrics, LyricStyle::LyricsOnly];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            LyricStyle::TitleAndLyrics => "title-and-lyrics",
+            LyricStyle::LyricsOnly => "lyrics-only",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MediaConfig {
     pub enabled: bool,
     pub show_lyrics: bool,
+    /// Single lyric line, or 「歌名 - 歌手」 over the lyric.
+    pub lyric_style: LyricStyle,
     pub show_spectrum: bool,
     /// Which way the spectrum bars grow.
     pub spectrum_style: SpectrumStyle,
@@ -268,6 +292,7 @@ impl Default for MediaConfig {
         Self {
             enabled: true,
             show_lyrics: true,
+            lyric_style: LyricStyle::default(),
             show_spectrum: true,
             spectrum_style: SpectrumStyle::default(),
             spectrum_sensitivity: 1.0,
