@@ -30,6 +30,9 @@ beautify-snip.workspace = true
 beautify-audio.workspace = true
 # The top-left confirmation panel the switch and its failures are reported in.
 beautify-toast.workspace = true
+# Self-update: release check/download/staging in `beautify-update`, the helper
+# process and the tray entry in `app/src/update.rs`.
+beautify-update.workspace = true
 
 tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
 serde.workspace = true

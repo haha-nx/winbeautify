@@ -166,6 +166,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             &MenuItem::with_id(app, "close-pins", "关闭全部贴图", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "reload", "重新载入配置", true, None::<&str>)?,
+            &MenuItem::with_id(app, "check-update", "检查更新", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "quit", "退出 WinBeautify", true, None::<&str>)?,
         ],
@@ -233,6 +234,7 @@ fn on_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         },
         "close-pins" => crate::snip::close_pins(),
         "reload" => reload(app),
+        "check-update" => crate::update::check_for_update(app),
         "quit" => crate::shutdown(app),
         _ => {}
     }

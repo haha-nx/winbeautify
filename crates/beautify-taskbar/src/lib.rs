@@ -18,11 +18,15 @@
 pub mod accent;
 pub mod ffi;
 pub mod inject;
+pub mod restart;
 pub mod shell;
 pub mod theme;
 pub mod winver;
 
 use accent::{AccentApplicator, Backdrop};
+// The shell restart is the one piece of this crate other modules call for
+// directly (the update helper); keep it reachable without naming the module.
+pub use restart::restart_explorer;
 use beautify_core::config::{Config, TaskbarMode};
 use beautify_core::event::Event;
 use beautify_core::geometry::Rect;

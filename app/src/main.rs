@@ -35,6 +35,7 @@ mod settings;
 mod snip;
 mod state;
 mod tray;
+mod update;
 mod win;
 
 use beautify_core::config::ConfigManager;
@@ -49,6 +50,14 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 
 fn main() {
+    // Before even the single-instance claim: an update helper re-enters this
+    // exe with `--update-finish` while the old copy still holds the instance
+    // mutex (it exits only once the helper is up). A helper must be a plain
+    // worker — no mutex, no modules, no tauri — see `update`.
+    if let Some(code) = update::helper_main(std::env::args().skip(1)) {
+        std::process::exit(code);
+    }
+
     // Before anything else, and before a single shared resource is touched: one
     // copy per session. The tray icon, the clipboard hook and the taskbar
     // composition are all process-global, so a second copy fights the first
@@ -76,6 +85,11 @@ fn main() {
     };
     beautify_core::logging::init(&config.ui.log_level, config.ui.file_logging);
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting {APP_NAME}");
+
+    // A previous update's `.old` leftovers (files that were still mapped when
+    // it ran) can only be removed once whatever held them has exited — this
+    // startup is usually the first chance.
+    update::cleanup_leftovers();
 
     let state = AppState::new(Arc::clone(&manager));
 

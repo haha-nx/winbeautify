@@ -1,0 +1,15 @@
+[package]
+name = "beautify-update"
+description = "Self-update plumbing for WinBeautify: check the release feed, download and verify the payload, and apply it with fallbacks for files that are still in use."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Blocking client on a plain thread — the update never runs inside an async
+# runtime. TLS comes from `default-tls`, i.e. schannel on Windows: the same
+# trust store File Explorer uses, no bundled roots to ship.
+reqwest = { version = "0.13", features = ["blocking"] }
+sha2 = "0.10"
+tracing.workspace = true

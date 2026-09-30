@@ -35,6 +35,17 @@ cargo build --release -p winbeautify -p beautify-taskbar-tap
 
 启动后常驻托盘，左键点托盘图标打开设置，右键菜单可以打开 Flyout、重载配置或退出。
 
+### 自更新
+
+右键托盘菜单的「检查更新」即可：应用从 GitHub Releases 下载新版本并校验 SHA-256，然后
+由一个辅助进程接手——等旧实例退出、**自动重启资源管理器**（TAP DLL 被 explorer 映射，
+只有 shell 重启才能释放文件锁）、覆盖安装目录、拉起新版本。全程只需忍受桌面闪动一两秒，
+打开中的文件资源管理器窗口会被一并关闭。
+
+发版用 `tools/make-release.ps1` 构建发布包（`WinBeautify-v<版本>-x64.zip` + `.sha256`），
+两个文件作为附件传到 tag 为 `v<版本>` 的 GitHub Release 即可被更新器发现。
+更新失败时的排查日志在 `%LOCALAPPDATA%\WinBeautify\logs\update-helper.log`。
+
 ---
 
 ## 架构
